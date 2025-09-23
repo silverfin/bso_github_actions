@@ -21,7 +21,7 @@ jobs:
       changed_templates: ${{ steps.templates_changed.outputs.changed_templates }}
     steps:
       - name: Checkout Repository - Fetch all history for all tags and branches
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Get changed liquid files
@@ -70,18 +70,19 @@ jobs:
     env:
       SF_API_CLIENT_ID: "${{ secrets.SF_API_CLIENT_ID }}"
       SF_API_SECRET: "${{ secrets.SF_API_SECRET }}"
+      SF_TEST_FIRM_ID: "${{ vars.SF_TEST_FIRM_ID }}"
       CHANGED_TEMPLATES: "${{ needs.check-changed-templates.outputs.changed_templates }}"
     if: ${{ needs.check-changed-templates.outputs.changed_templates != '[]' }}
     needs: [check-auth, check-changed-templates]
     steps:
       - name: Checkout Repository - Fetch all history for all tags and branches
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Setup Node v18
-        uses: actions/setup-node@v3
+      - name: Setup Node v20
+        uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: 20
       - name: Load Silverfin config file from secrets
         run: |
           mkdir -p $HOME/.silverfin/
@@ -100,7 +101,61 @@ jobs:
             while [[ "${CURRENT_DIR}" != "." ]]; do
               if [[ -e "${CURRENT_DIR}/config.json" ]]; then
                 HANDLE=$(cat ${CURRENT_DIR}/config.json | jq -r ".handle // .name")
-                FIRM_ID=$(cat ${CURRENT_DIR}/config.json | jq -r ".id" | jq "keys_unsorted" | jq "first" | tr -d '"')
+                
+                # Initialize FIRM_ID
+                FIRM_ID=""
+                
+                # Check if test_firm_id is present in config
+                TEST_FIRM_ID=$(cat ${CURRENT_DIR}/config.json | jq -r ".test_firm_id // empty")
+
+                if [[ -n "$TEST_FIRM_ID" && "$TEST_FIRM_ID" != "null" ]]; then
+                  # 1. Template-specific test_firm_id (highest priority)
+                  AVAILABLE_FIRM_IDS=$(cat ${CURRENT_DIR}/config.json | jq -r ".id | keys[]" 2>/dev/null || echo "")
+                  
+                  # Check for exact match by looping through available IDs
+                  FOUND_MATCH=false
+                  for available_id in $AVAILABLE_FIRM_IDS; do
+                    if [[ "$available_id" == "$TEST_FIRM_ID" ]]; then
+                      FOUND_MATCH=true
+                      break
+                    fi
+                  done
+                  
+                  if [[ "$FOUND_MATCH" == "true" ]]; then
+                    FIRM_ID="$TEST_FIRM_ID"
+                    echo "Using configured test_firm_id: ${FIRM_ID}"
+                  else
+                    echo "Warning: test_firm_id '${TEST_FIRM_ID}' not found in .id object, falling back to environment variable or default"
+                  fi
+                fi
+                
+                if [[ -z "$FIRM_ID" && -n "$SF_TEST_FIRM_ID" ]]; then
+                  # 2. Environment variable fallback
+                  AVAILABLE_FIRM_IDS=$(cat ${CURRENT_DIR}/config.json | jq -r ".id | keys[]" 2>/dev/null || echo "")
+                  
+                  # Check for exact match by looping through available IDs
+                  FOUND_MATCH=false
+                  for available_id in $AVAILABLE_FIRM_IDS; do
+                    if [[ "$available_id" == "$SF_TEST_FIRM_ID" ]]; then
+                      FOUND_MATCH=true
+                      break
+                    fi
+                  done
+                  
+                  if [[ "$FOUND_MATCH" == "true" ]]; then
+                    FIRM_ID="$SF_TEST_FIRM_ID"
+                    echo "Using SF_TEST_FIRM_ID environment variable: ${FIRM_ID}"
+                  else
+                    echo "Warning: SF_TEST_FIRM_ID '${SF_TEST_FIRM_ID}' not found in .id object, falling back to default"
+                  fi
+                fi
+                
+                if [[ -z "$FIRM_ID" ]]; then
+                  # 3. Default behavior - use first available firm ID
+                  FIRM_ID=$(cat ${CURRENT_DIR}/config.json | jq -r ".id" | jq "keys_unsorted" | jq "first" | tr -d '"')
+                  echo "Using first available firm ID: ${FIRM_ID}"
+                fi
+                
                 if [[ "${CURRENT_DIR}" == *reconciliation_texts* ]]; then
                   # FETCH THE NEWEST VERSION OF THE TOKENS FROM THE SECRETS, IN CASE THEY WERE UPDATED BY THE INITIATION OF A CONCURRENT WORKFLOW
                   echo '${{ secrets.CONFIG_JSON }}' > $HOME/.silverfin/config.json
@@ -134,7 +189,7 @@ jobs:
               echo "Errors: ${ERRORS[@]}, please run the tests locally to fix the errors"
               exit 1
           fi
-     
+
       # - name: Get changed files in the shared_parts folder
       #   id: changed-files-shared-parts
       #   uses: tj-actions/changed-files@v35
