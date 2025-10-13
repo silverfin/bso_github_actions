@@ -1,10 +1,7 @@
-name: Add Code Review Label on Review Request
-
+name: Add code-review label
+run-name: Add code-review label to PR on review requested
 on:
-  pull_request:
-    types: [review_requested, ready_for_review]
-  pull_request_target:
-    types: [review_requested]
+  workflow_call:
 
 jobs:
   add-review-label:
@@ -53,4 +50,4 @@ jobs:
                 console.error('❌ Error adding label:', error);
                 throw error;
               }
-            } 
+            }
