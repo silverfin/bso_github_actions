@@ -47,5 +47,3 @@ jobs:
           CONFIG_JSON=$(cat $HOME/.silverfin/config.json | tr -d '\n')
           echo "::add-mask::$CONFIG_JSON"
           echo "$CONFIG_JSON" | gh secret set CONFIG_JSON
-        env:
-          GH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
