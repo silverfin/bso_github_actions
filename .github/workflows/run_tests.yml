@@ -1,6 +1,6 @@
 name: run-liquid-tests
 run-name: Run liquid tests of updated reconciliations and reconciliations that use updated shared parts
-on: 
+on:
   workflow_call:
 
   pull_request:
@@ -30,7 +30,7 @@ jobs:
         with:
           since_last_remote_commit: false
           dir_names: false
-          ref: 'main'
+          ref: "main"
           files: |
             **/**.{liquid,yml,yaml,json}
       - name: Filter templates changed
@@ -161,14 +161,13 @@ jobs:
                   echo '${{ secrets.CONFIG_JSON }}' > $HOME/.silverfin/config.json
                   # RUN TEST
                   echo "Running tests for ${HANDLE} in firm ${FIRM_ID}"
-                  FORMATTED_OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-test --handle "${HANDLE}" --firm "${FIRM_ID}")
                   OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-test --handle "${HANDLE}" --firm "${FIRM_ID}" --status 2>&1)
                   # CHECK OUTPUT
                   if [[ "$OUTPUT" =~ "PASSED" ]]; then
                     echo "${HANDLE}: passed"
                   elif [[ "$OUTPUT" =~ "FAILED" ]]; then
                     echo "${HANDLE}: failed"
-                    echo "Details of test run: ${FORMATTED_OUTPUT}"
+                    echo "Details of test run: ${OUTPUT}"
                     ERRORS+=("${HANDLE}")
                   else
                     echo "${HANDLE}: other errors: ${OUTPUT}"
