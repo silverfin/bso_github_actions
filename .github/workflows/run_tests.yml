@@ -167,7 +167,6 @@ jobs:
                     echo "${HANDLE}: passed"
                   elif [[ "$OUTPUT" =~ "FAILED" ]]; then
                     echo "${HANDLE}: failed"
-                    echo "Details of test run: ${OUTPUT}"
                     ERRORS+=("${HANDLE}")
                   else
                     echo "${HANDLE}: other errors: ${OUTPUT}"
