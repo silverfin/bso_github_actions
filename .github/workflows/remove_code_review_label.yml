@@ -25,6 +25,20 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             
+            // Get the actor who made the review or comment
+            let actor;
+            if (context.eventName === 'pull_request_review') {
+              actor = context.payload.review.user.login;
+            } else if (context.eventName === 'pull_request_review_comment') {
+              actor = context.payload.comment.user.login;
+            }
+            
+            // Skip if the actor is coderabbitai[bot]
+            if (actor === 'coderabbitai[bot]') {
+              console.log(`⏭️  Skipping label removal - review/comment by ${actor}`);
+              return;
+            }
+            
             try {
               // Check if the label exists on the PR
               const { data: labels } = await github.rest.issues.listLabelsOnIssue({
