@@ -1,0 +1,107 @@
+name: Slack Changelog Notification
+
+on:
+  workflow_call:
+
+jobs:
+  notify-slack:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Get PR Details
+        id: pr-details
+        run: |
+          # Extract PR information
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+          PR_URL="${{ github.event.pull_request.html_url }}"
+          BRANCH_NAME="${{ github.event.pull_request.head.ref }}"
+
+          # Get changed files from the merge commit
+          echo "Getting files from merge commit..."
+          git diff --name-only HEAD~1 HEAD > changed_files.txt
+          echo "Files changed:"
+          cat changed_files.txt
+
+          # Extract unique template folders
+          TEMPLATE_FOLDERS=$(cat changed_files.txt | \
+            grep -E "(reconciliation_texts|shared_parts|export_files|account_templates)/" | \
+            sed 's|/[^/]*$||' | \
+            sed 's|/text_parts||' | \
+            sed 's|/tests||' | \
+            sed 's|/parts||' | \
+            sort | uniq | \
+            sed 's|^reconciliation_texts/||' | \
+            sed 's|^shared_parts/||' | \
+            sed 's|^export_files/||' | \
+            sed 's|^account_templates/||' | \
+            head -10 | \
+            sed 's/^/• /')
+
+          # Count template folders 
+          if [ -z "$TEMPLATE_FOLDERS" ]; then
+            TOTAL_TEMPLATES=0
+            TEMPLATE_FOLDERS="No template changes"
+          else
+            TOTAL_TEMPLATES=$(echo "$TEMPLATE_FOLDERS" | wc -l)
+          fi
+
+          # Set outputs
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "pr_title=$PR_TITLE" >> $GITHUB_OUTPUT
+          echo "pr_author=$PR_AUTHOR" >> $GITHUB_OUTPUT
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+          echo "total_templates=$TOTAL_TEMPLATES" >> $GITHUB_OUTPUT
+
+          # Handle multiline output for template folders
+          {
+            echo 'template_folders<<EOF'
+            echo "$TEMPLATE_FOLDERS"
+            echo 'EOF'
+          } >> $GITHUB_OUTPUT
+
+      - name: Generate Changelog Message
+        id: changelog
+        run: |
+          # Create a formatted changelog message
+          TIMESTAMP=$(TZ='Europe/Brussels' date +"%d/%m/%Y %H:%M")
+
+          # Build the complete message (using clean Slack formatting)
+          MESSAGE="
+          📝 ${{ steps.pr-details.outputs.pr_title }}
+          👤 ${{ steps.pr-details.outputs.pr_author }}
+          🔗 ${{ steps.pr-details.outputs.pr_url }}
+          ⏰ $TIMESTAMP
+
+          Templates:
+          ${{ steps.pr-details.outputs.template_folders }}"
+
+          # If more than 10 templates, add a note
+          if [ ${{ steps.pr-details.outputs.total_templates }} -gt 10 ]; then
+            MESSAGE="$MESSAGE
+          _...and $((${{ steps.pr-details.outputs.total_templates }} - 10)) more templates_"
+          fi
+
+          # Set output (escape for JSON)
+          # Escape quotes and newlines for JSON
+          MESSAGE_ESCAPED=$(echo "$MESSAGE" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+          echo "message=$MESSAGE_ESCAPED" >> $GITHUB_OUTPUT
+
+      - name: Post to Slack
+        run: |
+          # Send changelog message as text field for Workflow Builder
+          curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"text\":\"${{ steps.changelog.outputs.message }}\"}"
