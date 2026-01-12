@@ -152,7 +152,7 @@ jobs:
               if [[ "$line" =~ ^[[:space:]]+([^:]+):[[:space:]]+FAILED ]]; then
                 local test_name=$(echo "${BASH_REMATCH[1]}" | xargs)
                 if [[ -n "$current_template" ]]; then
-                  ERRORS+=("${current_template}: ${test_name}")
+                  ERRORS+=("[${template_type}] ${current_template}: ${test_name} (in firm ${firm_id}")
                 fi
                 continue
               fi
@@ -188,13 +188,13 @@ jobs:
                   if [[ -z "${HANDLES_BY_FIRM[${FIRM_ID}]}" ]]; then
                     HANDLES_BY_FIRM[${FIRM_ID}]="${HANDLE_OR_NAME}"
                   else
-                    HANDLES_BY_FIRM[${FIRM_ID}]="${HANDLES_BY_FIRM[${FIRM_ID}]} ${HANDLE_OR_NAME}"
+                    HANDLES_BY_FIRM[${FIRM_ID}]="${HANDLES_BY_FIRM[${FIRM_ID}]}|${HANDLE_OR_NAME}"
                   fi
                 elif [[ "${CURRENT_DIR}" == *account_templates* ]]; then
                   if [[ -z "${ACCOUNT_TEMPLATES_BY_FIRM[${FIRM_ID}]}" ]]; then
                     ACCOUNT_TEMPLATES_BY_FIRM[${FIRM_ID}]="${HANDLE_OR_NAME}"
                   else
-                    ACCOUNT_TEMPLATES_BY_FIRM[${FIRM_ID}]="${ACCOUNT_TEMPLATES_BY_FIRM[${FIRM_ID}]} ${HANDLE_OR_NAME}"
+                    ACCOUNT_TEMPLATES_BY_FIRM[${FIRM_ID}]="${ACCOUNT_TEMPLATES_BY_FIRM[${FIRM_ID}]}|${HANDLE_OR_NAME}"
                   fi
                 fi
                 break
@@ -213,9 +213,8 @@ jobs:
           for FIRM_ID in "${!HANDLES_BY_FIRM[@]}"; do
             HANDLES="${HANDLES_BY_FIRM[${FIRM_ID}]}"
             echo "Running tests for handles: ${HANDLES} in firm ${FIRM_ID}"
-            
-            # Build command with space-delimited handles
-            OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-test -h ${HANDLES} -f "${FIRM_ID}" --status 2>&1)
+
+            OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-test -h "${HANDLES}" -f "${FIRM_ID}" --status 2>&1)
             parse_test_output "$OUTPUT"
           done
 
@@ -224,18 +223,7 @@ jobs:
             TEMPLATE_NAMES="${ACCOUNT_TEMPLATES_BY_FIRM[${FIRM_ID}]}"
             echo "Running tests for account templates: ${TEMPLATE_NAMES} in firm ${FIRM_ID}"
             
-            # Build command with space-delimited quoted account template names
-            # Convert space-separated names to quoted space-separated names
-            QUOTED_NAMES=""
-            for name in ${TEMPLATE_NAMES}; do
-              if [[ -z "$QUOTED_NAMES" ]]; then
-                QUOTED_NAMES="'${name}'"
-              else
-                QUOTED_NAMES="${QUOTED_NAMES} '${name}'"
-              fi
-            done
-            
-            OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-test -at ${QUOTED_NAMES} -f "${FIRM_ID}" --status 2>&1)
+            OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-test -at "${TEMPLATE_NAMES}" -f "${FIRM_ID}" --status 2>&1)
             parse_test_output "$OUTPUT"
           done
 
