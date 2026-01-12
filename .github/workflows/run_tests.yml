@@ -36,7 +36,7 @@ jobs:
       - name: Filter templates changed
         id: templates_changed
         run: |
-          pattern="(?:reconciliation_texts|shared_parts)/([^/]+)/"
+          pattern="(?:reconciliation_texts|shared_parts|account_templates)/([^/]+)/"
           changed_files="${{ steps.changed-files.outputs.all_changed_files }}"
           if [ -n "$changed_files" ]; then
             filtered_names=($(printf "%s\n" "$changed_files" | grep -oP "$pattern" || true))
@@ -95,97 +95,144 @@ jobs:
           echo "CLI version: ${VERSION}"
       - name: Run liquid tests for updated templates
         run: |
+          declare -A HANDLES_BY_FIRM
+          declare -A ACCOUNT_TEMPLATES_BY_FIRM
           declare -a ERRORS
+
+          # Function to resolve firm ID from config
+          resolve_firm_id() {
+            local config_file="$1"
+            local firm_id=""
+            local test_firm_id=$(cat "${config_file}" | jq -r ".test_firm_id // empty")
+            local available_ids=$(cat "${config_file}" | jq -r ".id | keys[]" 2>/dev/null || echo "")
+            
+            # 1. Template-specific test_firm_id (highest priority)
+            if [[ -n "$test_firm_id" && "$test_firm_id" != "null" ]]; then
+              for id in $available_ids; do
+                if [[ "$id" == "$test_firm_id" ]]; then
+                  firm_id="$test_firm_id"
+                  echo "Using configured test_firm_id: ${firm_id}"
+                  break
+                fi
+              done
+            fi
+            
+            # 2. Environment variable fallback
+            if [[ -z "$firm_id" && -n "$SF_TEST_FIRM_ID" ]]; then
+              for id in $available_ids; do
+                if [[ "$id" == "$SF_TEST_FIRM_ID" ]]; then
+                  firm_id="$SF_TEST_FIRM_ID"
+                  echo "Using SF_TEST_FIRM_ID environment variable: ${firm_id}"
+                  break
+                fi
+              done
+            fi
+            
+            # 3. Default: first available firm ID
+            if [[ -z "$firm_id" ]]; then
+              firm_id=$(cat "${config_file}" | jq -r ".id | keys_unsorted | first" | tr -d '"')
+              echo "Using first available firm ID: ${firm_id}"
+            fi
+            
+            echo "$firm_id"
+          }
+
+          # Function to parse test output and collect errors
+          parse_test_output() {
+            local output="$1"
+            local current_template=""
+            
+            while IFS= read -r line || [[ -n "$line" ]]; do
+              # Skip empty lines
+              if [[ -z "$line" ]]; then
+                continue
+              fi
+              
+              # Check for indented failed test name (e.g., "  test_name: FAILED")
+              if [[ "$line" =~ ^[[:space:]]+([^:]+):[[:space:]]+FAILED ]]; then
+                local test_name=$(echo "${BASH_REMATCH[1]}" | xargs)
+                if [[ -n "$current_template" ]]; then
+                  ERRORS+=("[${template_type}] ${current_template}: ${test_name} (in firm ${firm_id}")
+                fi
+                continue
+              fi
+              
+              # Match template: PASSED or template: FAILED (may have trailing content like timestamps)
+              line=$(echo "$line" | xargs)
+              if [[ "$line" =~ ^([^:]+):[[:space:]]+(PASSED|FAILED) ]]; then
+                current_template=$(echo "${BASH_REMATCH[1]}" | xargs)
+                local status="${BASH_REMATCH[2]}"
+                
+                if [[ "$status" == "PASSED" ]]; then
+                  echo "${current_template}: passed"
+                elif [[ "$status" == "FAILED" ]]; then
+                  echo "${current_template}: failed"
+                  ERRORS+=("${current_template}")
+                fi
+              fi
+            done <<< "$output"
+          }
+
+          # First pass: collect all templates and group by firm ID
           for CURRENT_DIR in ${{ env.CHANGED_TEMPLATES }}; do
             echo "Checking ${CURRENT_DIR}"
-            while [[ "${CURRENT_DIR}" != "." ]]; do
-              if [[ -e "${CURRENT_DIR}/config.json" ]]; then
-                HANDLE=$(cat ${CURRENT_DIR}/config.json | jq -r ".handle // .name")
+            TEMPLATE_DIR="${CURRENT_DIR}"
+            
+            while [[ "${TEMPLATE_DIR}" != "." ]]; do
+              if [[ -e "${TEMPLATE_DIR}/config.json" ]]; then
+                HANDLE_OR_NAME=$(cat ${TEMPLATE_DIR}/config.json | jq -r ".handle // .name")
+                FIRM_ID=$(resolve_firm_id "${TEMPLATE_DIR}/config.json")
                 
-                # Initialize FIRM_ID
-                FIRM_ID=""
-                
-                # Check if test_firm_id is present in config
-                TEST_FIRM_ID=$(cat ${CURRENT_DIR}/config.json | jq -r ".test_firm_id // empty")
-
-                if [[ -n "$TEST_FIRM_ID" && "$TEST_FIRM_ID" != "null" ]]; then
-                  # 1. Template-specific test_firm_id (highest priority)
-                  AVAILABLE_FIRM_IDS=$(cat ${CURRENT_DIR}/config.json | jq -r ".id | keys[]" 2>/dev/null || echo "")
-                  
-                  # Check for exact match by looping through available IDs
-                  FOUND_MATCH=false
-                  for available_id in $AVAILABLE_FIRM_IDS; do
-                    if [[ "$available_id" == "$TEST_FIRM_ID" ]]; then
-                      FOUND_MATCH=true
-                      break
-                    fi
-                  done
-                  
-                  if [[ "$FOUND_MATCH" == "true" ]]; then
-                    FIRM_ID="$TEST_FIRM_ID"
-                    echo "Using configured test_firm_id: ${FIRM_ID}"
-                  else
-                    echo "Warning: test_firm_id '${TEST_FIRM_ID}' not found in .id object, falling back to environment variable or default"
-                  fi
-                fi
-                
-                if [[ -z "$FIRM_ID" && -n "$SF_TEST_FIRM_ID" ]]; then
-                  # 2. Environment variable fallback
-                  AVAILABLE_FIRM_IDS=$(cat ${CURRENT_DIR}/config.json | jq -r ".id | keys[]" 2>/dev/null || echo "")
-                  
-                  # Check for exact match by looping through available IDs
-                  FOUND_MATCH=false
-                  for available_id in $AVAILABLE_FIRM_IDS; do
-                    if [[ "$available_id" == "$SF_TEST_FIRM_ID" ]]; then
-                      FOUND_MATCH=true
-                      break
-                    fi
-                  done
-                  
-                  if [[ "$FOUND_MATCH" == "true" ]]; then
-                    FIRM_ID="$SF_TEST_FIRM_ID"
-                    echo "Using SF_TEST_FIRM_ID environment variable: ${FIRM_ID}"
-                  else
-                    echo "Warning: SF_TEST_FIRM_ID '${SF_TEST_FIRM_ID}' not found in .id object, falling back to default"
-                  fi
-                fi
-                
-                if [[ -z "$FIRM_ID" ]]; then
-                  # 3. Default behavior - use first available firm ID
-                  FIRM_ID=$(cat ${CURRENT_DIR}/config.json | jq -r ".id" | jq "keys_unsorted" | jq "first" | tr -d '"')
-                  echo "Using first available firm ID: ${FIRM_ID}"
-                fi
-                
+                # Categorize by template type and add to appropriate bucket
                 if [[ "${CURRENT_DIR}" == *reconciliation_texts* ]]; then
-                  # FETCH THE NEWEST VERSION OF THE TOKENS FROM THE SECRETS, IN CASE THEY WERE UPDATED BY THE INITIATION OF A CONCURRENT WORKFLOW
-                  echo '${{ secrets.CONFIG_JSON }}' > $HOME/.silverfin/config.json
-                  # RUN TEST
-                  echo "Running tests for ${HANDLE} in firm ${FIRM_ID}"
-                  OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-test --handle "${HANDLE}" --firm "${FIRM_ID}" --status 2>&1)
-                  # CHECK OUTPUT
-                  if [[ "$OUTPUT" =~ "PASSED" ]]; then
-                    echo "${HANDLE}: passed"
-                  elif [[ "$OUTPUT" =~ "FAILED" ]]; then
-                    echo "${HANDLE}: failed"
-                    ERRORS+=("${HANDLE}")
+                  if [[ -z "${HANDLES_BY_FIRM[${FIRM_ID}]}" ]]; then
+                    HANDLES_BY_FIRM[${FIRM_ID}]="${HANDLE_OR_NAME}"
                   else
-                    echo "${HANDLE}: other errors: ${OUTPUT}"
-                    ERRORS+=("${OUTPUT}")
+                    HANDLES_BY_FIRM[${FIRM_ID}]="${HANDLES_BY_FIRM[${FIRM_ID}]}|${HANDLE_OR_NAME}"
+                  fi
+                elif [[ "${CURRENT_DIR}" == *account_templates* ]]; then
+                  if [[ -z "${ACCOUNT_TEMPLATES_BY_FIRM[${FIRM_ID}]}" ]]; then
+                    ACCOUNT_TEMPLATES_BY_FIRM[${FIRM_ID}]="${HANDLE_OR_NAME}"
+                  else
+                    ACCOUNT_TEMPLATES_BY_FIRM[${FIRM_ID}]="${ACCOUNT_TEMPLATES_BY_FIRM[${FIRM_ID}]}|${HANDLE_OR_NAME}"
                   fi
                 fi
                 break
               else
-                echo "Config file not found in ${CURRENT_DIR}"
-                CURRENT_DIR="$(dirname "${CURRENT_DIR}")"
+                echo "Config file not found in ${TEMPLATE_DIR}"
+                TEMPLATE_DIR="$(dirname "${TEMPLATE_DIR}")"
               fi
             done
           done
+
+          # Second pass: run tests in batches
+          # FETCH THE NEWEST VERSION OF THE TOKENS FROM THE SECRETS, IN CASE THEY WERE UPDATED BY THE INITIATION OF A CONCURRENT WORKFLOW
+          echo '${{ secrets.CONFIG_JSON }}' > $HOME/.silverfin/config.json
+
+          # Run tests for reconciliation handles grouped by firm ID
+          for FIRM_ID in "${!HANDLES_BY_FIRM[@]}"; do
+            HANDLES="${HANDLES_BY_FIRM[${FIRM_ID}]}"
+            echo "Running tests for handles: ${HANDLES} in firm ${FIRM_ID}"
+
+            OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-test -h "${HANDLES}" -f "${FIRM_ID}" --status 2>&1)
+            parse_test_output "$OUTPUT"
+          done
+
+          # Run tests for account templates grouped by firm ID
+          for FIRM_ID in "${!ACCOUNT_TEMPLATES_BY_FIRM[@]}"; do
+            TEMPLATE_NAMES="${ACCOUNT_TEMPLATES_BY_FIRM[${FIRM_ID}]}"
+            echo "Running tests for account templates: ${TEMPLATE_NAMES} in firm ${FIRM_ID}"
+            
+            OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-test -at "${TEMPLATE_NAMES}" -f "${FIRM_ID}" --status 2>&1)
+            parse_test_output "$OUTPUT"
+          done
+
           # CHECK ERRORS PRESENT
           if [ ${#ERRORS[@]} -eq 0 ]; then
-              echo "All tests have passed"
+            echo "All tests have passed"
           else
-              echo "Errors: ${ERRORS[@]}, please run the tests locally to fix the errors"
-              exit 1
+            echo "Errors: ${ERRORS[@]}, please run the tests locally to fix the errors"
+            exit 1
           fi
 
       # - name: Get changed files in the shared_parts folder
