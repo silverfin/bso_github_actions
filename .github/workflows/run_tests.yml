@@ -111,7 +111,7 @@ jobs:
               for id in $available_ids; do
                 if [[ "$id" == "$test_firm_id" ]]; then
                   firm_id="$test_firm_id"
-                  echo "Using configured test_firm_id: ${firm_id}"
+                  echo "Using configured test_firm_id: ${firm_id}" >&2
                   break
                 fi
               done
@@ -122,7 +122,7 @@ jobs:
               for id in $available_ids; do
                 if [[ "$id" == "$SF_TEST_FIRM_ID" ]]; then
                   firm_id="$SF_TEST_FIRM_ID"
-                  echo "Using SF_TEST_FIRM_ID environment variable: ${firm_id}"
+                  echo "Using SF_TEST_FIRM_ID environment variable: ${firm_id}" >&2
                   break
                 fi
               done
@@ -131,7 +131,7 @@ jobs:
             # 3. Default: first available firm ID
             if [[ -z "$firm_id" ]]; then
               firm_id=$(cat "${config_file}" | jq -r ".id | keys_unsorted | first" | tr -d '"')
-              echo "Using first available firm ID: ${firm_id}"
+              echo "Using first available firm ID: ${firm_id}" >&2
             fi
             
             echo "$firm_id"
