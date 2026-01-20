@@ -27,42 +27,174 @@ The following tools assume that you use the structure detailed by this repositor
             config.json
 ```
 
-## GitHub Actions
+# Github Actions documentation
 
-- [Run Liquid Tests](https://github.com/silverfin/example_liquid_repository/blob/main/.github/run_tests.yml)
-- [Update Liquid Templates - Review](https://github.com/silverfin/example_liquid_repository/blob/main/.github/update_templates_review.yml)
-- [Update Liquid Templates - Production](https://github.com/silverfin/example_liquid_repository/blob/main/.github/update_templates_production.yml)
+The document will go over all the Github Actions that currently automate a couple of tasks in the Silverfin development workflow. All the actions are designed to be reused across multiple market repositories. 
 
-### Setup
 
-- Create `SF_API_CLIENT_ID` & `SF_API_SECRET` secrets.
-- Create a secret named `CONFIG_JSON` where you replicate a local `~/.silverfin/config.json`. It is important to note that the token's pair that this Action is going to use shouldn't be also used by other users, since it will be revoked eventually.
-- Set variables named `FIRM_ID_REVIEW`, `FIRM_ID_PRODUCTION`.
-- Create a [Personal Access Token](https://github.com/settings/personal-access-tokens/new).
-  - Set it to only have access to the repository needed and nothing else.
-  - Limit it's scope as much as possible.
-  - Permissions:
-    - Environments: `Read and Write`
-    - Metadata: `Read-only`
-    - Pull requests: `Read and Write`
-    - Secrets: `Read and Write`
-  - Store it as a secret named `REPO_ACCESS_TOKEN`
+## Table of Contents
 
-### Behaviour
+* [Overview](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBfa4cff673955d42e9a609fab12)
+* [Individual Action Documentation](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf5d38766349a742b78f139ee4d)
+  * [Label management](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBfda115c3c17e34b4c833cb4b0a)
+    * [Add Code Review Label (add_code_review_label.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBfce44f57a01564acd95f8c0c98)
+    * [Remove Code Review Label (remove_code_review_label.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf2828559422d84087b81255dc8)
+  * [Authentication](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf4f743db4b6854130af8693671)
+    * [Check authentication (check_auth.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf73af65c6455e4bb6a62454b15)
+  * [Testing](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf13d6dbd0df1e4450b3b22691c)
+    * [Check YAML files (check_tests.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf931fa1547b4b419d940464f89)
+    * [Run liquid tests (run_tests.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBfa4878bb5baac49cbb0c39d927)
+  * [Slack updates](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBfc9ca89d4b174494391ba075c5)
+    * [Automated slack update (slack_changelog.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf862cf4257e68475d8b47891c6)
 
-As they are defined right now, these workflows will be triggered in different situations:
 
-- "run_tests":
-  - Use: automatically runs the liquid tests of the updated reconciliations as well as the liquid tests of all the reconciliations linked to an updated shared part.
-  - Run: will be run when any change is made in an existing Pull Request (created, updated, closed). It will use take the first firm ID from the config.json from the reconciliation to specify in which firm the liquid tests will be run.
-- "update_templates_review":
-  - Use: automatically updates the changes liquid templates to the firm specified in the variable "FIRM_ID_REVIEW", which is the firm where the functional review will be done after the main development / code review is over.
-  - Run: will be run when a label named "2-functional-review" is added to a PR and on every subsequent push to this PR while this label is still added. It will use the variable "FIRM_ID_REVIEW" to establish to which firm the updates will be pushed.
-- "update_templates_production":
-  - Use: automatically updates the changes liquid templates to the firm specified in the variable "FIRM_ID_PRODUCTION", which is the firm where a 'custom template' copy of all the templates exist which are equal to the partner templates. This is the firm where the templates needs to copied from to partner. Will automatically remove all previously added labels and add the label '3-deploy-to-partner'.
-  - Run: will be run when a PR is closed and merged to the main branch. It will use the variable "FIRM_ID_PRODUCTION" to establish to which firm the updates will be pushed.
-- "add_shared_parts_review":
-  - Use: automatically adds the shared parts to the firm specified in the variable "FIRM_ID_REVIEW", which is the firm where the functional review will be done after the main development / code review is over.
-  - Run: will be run when a label named "add-shared-parts-review-firm" is added to a PR. It will use the variable "FIRM_ID_REVIEW" to establish to which firm the updates will be pushed. Once it's finished, labeles will be automatically removed and a comment will be inserted in the PR.
-- "add_shared_parts_production":
-  - Use: automatically adds the shared parts to the firm specified in the variable "FIRM_ID_PRODUCTION". This is the firm where the templates needs to copied from to partner. Once it's finished, labeles will be automatically removed and a comment will be inserted in the PR.
+## Overview
+
+All Github Actions are designed to be reused across multiple market repositories. As a result, they are stored in a specific repository in Github: [BSO Github Actions](https://github.com/silverfin/bso_github_actions). If an action needs to be added to a specific repository, these generic actions/workflows can be linked. 
+
+Currently, there are three groups of actions available:
+
+* Label management: Add/remove code review labels automatically
+* Authentication: Check and refresh Silverfin API tokens
+* Testing: Validate YAML files and run liquid tests
+
+
+
+## Individual Action Documentation
+
+### Label management
+
+#### Add Code Review Label  `(add_code_review_label.yml)`
+
+_Description_:
+The workflow will automatically add a `code-review` label to pull requests when a review is requested. 
+
+_Trigger_: 
+
+* A reviewer is assigned/requested on any PR
+* A draft PR is converted to "Ready for review"
+
+#### Remove Code Review Label  `(remove_code_review_label.yml)`
+
+_Description_: 
+Automatically removes the "code-review" label from pull requests when review comments are provided. It will only execute if the review contains actual comments and the commenter is NOT CodeRabbit.
+
+_Trigger_:
+
+* A complete PR review (any type: approve, request changes, comment) is submitted
+* An individual line comment has been submitted during the review
+
+
+
+### Authentication
+
+#### Check authentication `(check_auth.yml)`
+
+_Description_:
+Refreshes Silverfin API tokens to ensure authentication remains valid for subsequent operations.
+
+_Trigger_: 
+
+* The authentication workflow is run before the `run-tests` workflow to make sure that we always have the correct authentication before communicating with the platform. 
+
+
+_Steps:_
+
+* Installs the latest silverfin-cli version
+* Loads the CONFIG_JSON file from the secrets
+* Refreshes the tokens for all configured firms
+* Updates the CONFIG_JSON file secret with the refreshed tokens
+
+
+_Prerequisites_:
+
+* `SF_API_CLIENT_ID`: Silverfin API client ID
+* `SF_API_SECRET`: Silverfin API secret
+* `CONFIG_JSON`: Silverfin configuration file content
+* `REPO_ACCESS_TOKEN`: GitHub personal access token
+
+
+
+### Testing
+
+#### Check YAML files `(check_tests.yml)`
+
+_Description:_
+Validates that at least 1 `.yaml/.yml` file has been added or updated when changes are made to templates. This can be by-passed by adding the `no-test-required` to the pull request. 
+
+_Trigger:_
+
+* Every time new commits are pushed to a PR
+* When labels are added (important for the `no-test-required` bypass logic)
+* When labels are removed (re-enables validation if `no-test-required` was removed)
+
+#### Run liquid tests `(run_tests.yml)`
+
+_Description:_
+Executes liquid tests for updated reconciliations and reconciliations that use updated shared parts.
+
+_Trigger_:
+
+* On every pull request to any branch (comprehensive testing)
+* When code is pushed directly to main (post-merge validation)
+* Runs on PR creation, updates (commits), and rebasing/merging actions
+
+
+_Steps:_
+
+* Calls `check_auth.yml` to refresh tokens
+* Identifies changed liquid/config files
+* Determines which templates need testing
+* Runs liquid tests using silverfin-cli `run-test` command
+* Supports multiple firm ID selection strategies ℹ️
+
+
+_Test firm options:_
+There is a certain priority when it comes to test firm id’s. Users do have some options to configure which test firm is used for the liquid tests. 
+
+
+1. **Template-specific test firm id**
+
+This is the most specific option that is available on a template by template basis. An additional attribute `test_firm_id` can be added to the `config.json` file. That firm will always get priority over the other two options.
+
+
+1. **Github test firm id**
+
+If the `test_firm_id` is not used for a specific handle, the Github action will look for a Github environment variable `SF_TEST_FIRM_ID`. This variable can be defined on [this page](https://github.com/silverfin/be_market/settings/variables/actions) (link to BE market) and will be used for every template within the market repo (so not template specific). 
+
+
+1. **Default test firm id**
+
+If none of the above options is used/defined, we will fall back to the default option: the first firm id that is present in the `config.json` file. This is again template specific, but the order cannot be changed (the smallest firm id number will always be on top). 
+
+
+
+### Slack updates
+
+#### Automated slack update (`slack_changelog.yml`)
+
+_Description_: 
+Posts a changelog update to Slack when a pull request is merged into the `main` branch. 
+
+_Trigger:_
+
+* A pull request targeting `main` is closed
+* Only proceeds if the pull request was actually merged (not just closed)
+
+
+_Steps:_
+
+* Checks that the closed PR was merged
+* Inherits repository/organization secrets and sends the Slack notification for the merged PR
+
+
+_Prerequisites:_
+
+* Set up a Slack workflow in the Slack settings.
+    * [UK](https://slack.com/shortcuts/Ft09PPKBHW5N/f0d53e634f6fccff7335148ac0eab5d8)
+    * [NL](https://slack.com/shortcuts/Ft09MT6C2CKW/c8cb614e95f1192fdbeb264361d04f73)
+    * [LU](https://slack.com/shortcuts/Ft09ML70CL94/1a767ec100c7340772e48c84c24665fa)
+    * [BE](https://slack.com/shortcuts/Ft09CP21L86M/ed8f5f30038e6ecca4adf2d01df996ef)
+* This workflow will then generate a URL, which is called a webhook. 
+* The webhook from the workflow should be stored in an environment variable in the market specific repository: `SLACK_WEBHOOK_URL`
+* The Github action will create a text object (containing the formatted message) and will post this to the Slack webhook. This will then create the message in a pre-defined channel. 
