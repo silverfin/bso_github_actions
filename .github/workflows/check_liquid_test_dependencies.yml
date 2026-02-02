@@ -1,0 +1,167 @@
+name: Check liquid test dependencies
+run-name: Add dependencies comment to PR on review request
+on:
+  pull_request:
+    types: [review_requested]
+
+jobs:
+  report-dependencies:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
+    steps:
+      - name: Checkout Repository - Fetch all history for diff
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed liquid/config files
+        id: changed-files
+        uses: tj-actions/changed-files@v41
+        with:
+          since_last_remote_commit: false
+          dir_names: false
+          ref: "main"
+          files: |
+            **/**.{liquid,yml,yaml,json}
+
+      - name: Filter templates changed
+        id: templates_changed
+        run: |
+          pattern="reconciliation_texts/([^/]+)/"
+          changed_files="${{ steps.changed-files.outputs.all_changed_files }}"
+          if [ -n "$changed_files" ]; then
+            filtered_names=($(printf "%s\n" "$changed_files" | grep -oP "$pattern" || true))
+            if [ $? -ne 0 ]; then
+              echo "No files match the pattern"
+              changed_templates=()
+            else
+              filtered_names=("${filtered_names[@]%/}")
+              changed_templates=($(printf "%s\n" "${filtered_names[@]}" | sort -u))
+            fi
+          else
+            echo "No changed files"
+            changed_templates=()
+          fi
+          if [ ${#changed_templates[@]} -eq 0 ]; then
+            echo "changed_templates=[]" >> $GITHUB_OUTPUT
+            echo "No template directories changed."
+          else
+            echo "changed_templates=${changed_templates[*]}" >> $GITHUB_OUTPUT
+            echo "Changed template(s): ${changed_templates[*]}"
+          fi
+          exit 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install silverfin-cli
+        run: |
+          npm install https://github.com/silverfin/silverfin-cli.git
+          node ./node_modules/silverfin-cli/bin/cli.js -V
+
+      - name: Resolve handles from changed templates
+        id: resolve-handles
+        env:
+          CHANGED_TEMPLATES: ${{ steps.templates_changed.outputs.changed_templates }}
+        run: |
+          if [ -z "$CHANGED_TEMPLATES" ] || [ "$CHANGED_TEMPLATES" = "[]" ]; then
+            echo "handles=" >> $GITHUB_OUTPUT
+            echo "No reconciliation_texts changed."
+            exit 0
+          fi
+          node -e "
+          const fs = require('fs');
+          const path = require('path');
+          const paths = process.env.CHANGED_TEMPLATES.trim().split(/\s+/).filter(Boolean);
+          const baseDirs = ['reconciliation_texts'];
+          const handles = [];
+          for (const name of paths) {
+            let handle = name;
+            for (const base of baseDirs) {
+              const configPath = path.join(base, name, 'config.json');
+              if (fs.existsSync(configPath)) {
+                try {
+                  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+                  handle = config.handle || config.name || name;
+                  break;
+                } catch (_) {}
+              }
+            }
+            handles.push(handle);
+          }
+          fs.writeFileSync('handles.txt', [...new Set(handles)].join('\n'), 'utf8');
+          console.log('Handles to check:', [...new Set(handles)].join(', '));
+          "
+
+      - name: Run check-dependencies and report
+        id: report
+        run: |
+          if [ ! -f handles.txt ] || [ -z "$(cat handles.txt 2>/dev/null)" ]; then
+            echo "No handles to check."
+            touch dependency_handles.txt
+            exit 0
+          fi
+          : > dependency_handles_raw.txt
+          while IFS= read -r handle || [ -n "$handle" ]; do
+            [ -z "$handle" ] && continue
+            echo "Checking dependencies for handle: $handle"
+            node ./node_modules/silverfin-cli/bin/cli.js check-dependencies -h "$handle" 2>/dev/null || true | while IFS= read -r line; do
+              cleaned=$(echo "$line" | sed -E 's/^[[:space:]]*[-*]?[[:space:]]*//' | tr -d '\r')
+              if echo "$cleaned" | grep -qE '^[a-zA-Z0-9_-]+$'; then
+                echo "$cleaned" >> dependency_handles_raw.txt
+              fi
+            done
+          done < handles.txt
+          sort -u dependency_handles_raw.txt 2>/dev/null | grep -v '^$' > dependency_handles.txt || true
+          if [ -s dependency_handles.txt ]; then
+            echo "Dependencies:" && tr '\n' ',' < dependency_handles.txt && echo
+          else
+            echo "Dependencies: (none)"
+            : > dependency_handles.txt
+          fi
+
+      - name: Comment PR with dependencies
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const raw = fs.existsSync('dependency_handles.txt')
+              ? fs.readFileSync('dependency_handles.txt', 'utf8')
+              : '';
+            const handles = raw.trim().split('\n').filter(Boolean);
+            const bulletList = handles.length
+              ? handles.map(h => '- ' + h).join('\n')
+              : '- (none)';
+            const body = 'We have identified following dependencies:\n\n' + bulletList;
+
+            const commentMarker = '<!-- check_liquid_test_dependencies -->';
+            const fullBody = commentMarker + '\n\n' + body;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+
+            const existing = comments.find(c => c.body && c.body.includes(commentMarker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: fullBody
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: fullBody
+              });
+            }
