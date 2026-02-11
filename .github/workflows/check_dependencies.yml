@@ -1,0 +1,188 @@
+# Runs `silverfin check-dependencies -h <handle>` for each reconciliation template
+# changed in the PR. Triggered only when the `code-review` label is added.
+# Uses pull_request_target and only checks out the base ref (no untrusted PR code).
+name: Check dependencies
+run-name: Check dependencies for changed reconciliation templates
+on:
+  pull_request_target:
+    types: [labeled]
+
+jobs:
+  check-dependencies:
+    # Run only when the added label is exactly 'code-review'
+    if: github.event.label.name == 'code-review'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      # Check out base branch only (no untrusted PR code)
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+
+      # Get list of files changed in the PR via API (no PR checkout)
+      - name: Get PR changed files
+        id: pr-files
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: files } = await github.rest.pulls.listFiles({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number
+            });
+            const paths = files.map(f => f.filename).join('\n');
+            core.setOutput('paths', paths);
+
+      # Derive reconciliation handles from changed paths (same pattern as run_tests "Filter templates changed")
+      - name: Get reconciliation handles to check
+        id: handles
+        run: |
+          changed_files="${{ steps.pr-files.outputs.paths }}"
+          pattern="reconciliation_texts/([^/]+)/"
+          if [ -n "$changed_files" ]; then
+            filtered_names=($(printf "%s\n" "$changed_files" | grep -oE "$pattern" | sed 's|reconciliation_texts/||;s|/||' | sort -u))
+          else
+            filtered_names=()
+          fi
+          # Resolve handle from config.json if present (explicit mapping), else use directory name
+          handles=()
+          for dir in "${filtered_names[@]}"; do
+            config_path="reconciliation_texts/${dir}/config.json"
+            if [ -f "$config_path" ]; then
+              h=$(jq -r '.handle // .name // empty' "$config_path" 2>/dev/null || true)
+              [ -z "$h" ] && h="$dir"
+            else
+              h="$dir"
+            fi
+            handles+=("$h")
+          done
+          # Dedupe and output
+          if [ ${#handles[@]} -eq 0 ]; then
+            echo "handles_json=[]" >> $GITHUB_OUTPUT
+            echo "No reconciliation templates changed."
+          else
+            echo "handles_json=$(printf '%s\n' "${handles[@]}" | sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')" >> $GITHUB_OUTPUT
+            echo "Handles to check:"
+            printf '%s\n' "${handles[@]}" | sort -u
+          fi
+
+      - name: Post comment when no reconciliation templates changed
+        if: steps.handles.outputs.handles_json == '[]'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const marker = '<!-- silverfin-check-dependencies -->';
+            const body = [
+              '## Silverfin check-dependencies',
+              '',
+              'No reconciliation templates were changed in this PR. Nothing to run.',
+              '',
+              marker
+            ].join('\n');
+            const { owner, repo } = context.repo;
+            const prNumber = context.payload.pull_request.number;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number: prNumber
+            });
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body && c.body.includes(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber, body
+              });
+            }
+
+      - name: Setup Node and Silverfin CLI
+        if: steps.handles.outputs.handles_json != '[]'
+        run: |
+          npm install https://github.com/silverfin/silverfin-cli.git
+          node ./node_modules/silverfin-cli/bin/cli.js -V
+
+      - name: Load Silverfin config
+        if: steps.handles.outputs.handles_json != '[]'
+        run: |
+          mkdir -p $HOME/.silverfin/
+          echo '${{ secrets.CONFIG_JSON }}' > $HOME/.silverfin/config.json
+
+      # Run check-dependencies for each handle and collect results
+      - name: Run check-dependencies per handle
+        id: run-check
+        if: steps.handles.outputs.handles_json != '[]'
+        env:
+          HANDLES_JSON: ${{ steps.handles.outputs.handles_json }}
+        run: |
+          echo 'results<<CHECK_EOF' >> $GITHUB_OUTPUT
+          job_failed=0
+          for handle in $(echo "$HANDLES_JSON" | jq -r '.[]'); do
+            echo "## Handle: \`${handle}\`"
+            echo ""
+            echo "Command: \`silverfin check-dependencies -h ${handle}\`"
+            echo ""
+            output=$(node ./node_modules/silverfin-cli/bin/cli.js check-dependencies -h "$handle" 2>&1) || true
+            exit_code=$?
+            echo '```'
+            echo "$output"
+            echo '```'
+            echo ""
+            if [[ $exit_code -ne 0 ]]; then
+              echo "**Status: Failed (exit code ${exit_code})**"
+              job_failed=1
+            else
+              echo "**Status: OK**"
+            fi
+            echo ""
+          done
+          echo 'CHECK_EOF' >> $GITHUB_OUTPUT
+          echo "job_failed=$job_failed" >> $GITHUB_OUTPUT
+
+      - name: Post PR comment with results
+        if: steps.handles.outputs.handles_json != '[]' && always() && steps.run-check.outcome != 'skipped'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const marker = '<!-- silverfin-check-dependencies -->';
+            const body = [
+              '## Silverfin check-dependencies',
+              '',
+              'Ran for reconciliation templates changed in this PR (triggered by `code-review` label).',
+              '',
+              '${{ steps.run-check.outputs.results }}',
+              marker
+            ].join('\n');
+
+            const prNumber = context.payload.pull_request.number;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number: prNumber
+            });
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body && c.body.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body
+              });
+              console.log('Updated existing check-dependencies comment');
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber, body
+              });
+              console.log('Created new check-dependencies comment');
+            }
+
+      - name: Fail job if any check-dependencies failed
+        if: steps.handles.outputs.handles_json != '[]' && steps.run-check.outputs.job_failed == '1'
+        run: |
+          echo "One or more silverfin check-dependencies runs failed. See PR comment for details."
+          exit 1
