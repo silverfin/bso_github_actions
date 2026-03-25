@@ -103,6 +103,7 @@ _Steps:_
 * Installs the latest silverfin-cli version
 * Loads the CONFIG_JSON file from the secrets
 * Refreshes the tokens for all configured firms
+* Refreshes partner API keys for each key in `partnerCredentials` when that object is present (otherwise skips)
 * Updates the CONFIG_JSON file secret with the refreshed tokens
 
 

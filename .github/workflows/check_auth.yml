@@ -34,13 +34,19 @@ jobs:
           echo '${{ secrets.CONFIG_JSON }}' > $HOME/.silverfin/config.json
       - name: Refresh tokens
         run: |
-          CONFIG_JSON=$(cat $HOME/.silverfin/config.json)
-          for FIRM_ID in $(echo $CONFIG_JSON | jq 'del(.defaultFirmIDs, .host) | keys[]'); do
-            FIRM_ID=$(echo $FIRM_ID | tr -d '"')
+          CONFIG_PATH="$HOME/.silverfin/config.json"
+          CONFIG_JSON=$(cat "$CONFIG_PATH")
+          for FIRM_ID in $(echo "$CONFIG_JSON" | jq 'del(.defaultFirmIDs, .host) | keys[]'); do
+            FIRM_ID=$(echo "$FIRM_ID" | tr -d '"')
             if [[ -n "$FIRM_ID" && "$FIRM_ID" =~ ^[0-9]+$  ]]; then
               echo "[Action] refreshing token for firm $FIRM_ID"
-              node ./node_modules/silverfin-cli/bin/cli.js config --refresh-token $FIRM_ID
+              node ./node_modules/silverfin-cli/bin/cli.js config --refresh-token "$FIRM_ID"
             fi
+          done
+          CONFIG_JSON=$(cat "$CONFIG_PATH")
+          for PARTNER_ID in $(echo "$CONFIG_JSON" | jq -r '.partnerCredentials // {} | keys[]'); do
+            echo "[Action] refreshing partner API key for partner $PARTNER_ID"
+            node ./node_modules/silverfin-cli/bin/cli.js config --refresh-partner-token "$PARTNER_ID"
           done
       - name: Prepare and store updated CONFIG_JSON as secret
         run: |
