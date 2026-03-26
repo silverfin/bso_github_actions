@@ -72,8 +72,10 @@ jobs:
       # Derive reconciliation handles from changed paths (same pattern as run_tests "Filter templates changed")
       - name: Get reconciliation handles to check
         id: handles
+        env:
+          CHANGED_FILES: ${{ steps.pr-files.outputs.paths }}
         run: |
-          changed_files="${{ steps.pr-files.outputs.paths }}"
+          changed_files="$CHANGED_FILES"
           pattern="reconciliation_texts/([^/]+)/"
           if [ -n "$changed_files" ]; then
             filtered_names=($(printf "%s\n" "$changed_files" | grep -oE "$pattern" | sed "s|reconciliation_texts/||;s|/||" | sort -u))
