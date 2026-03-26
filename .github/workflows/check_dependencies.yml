@@ -1,30 +1,23 @@
 # Runs `silverfin check-dependencies -h <handle>` for each reconciliation template
 # changed in the PR. Triggered only when the `code-review` label is added.
 # Reusable workflow: call from a consumer repo with pull_request (labeled) and/or workflow_dispatch.
-# Runs check_auth first to refresh tokens (same pattern as run_tests).
+#
+# Does not run check_auth: that job updates CONFIG_JSON via gh secret set, which notifies
+# repo/org admins by email. The CLI check-dependencies command only scans local Liquid Test
+# YAML files and does not need API credentials.
 name: Check dependencies
 run-name: Check dependencies for changed reconciliation templates
 on:
   workflow_call:
 
 jobs:
-  check-auth:
-    # Refresh Silverfin API tokens (same as run_tests)
-    if: github.event.label.name == 'code-review' || github.event_name == 'workflow_dispatch'
-    uses: ./.github/workflows/check_auth.yml
-    secrets: inherit
-
   check-dependencies:
     # Run when the added label is "code-review" (pull_request) or when triggered manually (workflow_dispatch)
     if: github.event.label.name == 'code-review' || github.event_name == 'workflow_dispatch'
-    needs: [check-auth]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
-    env:
-      SF_API_CLIENT_ID: "${{ secrets.SF_API_CLIENT_ID }}"
-      SF_API_SECRET: "${{ secrets.SF_API_SECRET }}"
     steps:
       # Resolve PR base SHA (required for checkout; undefined for workflow_dispatch)
       - name: Get PR details
@@ -130,12 +123,6 @@ jobs:
         run: |
           npm install https://github.com/silverfin/silverfin-cli.git
           node ./node_modules/silverfin-cli/bin/cli.js -V
-
-      - name: Load Silverfin config
-        if: steps.handles.outputs.handles_json != '[]'
-        run: |
-          mkdir -p $HOME/.silverfin/
-          echo '${{ secrets.CONFIG_JSON }}' > $HOME/.silverfin/config.json
 
       # Run check-dependencies for each handle and collect results
       - name: Run check-dependencies per handle
