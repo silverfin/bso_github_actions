@@ -9,6 +9,11 @@ name: Check dependencies
 run-name: Check dependencies for changed reconciliation templates
 on:
   workflow_call:
+    inputs:
+      pull_request_number:
+        description: "Optional PR number when the caller passes it explicitly (e.g. workflow_dispatch input)."
+        required: false
+        type: string
 
 jobs:
   check-dependencies:
@@ -18,6 +23,8 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+    env:
+      WORKFLOW_CALL_PR_NUMBER: ${{ inputs.pull_request_number }}
     steps:
       # Resolve PR base SHA (required for checkout; undefined for workflow_dispatch)
       - name: Get PR details
@@ -25,7 +32,11 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const prNumber = context.payload.pull_request?.number || context.payload.inputs?.pull_request_number;
+            const fromCall = process.env.WORKFLOW_CALL_PR_NUMBER;
+            const prNumber =
+              context.payload.pull_request?.number ??
+              context.payload.inputs?.pull_request_number ??
+              (fromCall && fromCall !== "" ? parseInt(fromCall, 10) : undefined);
             const { data: pr } = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -45,7 +56,11 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const prNumber = context.payload.pull_request?.number || context.payload.inputs?.pull_request_number;
+            const fromCall = process.env.WORKFLOW_CALL_PR_NUMBER;
+            const prNumber =
+              context.payload.pull_request?.number ??
+              context.payload.inputs?.pull_request_number ??
+              (fromCall && fromCall !== "" ? parseInt(fromCall, 10) : undefined);
             const files = await github.paginate(github.rest.pulls.listFiles, {
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -101,7 +116,11 @@ jobs:
               marker
             ].join("\n");
             const { owner, repo } = context.repo;
-            const prNumber = context.payload.pull_request?.number || context.payload.inputs?.pull_request_number;
+            const fromCall = process.env.WORKFLOW_CALL_PR_NUMBER;
+            const prNumber =
+              context.payload.pull_request?.number ??
+              context.payload.inputs?.pull_request_number ??
+              (fromCall && fromCall !== "" ? parseInt(fromCall, 10) : undefined);
             const { data: comments } = await github.rest.issues.listComments({
               owner, repo, issue_number: prNumber
             });
@@ -178,7 +197,11 @@ jobs:
               marker
             ].join("\n");
 
-            const prNumber = context.payload.pull_request?.number || context.payload.inputs?.pull_request_number;
+            const fromCall = process.env.WORKFLOW_CALL_PR_NUMBER;
+            const prNumber =
+              context.payload.pull_request?.number ??
+              context.payload.inputs?.pull_request_number ??
+              (fromCall && fromCall !== "" ? parseInt(fromCall, 10) : undefined);
             const owner = context.repo.owner;
             const repo = context.repo.repo;
 
