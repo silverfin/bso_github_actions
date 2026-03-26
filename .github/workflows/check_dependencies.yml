@@ -155,7 +155,7 @@ jobs:
         run: |
           job_failed=0
           : > check_results.txt
-          for handle in $(echo "$HANDLES_JSON" | jq -r ".[]"); do
+          while IFS= read -r handle; do
             echo "## Handle: \`${handle}\`" >> check_results.txt
             echo "" >> check_results.txt
             echo "Command: \`silverfin check-dependencies -h ${handle}\`" >> check_results.txt
@@ -175,7 +175,7 @@ jobs:
               echo "**Status: OK**" >> check_results.txt
             fi
             echo "" >> check_results.txt
-          done
+          done < <(jq -r '.[]' <<< "$HANDLES_JSON")
           echo "results<<CHECK_EOF" >> $GITHUB_OUTPUT
           cat check_results.txt >> $GITHUB_OUTPUT
           echo "CHECK_EOF" >> $GITHUB_OUTPUT
