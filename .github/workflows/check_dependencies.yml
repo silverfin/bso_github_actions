@@ -26,7 +26,7 @@ jobs:
     env:
       WORKFLOW_CALL_PR_NUMBER: ${{ inputs.pull_request_number }}
     steps:
-      # Resolve PR base SHA (required for checkout; undefined for workflow_dispatch)
+      # Resolve PR base and head SHAs (head used for checkout so scans match the PR branch)
       - name: Get PR details
         id: pr-details
         uses: actions/github-script@v7
@@ -43,12 +43,13 @@ jobs:
               pull_number: prNumber
             });
             core.setOutput("base_sha", pr.base.sha);
+            core.setOutput("head_sha", pr.head.sha);
 
-      # Check out base branch (used for config.json / handle resolution; file list from API)
-      - name: Checkout base branch
+      # Check out PR HEAD (config.json / template tree for check-dependencies must match the PR)
+      - name: Checkout PR head
         uses: actions/checkout@v4
         with:
-          ref: ${{ steps.pr-details.outputs.base_sha }}
+          ref: ${{ steps.pr-details.outputs.head_sha }}
 
       # Get list of files changed in the PR via API (no PR checkout)
       - name: Get PR changed files
