@@ -3,8 +3,8 @@
 # Reusable workflow: call from a consumer repo with pull_request (labeled) and/or workflow_dispatch.
 #
 # Does not run check_auth: that job updates CONFIG_JSON via gh secret set, which notifies
-# repo/org admins by email. The CLI check-dependencies command only scans local Liquid Test
-# YAML files and does not need API credentials.
+# repo/org admins by email. The silverfin-cli still requires SF_API_CLIENT_ID / SF_API_SECRET
+# in the environment to start (even for check-dependencies / version).
 name: Check dependencies
 run-name: Check dependencies for changed reconciliation templates
 on:
@@ -25,6 +25,8 @@ jobs:
       pull-requests: write
     env:
       WORKFLOW_CALL_PR_NUMBER: ${{ inputs.pull_request_number }}
+      SF_API_CLIENT_ID: ${{ secrets.SF_API_CLIENT_ID }}
+      SF_API_SECRET: ${{ secrets.SF_API_SECRET }}
     steps:
       # Resolve PR base and head SHAs (head used for checkout so scans match the PR branch)
       - name: Get PR details
