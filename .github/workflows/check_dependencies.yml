@@ -3,8 +3,10 @@
 # Reusable workflow: call from a consumer repo with pull_request (labeled) and/or workflow_dispatch.
 #
 # Does not run check_auth: that job updates CONFIG_JSON via gh secret set, which notifies
-# repo/org admins by email. The CLI check-dependencies command only scans local Liquid Test
-# YAML files and does not need API credentials.
+# repo/org admins by email. check-dependencies only scans local Liquid Test YAML files.
+#
+# silverfin-cli still requires SF_API_CLIENT_ID / SF_API_SECRET at process startup; callers
+# must pass these secrets (e.g. secrets: inherit or explicit mapping from the consumer repo).
 name: Check dependencies
 run-name: Check dependencies for changed reconciliation templates
 on:
@@ -14,6 +16,13 @@ on:
         description: "Optional PR number when the caller passes it explicitly (e.g. workflow_dispatch input)."
         required: false
         type: string
+    secrets:
+      SF_API_CLIENT_ID:
+        description: "Silverfin API OAuth client id (same as other silverfin-cli workflows)."
+        required: true
+      SF_API_SECRET:
+        description: "Silverfin API OAuth client secret."
+        required: true
 
 jobs:
   check-dependencies:
@@ -140,19 +149,16 @@ jobs:
               });
             }
 
-      - name: Setup Node and Silverfin CLI
-        if: steps.handles.outputs.handles_json != '[]'
-        run: |
-          npm install https://github.com/silverfin/silverfin-cli.git
-          node ./node_modules/silverfin-cli/bin/cli.js -V
-
       # Run check-dependencies for each handle and collect results
       - name: Run check-dependencies per handle
         id: run-check
         if: steps.handles.outputs.handles_json != '[]'
         env:
           HANDLES_JSON: ${{ steps.handles.outputs.handles_json }}
+          SF_API_CLIENT_ID: ${{ secrets.SF_API_CLIENT_ID }}
+          SF_API_SECRET: ${{ secrets.SF_API_SECRET }}
         run: |
+          npm install https://github.com/silverfin/silverfin-cli.git
           job_failed=0
           : > check_results.txt
           while IFS= read -r handle; do
