@@ -139,11 +139,6 @@ jobs:
               });
             }
 
-      - name: Setup Node and Silverfin CLI
-        if: steps.handles.outputs.handles_json != '[]'
-        run: |
-          npm install https://github.com/silverfin/silverfin-cli.git
-
       # Run check-dependencies for each handle and collect results
       - name: Run check-dependencies per handle
         id: run-check
@@ -151,6 +146,7 @@ jobs:
         env:
           HANDLES_JSON: ${{ steps.handles.outputs.handles_json }}
         run: |
+          npm install https://github.com/silverfin/silverfin-cli.git
           job_failed=0
           : > check_results.txt
           while IFS= read -r handle; do
