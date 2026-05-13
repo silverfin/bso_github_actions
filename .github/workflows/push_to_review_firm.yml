@@ -1,0 +1,394 @@
+# Reusable workflow. Pushes the latest template code from the development PR(s)
+# linked to a functional-review Jira ticket to a Silverfin "review" firm.
+#
+# A market repo wraps this with `repository_dispatch` (fired by a Jira Automation
+# button) and/or `workflow_dispatch`, passing the development ticket key(s) and the
+# product manager's review firm id.
+#
+# Reader-only on CONFIG_JSON: it never refreshes tokens and never writes the secret
+# back (avoids becoming a concurrent writer of CONFIG_JSON). It relies on the
+# existing refresher to keep the secret fresh — see docs/github_actions_authentication.md.
+name: push-to-review-firm
+run-name: Push templates to a review firm (${{ inputs.dev_ticket_keys }})
+on:
+  workflow_call:
+    inputs:
+      dev_ticket_keys:
+        description: "Comma-separated Jira keys of the development tickets linked to the functional-review ticket (e.g. 'BE-1234,BE-5678'). Open PRs whose head branch equals or starts with one of these keys are pushed."
+        required: true
+        type: string
+      firm_id:
+        description: "Silverfin firm id to push to (the product manager's review firm). If empty, falls back to firm_id_review_fallback, then to the calling repo's FIRM_ID_REVIEW variable."
+        required: false
+        type: string
+        default: ""
+      fr_ticket_key:
+        description: "The functional-review Jira ticket key (used in the PR comment and Silverfin changelog message). Optional."
+        required: false
+        type: string
+        default: ""
+      firm_id_review_fallback:
+        description: "Fallback firm id supplied by the caller — the wrapper should pass vars.FIRM_ID_REVIEW here so it is resolvable inside this reusable workflow. Optional."
+        required: false
+        type: string
+        default: ""
+    secrets:
+      SF_API_CLIENT_ID:
+        description: "Silverfin API OAuth client id (silverfin-cli needs it at startup)."
+        required: true
+      SF_API_SECRET:
+        description: "Silverfin API OAuth client secret."
+        required: true
+      CONFIG_JSON:
+        description: "silverfin-cli credentials file content (per-firm OAuth tokens). Read only — this workflow never writes it back."
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: push-to-review-firm-${{ inputs.firm_id || inputs.firm_id_review_fallback || vars.FIRM_ID_REVIEW }}
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    outputs:
+      firm_id: ${{ steps.firm.outputs.firm_id }}
+      pr_numbers: ${{ steps.prs.outputs.pr_numbers }}
+      results_md: ${{ steps.push.outputs.results_md }}
+      any_failed: ${{ steps.push.outputs.any_failed }}
+      nothing_to_push: ${{ steps.push.outputs.nothing_to_push }}
+    env:
+      SF_API_CLIENT_ID: ${{ secrets.SF_API_CLIENT_ID }}
+      SF_API_SECRET: ${{ secrets.SF_API_SECRET }}
+    steps:
+      - name: Resolve the review firm id
+        id: firm
+        env:
+          INPUT_FIRM_ID: ${{ inputs.firm_id }}
+          INPUT_FALLBACK: ${{ inputs.firm_id_review_fallback }}
+          VARS_FALLBACK: ${{ vars.FIRM_ID_REVIEW }}
+          DEV_KEYS: ${{ inputs.dev_ticket_keys }}
+        run: |
+          FIRM_ID="$INPUT_FIRM_ID"
+          [ -z "$FIRM_ID" ] && FIRM_ID="$INPUT_FALLBACK"
+          [ -z "$FIRM_ID" ] && FIRM_ID="$VARS_FALLBACK"
+          if [ -z "$FIRM_ID" ]; then
+            echo "::error::No review firm id supplied (firm_id input is empty and no FIRM_ID_REVIEW fallback is set). Dev tickets: ${DEV_KEYS}. Set the product manager's review firm, or define the FIRM_ID_REVIEW repository variable."
+            exit 1
+          fi
+          if ! printf '%s' "$FIRM_ID" | grep -qE '^[0-9]+$'; then
+            echo "::error::Resolved firm id '${FIRM_ID}' is not numeric."
+            exit 1
+          fi
+          echo "Using review firm id: ${FIRM_ID}"
+          echo "firm_id=${FIRM_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Check the review firm is authorized in CONFIG_JSON
+        env:
+          CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+          FIRM_ID: ${{ steps.firm.outputs.firm_id }}
+          DEV_KEYS: ${{ inputs.dev_ticket_keys }}
+        run: |
+          echo "::add-mask::${CONFIG_JSON}"
+          IS_AUTHORIZED=$(printf '%s' "${CONFIG_JSON}" | jq -r --arg f "${FIRM_ID}" 'del(.defaultFirmIDs, .host) | has($f)' 2>/dev/null || echo "false")
+          if [ "${IS_AUTHORIZED}" != "true" ]; then
+            echo "::error::Review firm ${FIRM_ID} is not authorized for this repository (no OAuth tokens for it in CONFIG_JSON). Ask the developer who implemented ${DEV_KEYS} to authorize firm ${FIRM_ID} with the Silverfin CLI ('silverfin authorize') and add it to the repository's CONFIG_JSON secret."
+            exit 1
+          fi
+          echo "Review firm ${FIRM_ID} is authorized."
+
+      - name: Find open PRs for the development tickets
+        id: prs
+        uses: actions/github-script@v7
+        env:
+          DEV_TICKET_KEYS: ${{ inputs.dev_ticket_keys }}
+        with:
+          script: |
+            const keys = process.env.DEV_TICKET_KEYS.split(",").map(s => s.trim()).filter(Boolean);
+            if (keys.length === 0) {
+              core.setOutput("pr_numbers", "[]");
+              core.setOutput("pr_head_refs", "[]");
+              core.setFailed("No development ticket keys were supplied.");
+              return;
+            }
+            const { owner, repo } = context.repo;
+            const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: "open", per_page: 100 });
+            const matched = [];
+            const seen = new Set();
+            for (const pr of open) {
+              if (pr.head.repo && pr.head.repo.full_name !== `${owner}/${repo}`) {
+                core.warning(`Skipping PR #${pr.number}: head branch is on a fork (${pr.head.repo.full_name}).`);
+                continue;
+              }
+              const ref = pr.head.ref;
+              if (keys.some(k => ref === k || ref.startsWith(k + "-"))) {
+                if (!seen.has(pr.number)) {
+                  seen.add(pr.number);
+                  matched.push({ number: pr.number, head_ref: ref, draft: !!pr.draft });
+                }
+              }
+            }
+            if (matched.length === 0) {
+              core.setOutput("pr_numbers", "[]");
+              core.setOutput("pr_head_refs", "[]");
+              core.setFailed(`No open PRs found whose head branch matches any of: ${keys.join(", ")}. Check that the development PR(s) exist, are not yet merged, and follow the JIRA-KEY-description branch naming.`);
+              return;
+            }
+            core.info(`Matched PRs: ${matched.map(m => `#${m.number} (${m.head_ref})${m.draft ? " [draft]" : ""}`).join(", ")}`);
+            core.setOutput("pr_numbers", JSON.stringify(matched.map(m => m.number)));
+            core.setOutput("pr_head_refs", JSON.stringify(matched.map(m => m.head_ref)));
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install silverfin-cli
+        run: |
+          npm install https://github.com/silverfin/silverfin-cli.git
+          VERSION=$(node ./node_modules/silverfin-cli/bin/cli.js -V)
+          echo "silverfin-cli version: ${VERSION}"
+
+      - name: Load Silverfin credentials and set firm
+        env:
+          FIRM_ID: ${{ steps.firm.outputs.firm_id }}
+        run: |
+          mkdir -p "$HOME/.silverfin"
+          echo '${{ secrets.CONFIG_JSON }}' > "$HOME/.silverfin/config.json"
+          node ./node_modules/silverfin-cli/bin/cli.js config --set-firm="${FIRM_ID}"
+          node ./node_modules/silverfin-cli/bin/cli.js config --get-firm
+
+      - name: Push changed templates to the review firm
+        id: push
+        shell: bash
+        env:
+          FIRM_ID: ${{ steps.firm.outputs.firm_id }}
+          FR_TICKET_KEY: ${{ inputs.fr_ticket_key }}
+          PR_NUMBERS: ${{ steps.prs.outputs.pr_numbers }}
+          PR_HEAD_REFS: ${{ steps.prs.outputs.pr_head_refs }}
+        run: |
+          CLI="node ./node_modules/silverfin-cli/bin/cli.js"
+          PATTERN='^(reconciliation_texts|shared_parts|account_templates|export_files)/[^/]+'
+
+          mapfile -t PR_NUMS < <(printf '%s' "${PR_NUMBERS}" | jq -r '.[]')
+          mapfile -t PR_REFS < <(printf '%s' "${PR_HEAD_REFS}" | jq -r '.[]')
+
+          declare -A PUSHED        # dir -> "✅ updated" | "✅ created" | "❌ <reason>"
+          declare -A FIRST_PR      # dir -> first PR number that touched it
+          declare -a ORDER         # dirs in push order
+          declare -a DUP_WARNINGS  # human-readable "changed by more than one PR" notes
+          ANY_FAILED=0
+          ANY_SHARED_PART=0
+          SHARED_PART_LINK_NOTE=""
+
+          for i in "${!PR_REFS[@]}"; do
+            REF="${PR_REFS[$i]}"
+            NUM="${PR_NUMS[$i]}"
+            echo "::group::PR #${NUM} (${REF})"
+
+            if ! git checkout -f "origin/${REF}" --quiet 2>/dev/null; then
+              echo "Could not check out origin/${REF} — skipping PR #${NUM}."
+              echo "::endgroup::"
+              continue
+            fi
+
+            DIRS=$(git diff --name-only "origin/main...origin/${REF}" 2>/dev/null | grep -oE "${PATTERN}" | sort -u || true)
+            if [ -z "${DIRS}" ]; then
+              echo "PR #${NUM}: no template changes vs main."
+              echo "::endgroup::"
+              continue
+            fi
+
+            while IFS= read -r DIR; do
+              [ -z "${DIR}" ] && continue
+              if [ -n "${PUSHED[$DIR]+x}" ]; then
+                echo "Skip ${DIR} — already pushed (PR #${FIRST_PR[$DIR]})."
+                DUP_WARNINGS+=("\`${DIR}\` was changed in PR #${FIRST_PR[$DIR]} and PR #${NUM} — kept PR #${FIRST_PR[$DIR]}'s version.")
+                continue
+              fi
+              ORDER+=("${DIR}")
+              FIRST_PR["${DIR}"]="${NUM}"
+
+              if [ ! -f "${DIR}/config.json" ]; then
+                # Whole template directory removed in the PR (or no config.json) — nothing to push, not a failure.
+                PUSHED["${DIR}"]="⚠️ no config.json — skipped (template removed?)"
+                echo "${DIR}: no config.json — skipped"
+                continue
+              fi
+
+              case "${DIR}" in
+                reconciliation_texts/*) TYPE="reconciliation";   FLAG="--handle";      IDVAL=$(jq -r '.handle // empty' "${DIR}/config.json");;
+                shared_parts/*)         TYPE="shared-part";      FLAG="--shared-part"; IDVAL=$(jq -r '.name // empty' "${DIR}/config.json");;
+                account_templates/*)    TYPE="account-template"; FLAG="--name";        IDVAL=$(jq -r '.name_nl // .name // empty' "${DIR}/config.json");;
+                export_files/*)         TYPE="export-file";      FLAG="--name";        IDVAL=$(jq -r '.name_nl // .name // empty' "${DIR}/config.json");;
+                *) PUSHED["${DIR}"]="❌ unknown template type"; ANY_FAILED=1; continue;;
+              esac
+              if [ -z "${IDVAL}" ] || [ "${IDVAL}" = "null" ]; then
+                IDVAL=$(basename "${DIR}")
+              fi
+              if [ -z "${IDVAL}" ]; then
+                PUSHED["${DIR}"]="❌ missing identifier in config.json"
+                ANY_FAILED=1
+                continue
+              fi
+              [ "${TYPE}" = "shared-part" ] && ANY_SHARED_PART=1
+
+              HAS_ID=$(jq -r --arg f "${FIRM_ID}" '(.id // {}) | has($f)' "${DIR}/config.json")
+              if [ "${HAS_ID}" != "true" ]; then
+                echo "Fetching ${TYPE} id for '${IDVAL}' from firm ${FIRM_ID}..."
+                ${CLI} get-"${TYPE}"-id "${FLAG}" "${IDVAL}" --firm "${FIRM_ID}" --yes || true
+                HAS_ID=$(jq -r --arg f "${FIRM_ID}" '(.id // {}) | has($f)' "${DIR}/config.json")
+              fi
+
+              if [ "${HAS_ID}" = "true" ]; then
+                OP="update"
+                MSG="Functional review push${FR_TICKET_KEY:+ (${FR_TICKET_KEY})} - PR #${NUM}"
+                OUT=$(${CLI} update-"${TYPE}" "${FLAG}" "${IDVAL}" --firm "${FIRM_ID}" --yes --message "${MSG}" 2>&1)
+                RC=$?
+              else
+                OP="create"
+                OUT=$(${CLI} create-"${TYPE}" "${FLAG}" "${IDVAL}" --firm "${FIRM_ID}" 2>&1)
+                RC=$?
+              fi
+              printf '%s\n' "${OUT}"
+              if [ "${RC}" -eq 0 ]; then
+                PUSHED["${DIR}"]="✅ ${OP}d"
+                echo "${DIR}: ${OP}d"
+              else
+                LAST_LINE=$(printf '%s\n' "${OUT}" | tail -n 1 | tr -d '`|')
+                PUSHED["${DIR}"]="❌ ${OP} failed (exit ${RC}): ${LAST_LINE}"
+                ANY_FAILED=1
+                echo "${DIR}: ${OP} FAILED (exit ${RC})"
+              fi
+            done <<< "${DIRS}"
+
+            echo "::endgroup::"
+          done
+
+          if [ "${ANY_SHARED_PART}" -eq 1 ]; then
+            echo "::group::add-shared-part --all"
+            AS_OUT=$(${CLI} add-shared-part --all --yes --firm "${FIRM_ID}" 2>&1)
+            AS_RC=$?
+            printf '%s\n' "${AS_OUT}"
+            if [ "${AS_RC}" -eq 0 ]; then
+              SHARED_PART_LINK_NOTE="Shared parts re-linked to their templates (\`add-shared-part --all\`)."
+            else
+              SHARED_PART_LINK_NOTE="⚠️ \`add-shared-part --all\` failed (exit ${AS_RC}) — shared parts pushed, but linking may be incomplete."
+              ANY_FAILED=1
+            fi
+            echo "::endgroup::"
+          fi
+
+          if [ "${#ORDER[@]}" -eq 0 ]; then
+            echo "nothing_to_push=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "nothing_to_push=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "any_failed=${ANY_FAILED}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "results_md<<RESULTS_MD_EOF_8f3a"
+            if [ "${#ORDER[@]}" -eq 0 ]; then
+              echo "_No template changes found in the matched PR(s) — nothing was pushed._"
+            else
+              echo "| Template | PR | Result |"
+              echo "|---|---|---|"
+              for D in "${ORDER[@]}"; do
+                echo "| \`${D}\` | #${FIRST_PR[$D]} | ${PUSHED[$D]} |"
+              done
+              if [ -n "${SHARED_PART_LINK_NOTE}" ]; then
+                echo ""
+                echo "${SHARED_PART_LINK_NOTE}"
+              fi
+              if [ "${#DUP_WARNINGS[@]}" -gt 0 ]; then
+                echo ""
+                echo "**Templates changed by more than one PR:**"
+                for W in "${DUP_WARNINGS[@]}"; do
+                  echo "- ${W}"
+                done
+              fi
+            fi
+            echo "RESULTS_MD_EOF_8f3a"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fail if any template push failed
+        if: steps.push.outputs.any_failed == '1'
+        run: |
+          echo "::error::One or more template pushes failed — see the per-template results above and the PR comment."
+          exit 1
+
+  comment:
+    needs: [push]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Comment the push result on each PR
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBERS: ${{ needs.push.outputs.pr_numbers }}
+          FIRM_ID: ${{ needs.push.outputs.firm_id }}
+          RESULTS_MD: ${{ needs.push.outputs.results_md }}
+          ANY_FAILED: ${{ needs.push.outputs.any_failed }}
+          NOTHING_TO_PUSH: ${{ needs.push.outputs.nothing_to_push }}
+          DEV_TICKET_KEYS: ${{ inputs.dev_ticket_keys }}
+          FR_TICKET_KEY: ${{ inputs.fr_ticket_key }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            let prNumbers = [];
+            try { prNumbers = JSON.parse(process.env.PR_NUMBERS || "[]"); } catch { prNumbers = []; }
+            if (!Array.isArray(prNumbers) || prNumbers.length === 0) {
+              core.info("No PRs to comment on (the push job did not get past PR resolution — see the run log).");
+              return;
+            }
+            const { owner, repo } = context.repo;
+            const marker = "<!-- silverfin-push-to-review-firm -->";
+            const firmId = process.env.FIRM_ID || "(unknown)";
+            const anyFailed = process.env.ANY_FAILED === "1";
+            const nothingToPush = process.env.NOTHING_TO_PUSH === "true";
+            const resultsMd = process.env.RESULTS_MD || "";
+            const devKeys = process.env.DEV_TICKET_KEYS || "";
+            const frKey = process.env.FR_TICKET_KEY || "";
+            const runUrl = process.env.RUN_URL;
+
+            let overall;
+            if (nothingToPush) {
+              overall = "ℹ️ No template changes were found in the matched PR(s) — nothing was pushed.";
+            } else if (resultsMd === "" && !anyFailed) {
+              overall = `⚠️ The push job failed before any template was pushed — see the [workflow run](${runUrl}).`;
+            } else if (anyFailed) {
+              overall = "❌ Some templates failed to push — see the table below.";
+            } else {
+              overall = `✅ All changed templates were pushed to review firm \`${firmId}\`.`;
+            }
+
+            const lines = [`## Push to review firm \`${firmId}\``, "", overall, ""];
+            if (frKey) lines.push(`- Functional review ticket: \`${frKey}\``);
+            if (devKeys) lines.push(`- Development ticket(s): \`${devKeys}\``);
+            lines.push(`- Workflow run: ${runUrl}`);
+            lines.push("");
+            if (resultsMd) { lines.push(resultsMd); lines.push(""); }
+            lines.push(marker);
+            const body = lines.join("\n");
+
+            for (const num of prNumbers) {
+              const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: num, per_page: 100 });
+              const existing = comments.find(c => c.user && c.user.type === "Bot" && c.body && c.body.includes(marker));
+              if (existing) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+                core.info(`Updated push-to-review-firm comment on PR #${num}`);
+              } else {
+                await github.rest.issues.createComment({ owner, repo, issue_number: num, body });
+                core.info(`Created push-to-review-firm comment on PR #${num}`);
+              }
+            }
