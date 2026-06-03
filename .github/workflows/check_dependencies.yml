@@ -56,7 +56,7 @@ jobs:
 
       # Check out PR HEAD (config.json / template tree for check-dependencies must match the PR)
       - name: Checkout PR head
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ steps.pr-details.outputs.head_sha }}
 

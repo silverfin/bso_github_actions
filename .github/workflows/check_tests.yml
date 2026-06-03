@@ -12,7 +12,7 @@ jobs:
     steps:
       # Step 1: Checkout the repository @ $GITHUB_WORKSPACE so workflow can access it
       - name: Checkout Repository - Fetch history of the current branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           # Current branch only
           ref: ${{ github.ref }}
