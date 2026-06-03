@@ -17,9 +17,9 @@ jobs:
       SF_API_SECRET: "${{ secrets.SF_API_SECRET }}"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
       - name: Add silverfin-cli package latest version

@@ -14,7 +14,7 @@ jobs:
       has_partner_deployment_label: ${{ steps.haslabel.outputs.labeled-3-deploy-to-partner }}
     steps:
       - name: Checkout Repository - Fetch all history for all tags and branches
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Labeled to partner deployment
@@ -29,7 +29,7 @@ jobs:
       changed_templates: ${{ steps.templates_changed.outputs.changed_templates }}
     steps:
       - name: Checkout Repository - Fetch all history for all tags and branches
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Get changed liquid files

@@ -21,16 +21,16 @@ jobs:
       changed_templates: ${{ steps.templates_changed.outputs.changed_templates }}
     steps:
       - name: Checkout Repository - Fetch all history for all tags and branches
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Get changed liquid files
         id: changed-files
-        uses: tj-actions/changed-files@v41
+        uses: tj-actions/changed-files@v46
         with:
           since_last_remote_commit: false
           dir_names: false
-          ref: "main"
+          base_sha: 'main'
           files: |
             **/**.{liquid,yml,yaml,json}
       - name: Filter templates changed
@@ -76,13 +76,13 @@ jobs:
     needs: [check-auth, check-changed-templates]
     steps:
       - name: Checkout Repository - Fetch all history for all tags and branches
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - name: Setup Node v20
-        uses: actions/setup-node@v4
+      - name: Setup Node v22
+        uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 22
       - name: Load Silverfin config file from secrets
         run: |
           mkdir -p $HOME/.silverfin/
