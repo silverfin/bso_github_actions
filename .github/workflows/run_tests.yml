@@ -72,6 +72,11 @@ jobs:
       SF_API_SECRET: "${{ secrets.SF_API_SECRET }}"
       SF_TEST_FIRM_ID: "${{ vars.SF_TEST_FIRM_ID }}"
       CHANGED_TEMPLATES: "${{ needs.check-changed-templates.outputs.changed_templates }}"
+      # Maximum number of liquid tests run in parallel against the live platform per batch.
+      # A single `run-test --status` call fires all of its handles concurrently (Promise.all)
+      # with no client-side rate limiting, so we cap the batch size and run batches
+      # sequentially to keep the global number of in-flight tests bounded.
+      MAX_PARALLEL_TESTS: 5
     if: ${{ needs.check-changed-templates.outputs.changed_templates != '[]' }}
     needs: [check-auth, check-changed-templates]
     steps:
@@ -93,13 +98,22 @@ jobs:
           npm install https://github.com/silverfin/silverfin-cli.git
           VERSION=$(./node_modules/silverfin-cli/bin/cli.js -V)
           echo "CLI version: ${VERSION}"
-      - name: Run liquid tests for updated templates
+      - name: Run liquid tests for updated templates (grouped per firm, run in parallel)
         run: |
+          MAX_PARALLEL="${MAX_PARALLEL_TESTS:-5}"
+          # Reconciliation handles grouped by their resolved firm id ("firm id" -> "handle1 handle2 ...").
+          declare -A FIRM_HANDLES
           declare -a ERRORS
           for CURRENT_DIR in ${{ env.CHANGED_TEMPLATES }}; do
             echo "Checking ${CURRENT_DIR}"
             while [[ "${CURRENT_DIR}" != "." ]]; do
               if [[ -e "${CURRENT_DIR}/config.json" ]]; then
+                # Only reconciliation_texts have liquid tests executed in CI; skip anything
+                # else (e.g. shared_parts, whose ".id" is a plain string) before resolving a firm.
+                if [[ "${CURRENT_DIR}" != *reconciliation_texts* ]]; then
+                  echo "Skipping ${CURRENT_DIR} (not a reconciliation template)"
+                  break
+                fi
                 HANDLE=$(cat ${CURRENT_DIR}/config.json | jq -r ".handle // .name")
                 
                 # Initialize FIRM_ID
@@ -156,28 +170,49 @@ jobs:
                   echo "Using first available firm ID: ${FIRM_ID}"
                 fi
                 
-                if [[ "${CURRENT_DIR}" == *reconciliation_texts* ]]; then
-                  # FETCH THE NEWEST VERSION OF THE TOKENS FROM THE SECRETS, IN CASE THEY WERE UPDATED BY THE INITIATION OF A CONCURRENT WORKFLOW
-                  echo '${{ secrets.CONFIG_JSON }}' > $HOME/.silverfin/config.json
-                  # RUN TEST
-                  echo "Running tests for ${HANDLE} in firm ${FIRM_ID}"
-                  OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-test --handle "${HANDLE}" --firm "${FIRM_ID}" --status 2>&1)
-                  # CHECK OUTPUT
-                  if [[ "$OUTPUT" =~ "PASSED" ]]; then
-                    echo "${HANDLE}: passed"
-                  elif [[ "$OUTPUT" =~ "FAILED" ]]; then
-                    echo "${HANDLE}: failed"
-                    ERRORS+=("${HANDLE}")
-                  else
-                    echo "${HANDLE}: other errors: ${OUTPUT}"
-                    ERRORS+=("${OUTPUT}")
-                  fi
-                fi
+                # Group this reconciliation under its resolved firm so all reconciliations
+                # for the same firm can be run together in a single parallel batch later.
+                FIRM_HANDLES["${FIRM_ID}"]+=" ${HANDLE}"
+                echo "Queued ${HANDLE} for firm ${FIRM_ID}"
                 break
               else
                 echo "Config file not found in ${CURRENT_DIR}"
                 CURRENT_DIR="$(dirname "${CURRENT_DIR}")"
               fi
+            done
+          done
+          # Run the queued reconciliations grouped per firm. All handles passed to a single
+          # `run-test --status` call are executed concurrently by the CLI (Promise.all), so we
+          # cap each batch at MAX_PARALLEL handles and run batches sequentially to keep the
+          # total number of in-flight tests against the live platform bounded.
+          for FIRM_ID in "${!FIRM_HANDLES[@]}"; do
+            # Deduplicate and sort the handles queued for this firm.
+            read -r -a HANDLES <<< "$(printf '%s\n' ${FIRM_HANDLES[$FIRM_ID]} | sort -u | tr '\n' ' ')"
+            TOTAL=${#HANDLES[@]}
+            echo "Firm ${FIRM_ID}: ${TOTAL} reconciliation(s) to test: ${HANDLES[*]}"
+            for (( START=0; START<TOTAL; START+=MAX_PARALLEL )); do
+              BATCH=("${HANDLES[@]:START:MAX_PARALLEL}")
+              echo "Running batch for firm ${FIRM_ID} (${#BATCH[@]} in parallel): ${BATCH[*]}"
+              if OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-test --firm "${FIRM_ID}" --status --handle "${BATCH[@]}" 2>&1); then
+                BATCH_EXIT=0
+              else
+                BATCH_EXIT=$?
+              fi
+              echo "${OUTPUT}"
+              # Strip ANSI colour codes so the per-handle status lines can be parsed reliably.
+              CLEAN_OUTPUT=$(printf '%s\n' "${OUTPUT}" | sed -E "s/\x1b\[[0-9;]*m//g")
+              # The CLI prints one top-level "<handle>: PASSED" / "<handle>: FAILED" line per handle.
+              for HANDLE in "${BATCH[@]}"; do
+                if printf '%s\n' "${CLEAN_OUTPUT}" | grep -qE "^[[:space:]]*${HANDLE}: PASSED[[:space:]]*$"; then
+                  echo "${HANDLE}: passed"
+                elif printf '%s\n' "${CLEAN_OUTPUT}" | grep -qE "^[[:space:]]*${HANDLE}: FAILED[[:space:]]*$"; then
+                  echo "${HANDLE}: failed"
+                  ERRORS+=("${HANDLE}")
+                else
+                  echo "${HANDLE}: status could not be determined (batch exit code ${BATCH_EXIT})"
+                  ERRORS+=("${HANDLE}")
+                fi
+              done
             done
           done
           # CHECK ERRORS PRESENT
