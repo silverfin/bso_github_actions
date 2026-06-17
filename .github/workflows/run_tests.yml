@@ -70,7 +70,7 @@ jobs:
       # A single `run-test --status` call fires all of its handles concurrently (Promise.all)
       # with no client-side rate limiting, so we cap the batch size and run batches
       # sequentially to keep the global number of in-flight tests bounded.
-      MAX_PARALLEL_TESTS: 5
+      MAX_PARALLEL_TESTS: 10
     if: ${{ needs.check-changed-templates.outputs.changed_templates != '[]' }}
     needs: [check-auth, check-changed-templates]
     steps:
@@ -94,7 +94,7 @@ jobs:
           echo "CLI version: ${VERSION}"
       - name: Run liquid tests for updated templates (grouped per firm, run in parallel)
         run: |
-          MAX_PARALLEL="${MAX_PARALLEL_TESTS:-5}"
+          MAX_PARALLEL="${MAX_PARALLEL_TESTS:-10}"
           # Testable templates grouped by "<firm id>|<template type>". Each bucket maps to one
           # `run-test` call, because the CLI takes a single firm and a single template type per
           # invocation. Identifiers are stored newline-separated so account template names
