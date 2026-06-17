@@ -199,13 +199,17 @@ jobs:
                 BATCH_EXIT=$?
               fi
               echo "${OUTPUT}"
-              # Strip ANSI colour codes so the per-handle status lines can be parsed reliably.
-              CLEAN_OUTPUT=$(printf '%s\n' "${OUTPUT}" | sed -E "s/\x1b\[[0-9;]*m//g")
-              # The CLI prints one top-level "<handle>: PASSED" / "<handle>: FAILED" line per handle.
+              # Normalise the output before parsing: split carriage-return spinner frames onto
+              # their own lines and strip ANSI / cursor escape sequences. In CI, consola prefixes
+              # every line with a "[log] " tag and the test spinner interleaves frames onto the
+              # same line, so the per-handle status ("<handle>: PASSED") is not at the start of a
+              # line. Match the handle on a left word boundary instead of anchoring to "^".
+              CLEAN_OUTPUT=$(printf '%s\n' "${OUTPUT}" | tr '\r' '\n' | sed -E $'s/\033\\[[0-9;?]*[A-Za-z]//g')
+              # The CLI prints one "<handle>: PASSED" / "<handle>: FAILED" line per handle.
               for HANDLE in "${BATCH[@]}"; do
-                if printf '%s\n' "${CLEAN_OUTPUT}" | grep -qE "^[[:space:]]*${HANDLE}: PASSED[[:space:]]*$"; then
+                if printf '%s\n' "${CLEAN_OUTPUT}" | grep -qE "(^|[^[:alnum:]_])${HANDLE}: PASSED"; then
                   echo "${HANDLE}: passed"
-                elif printf '%s\n' "${CLEAN_OUTPUT}" | grep -qE "^[[:space:]]*${HANDLE}: FAILED[[:space:]]*$"; then
+                elif printf '%s\n' "${CLEAN_OUTPUT}" | grep -qE "(^|[^[:alnum:]_])${HANDLE}: FAILED"; then
                   echo "${HANDLE}: failed"
                   ERRORS+=("${HANDLE}")
                 else
