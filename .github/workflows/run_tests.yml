@@ -33,7 +33,9 @@ jobs:
           base_sha: 'main'
           # Emit the file list as a JSON array so paths containing spaces (e.g. account
           # template names) survive the hand-off between steps and jobs intact.
+          # escape_json: false keeps it valid JSON for jq (the default double-escapes the quotes).
           json: true
+          escape_json: false
           files: |
             **/**.{liquid,yml,yaml,json}
       - name: Filter templates changed
