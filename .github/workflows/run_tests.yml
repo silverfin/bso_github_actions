@@ -31,39 +31,31 @@ jobs:
           since_last_remote_commit: false
           dir_names: false
           base_sha: 'main'
+          # Emit the file list as a JSON array so paths containing spaces (e.g. account
+          # template names) survive the hand-off between steps and jobs intact.
+          json: true
           files: |
             **/**.{liquid,yml,yaml,json}
       - name: Filter templates changed
         id: templates_changed
+        env:
+          # Passed via env (not inlined) so a path with quotes/spaces cannot break the script.
+          ALL_CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
         run: |
-          pattern="(?:reconciliation_texts|shared_parts)/([^/]+)/"
-          changed_files="${{ steps.changed-files.outputs.all_changed_files }}"
-          if [ -n "$changed_files" ]; then
-            filtered_names=($(printf "%s\n" "$changed_files" | grep -oP "$pattern" || true))
-            if [ $? -ne 0 ]; then
-              echo "No files match the pattern"
-              changed_templates=()
-            else
-              # Remove the trailing "/" from the extracted names
-              filtered_names=("${filtered_names[@]%/}")
-              # Remove duplicates
-              changed_templates=($(printf "%s\n" "${filtered_names[@]}" | sort -u))
-            fi
-          else
-            echo "No changed files"
-            changed_templates=()
-          fi
-          # Store outputs
+          # all_changed_files is a JSON array (json: true). Extract the unique template
+          # directories (reconciliation_texts / account_templates / shared_parts), space-safely.
+          pattern='(reconciliation_texts|account_templates|shared_parts)/[^/]+'
+          mapfile -t changed_templates < <(printf '%s' "${ALL_CHANGED_FILES:-[]}" | jq -r '.[]' | grep -oE "$pattern" | sort -u)
           if [ ${#changed_templates[@]} -eq 0 ]; then
-            echo "changed_templates=[]" >> $GITHUB_OUTPUT
+            echo "No templates changed"
+            echo "changed_templates=[]" >> "$GITHUB_OUTPUT"
           else
-            echo "changed_templates=${changed_templates[*]}" >> $GITHUB_OUTPUT
-            # Print the templates names
-            for name in "${changed_templates[@]}"; do
-              echo "$name"
-            done
+            echo "Changed templates:"
+            printf '  %s\n' "${changed_templates[@]}"
+            # Emit a JSON array so directory names containing spaces survive as single entries.
+            json=$(printf '%s\n' "${changed_templates[@]}" | jq -R . | jq -s -c .)
+            echo "changed_templates=${json}" >> "$GITHUB_OUTPUT"
           fi
-          exit 0
 
   test-templates:
     runs-on: ubuntu-latest
@@ -101,30 +93,43 @@ jobs:
       - name: Run liquid tests for updated templates (grouped per firm, run in parallel)
         run: |
           MAX_PARALLEL="${MAX_PARALLEL_TESTS:-5}"
-          # Reconciliation handles grouped by their resolved firm id ("firm id" -> "handle1 handle2 ...").
-          declare -A FIRM_HANDLES
+          # Testable templates grouped by "<firm id>|<template type>". Each bucket maps to one
+          # `run-test` call, because the CLI takes a single firm and a single template type per
+          # invocation. Identifiers are stored newline-separated so account template names
+          # (which contain spaces and other characters) stay intact.
+          declare -A TEMPLATE_BUCKETS
           declare -a ERRORS
-          for CURRENT_DIR in ${{ env.CHANGED_TEMPLATES }}; do
+          # CHANGED_TEMPLATES is a JSON array; read it space-safely. The process substitution
+          # keeps the loop in the current shell so the arrays above survive.
+          while IFS= read -r CURRENT_DIR; do
+            [[ -z "${CURRENT_DIR}" ]] && continue
             echo "Checking ${CURRENT_DIR}"
             while [[ "${CURRENT_DIR}" != "." ]]; do
               if [[ -e "${CURRENT_DIR}/config.json" ]]; then
-                # Only reconciliation_texts have liquid tests executed in CI; skip anything
-                # else (e.g. shared_parts, whose ".id" is a plain string) before resolving a firm.
-                if [[ "${CURRENT_DIR}" != *reconciliation_texts* ]]; then
-                  echo "Skipping ${CURRENT_DIR} (not a reconciliation template)"
+                # Decide the template type from the path. Only reconciliation_texts and
+                # account_templates have liquid tests; skip anything else (e.g. shared_parts,
+                # whose ".id" is a plain string) before resolving a firm.
+                if [[ "${CURRENT_DIR}" == *reconciliation_texts* ]]; then
+                  TEMPLATE_TYPE="reconciliationText"
+                  IDENTIFIER=$(cat "${CURRENT_DIR}/config.json" | jq -r ".handle // .name")
+                elif [[ "${CURRENT_DIR}" == *account_templates* ]]; then
+                  TEMPLATE_TYPE="accountTemplate"
+                  # Account template configs often have a null handle/name, so use the folder name.
+                  IDENTIFIER=$(basename "${CURRENT_DIR}")
+                else
+                  echo "Skipping ${CURRENT_DIR} (no liquid tests for this template type)"
                   break
                 fi
-                HANDLE=$(cat ${CURRENT_DIR}/config.json | jq -r ".handle // .name")
                 
                 # Initialize FIRM_ID
                 FIRM_ID=""
                 
                 # Check if test_firm_id is present in config
-                TEST_FIRM_ID=$(cat ${CURRENT_DIR}/config.json | jq -r ".test_firm_id // empty")
+                TEST_FIRM_ID=$(cat "${CURRENT_DIR}/config.json" | jq -r ".test_firm_id // empty")
 
                 if [[ -n "$TEST_FIRM_ID" && "$TEST_FIRM_ID" != "null" ]]; then
                   # 1. Template-specific test_firm_id (highest priority)
-                  AVAILABLE_FIRM_IDS=$(cat ${CURRENT_DIR}/config.json | jq -r ".id | keys[]" 2>/dev/null || echo "")
+                  AVAILABLE_FIRM_IDS=$(cat "${CURRENT_DIR}/config.json" | jq -r ".id | keys[]" 2>/dev/null || echo "")
                   
                   # Check for exact match by looping through available IDs
                   FOUND_MATCH=false
@@ -145,7 +150,7 @@ jobs:
                 
                 if [[ -z "$FIRM_ID" && -n "$SF_TEST_FIRM_ID" ]]; then
                   # 2. Environment variable fallback
-                  AVAILABLE_FIRM_IDS=$(cat ${CURRENT_DIR}/config.json | jq -r ".id | keys[]" 2>/dev/null || echo "")
+                  AVAILABLE_FIRM_IDS=$(cat "${CURRENT_DIR}/config.json" | jq -r ".id | keys[]" 2>/dev/null || echo "")
                   
                   # Check for exact match by looping through available IDs
                   FOUND_MATCH=false
@@ -166,56 +171,76 @@ jobs:
                 
                 if [[ -z "$FIRM_ID" ]]; then
                   # 3. Default behavior - use first available firm ID
-                  FIRM_ID=$(cat ${CURRENT_DIR}/config.json | jq -r ".id" | jq "keys_unsorted" | jq "first" | tr -d '"')
+                  FIRM_ID=$(cat "${CURRENT_DIR}/config.json" | jq -r ".id" | jq "keys_unsorted" | jq "first" | tr -d '"')
                   echo "Using first available firm ID: ${FIRM_ID}"
                 fi
                 
-                # Group this reconciliation under its resolved firm so all reconciliations
-                # for the same firm can be run together in a single parallel batch later.
-                FIRM_HANDLES["${FIRM_ID}"]+=" ${HANDLE}"
-                echo "Queued ${HANDLE} for firm ${FIRM_ID}"
+                # Group this template under "<firm>|<type>" so all templates that share a firm
+                # and type run together in one parallel batch. Newline-separated keeps identifiers
+                # that contain spaces (account template names) intact.
+                TEMPLATE_BUCKETS["${FIRM_ID}|${TEMPLATE_TYPE}"]+="${IDENTIFIER}"$'\n'
+                echo "Queued ${IDENTIFIER} (${TEMPLATE_TYPE}) for firm ${FIRM_ID}"
                 break
               else
                 echo "Config file not found in ${CURRENT_DIR}"
                 CURRENT_DIR="$(dirname "${CURRENT_DIR}")"
               fi
             done
-          done
-          # Run the queued reconciliations grouped per firm. All handles passed to a single
-          # `run-test --status` call are executed concurrently by the CLI (Promise.all), so we
-          # cap each batch at MAX_PARALLEL handles and run batches sequentially to keep the
-          # total number of in-flight tests against the live platform bounded.
-          for FIRM_ID in "${!FIRM_HANDLES[@]}"; do
-            # Deduplicate and sort the handles queued for this firm.
-            read -r -a HANDLES <<< "$(printf '%s\n' ${FIRM_HANDLES[$FIRM_ID]} | sort -u | tr '\n' ' ')"
-            TOTAL=${#HANDLES[@]}
-            echo "Firm ${FIRM_ID}: ${TOTAL} reconciliation(s) to test: ${HANDLES[*]}"
+          done < <(printf '%s' "${CHANGED_TEMPLATES}" | jq -r '.[]')
+          # Run each bucket. All identifiers passed to a single `run-test --status` call run
+          # concurrently in the CLI (Promise.all), so we cap each batch at MAX_PARALLEL and run
+          # batches sequentially to keep the number of in-flight tests against the platform bounded.
+          for KEY in "${!TEMPLATE_BUCKETS[@]}"; do
+            FIRM_ID="${KEY%%|*}"
+            TEMPLATE_TYPE="${KEY##*|}"
+            # The CLI uses a different flag per template type.
+            if [[ "${TEMPLATE_TYPE}" == "accountTemplate" ]]; then
+              CLI_FLAG="--account-template"
+            else
+              CLI_FLAG="--handle"
+            fi
+            # Deduplicate the identifiers for this bucket (newline-separated, so names with
+            # spaces stay intact).
+            mapfile -t IDENTIFIERS < <(printf '%s' "${TEMPLATE_BUCKETS[$KEY]}" | sort -u | grep -v '^$')
+            TOTAL=${#IDENTIFIERS[@]}
+            echo "Firm ${FIRM_ID} / ${TEMPLATE_TYPE}: ${TOTAL} template(s) to test"
             for (( START=0; START<TOTAL; START+=MAX_PARALLEL )); do
-              BATCH=("${HANDLES[@]:START:MAX_PARALLEL}")
-              echo "Running batch for firm ${FIRM_ID} (${#BATCH[@]} in parallel): ${BATCH[*]}"
-              if OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-test --firm "${FIRM_ID}" --status --handle "${BATCH[@]}" 2>&1); then
+              BATCH=("${IDENTIFIERS[@]:START:MAX_PARALLEL}")
+              echo "Running batch for firm ${FIRM_ID} / ${TEMPLATE_TYPE} (${#BATCH[@]} in parallel): ${BATCH[*]}"
+              if OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-test --firm "${FIRM_ID}" --status ${CLI_FLAG} "${BATCH[@]}" 2>&1); then
                 BATCH_EXIT=0
               else
                 BATCH_EXIT=$?
               fi
               echo "${OUTPUT}"
-              # Normalise the output before parsing: split carriage-return spinner frames onto
-              # their own lines and strip ANSI / cursor escape sequences. In CI, consola prefixes
-              # every line with a "[log] " tag and the test spinner interleaves frames onto the
-              # same line, so the per-handle status ("<handle>: PASSED") is not at the start of a
-              # line. Match the handle on a left word boundary instead of anchoring to "^".
+              # Parse the per-template status. In CI, consola prefixes every line with "[log] "
+              # and the test spinner interleaves frames via carriage returns, so split on carriage
+              # returns and strip ANSI escapes first. We then read the top-level
+              # "[log] <name>: PASSED|FAILED" lines (a leading space after "[log] " marks an
+              # indented sub-result, which is skipped) and match by EXACT name: account template
+              # names contain spaces and characters that are unsafe inside a regex.
               CLEAN_OUTPUT=$(printf '%s\n' "${OUTPUT}" | tr '\r' '\n' | sed -E $'s/\033\\[[0-9;?]*[A-Za-z]//g')
-              # The CLI prints one "<handle>: PASSED" / "<handle>: FAILED" line per handle.
-              for HANDLE in "${BATCH[@]}"; do
-                if printf '%s\n' "${CLEAN_OUTPUT}" | grep -qE "(^|[^[:alnum:]_])${HANDLE}: PASSED"; then
-                  echo "${HANDLE}: passed"
-                elif printf '%s\n' "${CLEAN_OUTPUT}" | grep -qE "(^|[^[:alnum:]_])${HANDLE}: FAILED"; then
-                  echo "${HANDLE}: failed"
-                  ERRORS+=("${HANDLE}")
-                else
-                  echo "${HANDLE}: status could not be determined (batch exit code ${BATCH_EXIT})"
-                  ERRORS+=("${HANDLE}")
-                fi
+              declare -A RESULTS=()
+              while IFS= read -r LINE; do
+                STATUS="${LINE##*: }"
+                NAME="${LINE#\[log\] }"
+                NAME="${NAME%: *}"
+                RESULTS["${NAME}"]="${STATUS}"
+              done < <(printf '%s\n' "${CLEAN_OUTPUT}" | grep -oE '\[log\] [^[:space:]].*: (PASSED|FAILED)$')
+              for IDENTIFIER in "${BATCH[@]}"; do
+                case "${RESULTS[${IDENTIFIER}]:-}" in
+                  PASSED)
+                    echo "${IDENTIFIER}: passed"
+                    ;;
+                  FAILED)
+                    echo "${IDENTIFIER}: failed"
+                    ERRORS+=("${IDENTIFIER}")
+                    ;;
+                  *)
+                    echo "${IDENTIFIER}: status could not be determined (batch exit code ${BATCH_EXIT})"
+                    ERRORS+=("${IDENTIFIER}")
+                    ;;
+                esac
               done
             done
           done
