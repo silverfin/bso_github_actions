@@ -174,9 +174,11 @@ jobs:
           FR_TICKET_KEY: ${{ inputs.fr_ticket_key }}
           PR_NUMBERS: ${{ steps.prs.outputs.pr_numbers }}
           PR_HEAD_REFS: ${{ steps.prs.outputs.pr_head_refs }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           CLI="node ./node_modules/silverfin-cli/bin/cli.js"
           PATTERN='^(reconciliation_texts|shared_parts|account_templates|export_files)/[^/]+'
+          BASE="${DEFAULT_BRANCH:-main}"
 
           mapfile -t PR_NUMS < <(printf '%s' "${PR_NUMBERS}" | jq -r '.[]')
           mapfile -t PR_REFS < <(printf '%s' "${PR_HEAD_REFS}" | jq -r '.[]')
@@ -186,23 +188,24 @@ jobs:
           declare -a ORDER         # dirs in push order
           declare -a DUP_WARNINGS  # human-readable "changed by more than one PR" notes
           ANY_FAILED=0
-          ANY_SHARED_PART=0
           SHARED_PART_LINK_NOTE=""
 
           for i in "${!PR_REFS[@]}"; do
             REF="${PR_REFS[$i]}"
             NUM="${PR_NUMS[$i]}"
+            PR_HAS_SHARED_PART=0
             echo "::group::PR #${NUM} (${REF})"
 
             if ! git checkout -f "origin/${REF}" --quiet 2>/dev/null; then
-              echo "Could not check out origin/${REF} — skipping PR #${NUM}."
+              echo "::error::Could not check out origin/${REF} (PR #${NUM})."
+              ANY_FAILED=1
               echo "::endgroup::"
               continue
             fi
 
-            DIRS=$(git diff --name-only "origin/main...origin/${REF}" 2>/dev/null | grep -oE "${PATTERN}" | sort -u || true)
+            DIRS=$(git diff --name-only "origin/${BASE}...origin/${REF}" 2>/dev/null | grep -oE "${PATTERN}" | sort -u || true)
             if [ -z "${DIRS}" ]; then
-              echo "PR #${NUM}: no template changes vs main."
+              echo "PR #${NUM}: no template changes vs ${BASE}."
               echo "::endgroup::"
               continue
             fi
@@ -239,7 +242,7 @@ jobs:
                 ANY_FAILED=1
                 continue
               fi
-              [ "${TYPE}" = "shared-part" ] && ANY_SHARED_PART=1
+              [ "${TYPE}" = "shared-part" ] && PR_HAS_SHARED_PART=1
 
               HAS_ID=$(jq -r --arg f "${FIRM_ID}" '(.id // {}) | has($f)' "${DIR}/config.json")
               if [ "${HAS_ID}" != "true" ]; then
@@ -251,12 +254,10 @@ jobs:
               if [ "${HAS_ID}" = "true" ]; then
                 OP="update"
                 MSG="Functional review push${FR_TICKET_KEY:+ (${FR_TICKET_KEY})} - PR #${NUM}"
-                OUT=$(${CLI} update-"${TYPE}" "${FLAG}" "${IDVAL}" --firm "${FIRM_ID}" --yes --message "${MSG}" 2>&1)
-                RC=$?
+                OUT=$(${CLI} update-"${TYPE}" "${FLAG}" "${IDVAL}" --firm "${FIRM_ID}" --yes --message "${MSG}" 2>&1) && RC=0 || RC=$?
               else
                 OP="create"
-                OUT=$(${CLI} create-"${TYPE}" "${FLAG}" "${IDVAL}" --firm "${FIRM_ID}" 2>&1)
-                RC=$?
+                OUT=$(${CLI} create-"${TYPE}" "${FLAG}" "${IDVAL}" --firm "${FIRM_ID}" 2>&1) && RC=0 || RC=$?
               fi
               printf '%s\n' "${OUT}"
               if [ "${RC}" -eq 0 ]; then
@@ -271,21 +272,20 @@ jobs:
             done <<< "${DIRS}"
 
             echo "::endgroup::"
-          done
 
-          if [ "${ANY_SHARED_PART}" -eq 1 ]; then
-            echo "::group::add-shared-part --all"
-            AS_OUT=$(${CLI} add-shared-part --all --yes --firm "${FIRM_ID}" 2>&1)
-            AS_RC=$?
-            printf '%s\n' "${AS_OUT}"
-            if [ "${AS_RC}" -eq 0 ]; then
-              SHARED_PART_LINK_NOTE="Shared parts re-linked to their templates (\`add-shared-part --all\`)."
-            else
-              SHARED_PART_LINK_NOTE="⚠️ \`add-shared-part --all\` failed (exit ${AS_RC}) — shared parts pushed, but linking may be incomplete."
-              ANY_FAILED=1
+            if [ "${PR_HAS_SHARED_PART}" -eq 1 ]; then
+              echo "::group::add-shared-part --all (PR #${NUM})"
+              AS_OUT=$(${CLI} add-shared-part --all --yes --firm "${FIRM_ID}" 2>&1) && AS_RC=0 || AS_RC=$?
+              printf '%s\n' "${AS_OUT}"
+              if [ "${AS_RC}" -eq 0 ]; then
+                [ -z "${SHARED_PART_LINK_NOTE}" ] && SHARED_PART_LINK_NOTE="Shared parts re-linked to their templates (\`add-shared-part --all\`)."
+              else
+                SHARED_PART_LINK_NOTE="⚠️ \`add-shared-part --all\` failed (exit ${AS_RC}) for PR #${NUM} — shared parts pushed, but linking may be incomplete."
+                ANY_FAILED=1
+              fi
+              echo "::endgroup::"
             fi
-            echo "::endgroup::"
-          fi
+          done
 
           if [ "${#ORDER[@]}" -eq 0 ]; then
             echo "nothing_to_push=true" >> "$GITHUB_OUTPUT"

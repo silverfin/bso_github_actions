@@ -46,8 +46,8 @@ The document will go over all the Github Actions that currently automate a coupl
     * [Run liquid tests (run_tests.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBfa4878bb5baac49cbb0c39d927)
   * [Slack updates](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBfc9ca89d4b174494391ba075c5)
     * [Automated slack update (slack_changelog.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf862cf4257e68475d8b47891c6)
-  * Review firm deployment
-    * Push templates to review firm (push_to_review_firm.yml)
+  * [Review firm deployment](#review-firm-deployment)
+    * [Push templates to review firm (push_to_review_firm.yml)](#push-templates-to-review-firm-push_to_review_firmyml)
 
 
 ## Overview
@@ -199,7 +199,7 @@ _Prerequisites:_
     * [BE](https://slack.com/shortcuts/Ft09CP21L86M/ed8f5f30038e6ecca4adf2d01df996ef)
 * This workflow will then generate a URL, which is called a webhook. 
 * The webhook from the workflow should be stored in an environment variable in the market specific repository: `SLACK_WEBHOOK_URL`
-* The Github action will create a text object (containing the formatted message) and will post this to the Slack webhook. This will then create the message in a pre-defined channel. 
+* The GitHub action will create a text object (containing the formatted message) and will post this to the Slack webhook. This will then create the message in a pre-defined channel. 
 
 
 
