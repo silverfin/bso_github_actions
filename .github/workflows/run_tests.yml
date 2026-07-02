@@ -24,6 +24,11 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - name: Emit non-ASCII paths raw
+        # With git's default core.quotepath=true, paths with non-ASCII characters (e.g. a curly
+        # apostrophe in an account template name) are emitted octal-escaped and silently dropped
+        # by the changed-files glob filter, so the template would never be tested.
+        run: git config --global core.quotepath false
       - name: Get changed liquid files
         id: changed-files
         uses: tj-actions/changed-files@24d32ffd492484c1d75e0c0b894501ddb9d30d62 # v47
@@ -34,8 +39,12 @@ jobs:
           # Emit the file list as a JSON array so paths containing spaces (e.g. account
           # template names) survive the hand-off between steps and jobs intact.
           # escape_json: false keeps it valid JSON for jq (the default double-escapes the quotes).
+          # safe_output: false stops backslash-escaping of shell metacharacters (& ( ) ...) inside
+          # the JSON values, which is invalid JSON and would silently empty the template list.
+          # Safe here: the list is passed via env and parsed with jq, never eval'd by the shell.
           json: true
           escape_json: false
+          safe_output: false
           files: |
             **/**.{liquid,yml,yaml,json}
       - name: Filter templates changed
@@ -45,8 +54,16 @@ jobs:
           ALL_CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
         run: |
           # all_changed_files is a JSON array (json: true). Extract the unique template
-          # directories (reconciliation_texts / account_templates / shared_parts), space-safely.
-          pattern='(reconciliation_texts|account_templates|shared_parts)/[^/]+'
+          # directories, space-safely. Only reconciliation_texts and account_templates have
+          # liquid tests; shared_parts is left out so a shared-parts-only PR skips the test
+          # job entirely instead of spinning it up just to skip every template.
+          pattern='(reconciliation_texts|account_templates)/[^/]+'
+          # Fail loudly if the changed-files output is not valid JSON. A silent jq failure
+          # here would empty the template list and skip every test while CI stays green.
+          if ! printf '%s' "${ALL_CHANGED_FILES:-[]}" | jq -e . > /dev/null; then
+            echo "::error::changed-files output is not valid JSON, refusing to skip tests silently"
+            exit 1
+          fi
           mapfile -t changed_templates < <(printf '%s' "${ALL_CHANGED_FILES:-[]}" | jq -r '.[]' | grep -oE "$pattern" | sort -u)
           if [ ${#changed_templates[@]} -eq 0 ]; then
             echo "No templates changed"
@@ -109,8 +126,8 @@ jobs:
             while [[ "${CURRENT_DIR}" != "." ]]; do
               if [[ -e "${CURRENT_DIR}/config.json" ]]; then
                 # Decide the template type from the path. Only reconciliation_texts and
-                # account_templates have liquid tests; skip anything else (e.g. shared_parts,
-                # whose ".id" is a plain string) before resolving a firm.
+                # account_templates have liquid tests; the filter step already excludes other
+                # types, this branch is defense in depth.
                 if [[ "${CURRENT_DIR}" == *reconciliation_texts* ]]; then
                   TEMPLATE_TYPE="reconciliationText"
                   IDENTIFIER=$(cat "${CURRENT_DIR}/config.json" | jq -r ".handle // .name")
@@ -122,7 +139,18 @@ jobs:
                   echo "Skipping ${CURRENT_DIR} (no liquid tests for this template type)"
                   break
                 fi
-                
+
+                # Skip templates whose test YAML is missing or has no real content. The CLI
+                # reports those as FAILED ("there are no tests stored in the YAML file"), and a
+                # template without tests should not fail CI.
+                TEST_REL=$(cat "${CURRENT_DIR}/config.json" | jq -r '.test // empty')
+                TEST_PATH="${CURRENT_DIR}/${TEST_REL}"
+                if [[ -z "${TEST_REL}" || ! -s "${TEST_PATH}" ]] \
+                   || [[ "$(grep -cvE '^[[:space:]]*(#|$)' "${TEST_PATH}")" -eq 0 ]]; then
+                  echo "Skipping ${IDENTIFIER} (no liquid tests defined)"
+                  break
+                fi
+
                 # Initialize FIRM_ID
                 FIRM_ID=""
                 
