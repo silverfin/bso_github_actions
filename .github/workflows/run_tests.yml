@@ -118,11 +118,11 @@ jobs:
           # (which contain spaces and other characters) stay intact.
           declare -A TEMPLATE_BUCKETS
           declare -a ERRORS
+          declare -a SUMMARY
           # CHANGED_TEMPLATES is a JSON array; read it space-safely. The process substitution
           # keeps the loop in the current shell so the arrays above survive.
           while IFS= read -r CURRENT_DIR; do
             [[ -z "${CURRENT_DIR}" ]] && continue
-            echo "Checking ${CURRENT_DIR}"
             while [[ "${CURRENT_DIR}" != "." ]]; do
               if [[ -e "${CURRENT_DIR}/config.json" ]]; then
                 # Decide the template type from the path. Only reconciliation_texts and
@@ -172,7 +172,6 @@ jobs:
                   
                   if [[ "$FOUND_MATCH" == "true" ]]; then
                     FIRM_ID="$TEST_FIRM_ID"
-                    echo "Using configured test_firm_id: ${FIRM_ID}"
                   else
                     echo "Warning: test_firm_id '${TEST_FIRM_ID}' not found in .id object, falling back to environment variable or default"
                   fi
@@ -193,7 +192,6 @@ jobs:
                   
                   if [[ "$FOUND_MATCH" == "true" ]]; then
                     FIRM_ID="$SF_TEST_FIRM_ID"
-                    echo "Using SF_TEST_FIRM_ID environment variable: ${FIRM_ID}"
                   else
                     echo "Warning: SF_TEST_FIRM_ID '${SF_TEST_FIRM_ID}' not found in .id object, falling back to default"
                   fi
@@ -202,14 +200,13 @@ jobs:
                 if [[ -z "$FIRM_ID" ]]; then
                   # 3. Default behavior - use first available firm ID
                   FIRM_ID=$(cat "${CURRENT_DIR}/config.json" | jq -r ".id" | jq "keys_unsorted" | jq "first" | tr -d '"')
-                  echo "Using first available firm ID: ${FIRM_ID}"
                 fi
-                
+
                 # Group this template under "<firm>|<type>" so all templates that share a firm
                 # and type run together in one parallel batch. Newline-separated keeps identifiers
                 # that contain spaces (account template names) intact.
                 TEMPLATE_BUCKETS["${FIRM_ID}|${TEMPLATE_TYPE}"]+="${IDENTIFIER}"$'\n'
-                echo "Queued ${IDENTIFIER} (${TEMPLATE_TYPE}) for firm ${FIRM_ID}"
+                echo "+ ${IDENTIFIER} → firm ${FIRM_ID}"
                 break
               else
                 echo "Config file not found in ${CURRENT_DIR}"
@@ -233,10 +230,11 @@ jobs:
             # spaces stay intact).
             mapfile -t IDENTIFIERS < <(printf '%s' "${TEMPLATE_BUCKETS[$KEY]}" | sort -u | grep -v '^$')
             TOTAL=${#IDENTIFIERS[@]}
-            echo "Firm ${FIRM_ID} / ${TEMPLATE_TYPE}: ${TOTAL} template(s) to test"
             for (( START=0; START<TOTAL; START+=MAX_PARALLEL )); do
               BATCH=("${IDENTIFIERS[@]:START:MAX_PARALLEL}")
-              echo "Running batch for firm ${FIRM_ID} / ${TEMPLATE_TYPE} (${#BATCH[@]} in parallel): ${BATCH[*]}"
+              # Fold each parallel batch into a collapsible log group so the raw CLI output
+              # (spinner frames included) stays out of the way unless you open it.
+              echo "::group::firm ${FIRM_ID} · ${TEMPLATE_TYPE} · ${#BATCH[@]} in parallel"
               if OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-test --firm "${FIRM_ID}" --status ${CLI_FLAG} "${BATCH[@]}" 2>&1); then
                 BATCH_EXIT=0
               else
@@ -247,33 +245,49 @@ jobs:
               # and the test spinner interleaves frames via carriage returns, so split on carriage
               # returns and strip ANSI escapes first. We then read the top-level
               # "[log] <name>: PASSED|FAILED" lines (a leading space after "[log] " marks an
-              # indented sub-result, which is skipped) and match by EXACT name: account template
-              # names contain spaces and characters that are unsafe inside a regex.
+              # indented sub-result, which is skipped; trailing whitespace is tolerated) and match
+              # by EXACT name: account template names contain spaces and characters that are
+              # unsafe inside a regex.
               CLEAN_OUTPUT=$(printf '%s\n' "${OUTPUT}" | tr '\r' '\n' | sed -E $'s/\033\\[[0-9;?]*[A-Za-z]//g')
               declare -A RESULTS=()
               while IFS= read -r LINE; do
                 STATUS="${LINE##*: }"
+                STATUS="${STATUS%%[[:space:]]*}"
                 NAME="${LINE#\[log\] }"
                 NAME="${NAME%: *}"
                 RESULTS["${NAME}"]="${STATUS}"
-              done < <(printf '%s\n' "${CLEAN_OUTPUT}" | grep -oE '\[log\] [^[:space:]].*: (PASSED|FAILED)$')
+              done < <(printf '%s\n' "${CLEAN_OUTPUT}" | grep -oE '\[log\] [^[:space:]].*: (PASSED|FAILED)[[:space:]]*$')
               for IDENTIFIER in "${BATCH[@]}"; do
                 case "${RESULTS[${IDENTIFIER}]:-}" in
                   PASSED)
                     echo "${IDENTIFIER}: passed"
+                    SUMMARY+=("PASS"$'\t'"${FIRM_ID}"$'\t'"${IDENTIFIER}")
                     ;;
                   FAILED)
                     echo "${IDENTIFIER}: failed"
                     ERRORS+=("${IDENTIFIER}")
+                    SUMMARY+=("FAIL"$'\t'"${FIRM_ID}"$'\t'"${IDENTIFIER}")
                     ;;
                   *)
                     echo "${IDENTIFIER}: status could not be determined (batch exit code ${BATCH_EXIT})"
                     ERRORS+=("${IDENTIFIER}")
+                    SUMMARY+=("????"$'\t'"${FIRM_ID}"$'\t'"${IDENTIFIER}")
                     ;;
                 esac
               done
+              echo "::endgroup::"
             done
           done
+          # Flat summary keyed on the two columns that matter: template and firm.
+          if [ ${#SUMMARY[@]} -gt 0 ]; then
+            echo ""
+            echo "─ Results ─────────────────────────────────────────────────────"
+            while IFS=$'\t' read -r RESULT FIRM NAME; do
+              printf ' %-4s %-45s firm %s\n' "${RESULT}" "${NAME}" "${FIRM}"
+            done < <(printf '%s\n' "${SUMMARY[@]}")
+            echo "────────────────────────────────────────────────────────────────"
+            echo "${#ERRORS[@]} failed, $(( ${#SUMMARY[@]} - ${#ERRORS[@]} )) passed"
+          fi
           # CHECK ERRORS PRESENT
           if [ ${#ERRORS[@]} -eq 0 ]; then
               echo "All tests have passed"
