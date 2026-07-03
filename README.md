@@ -46,6 +46,8 @@ The document will go over all the Github Actions that currently automate a coupl
     * [Run liquid tests (run_tests.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBfa4878bb5baac49cbb0c39d927)
   * [Slack updates](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBfc9ca89d4b174494391ba075c5)
     * [Automated slack update (slack_changelog.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf862cf4257e68475d8b47891c6)
+  * [Review firm deployment](#review-firm-deployment)
+    * [Push templates to review firm (push_to_review_firm.yml)](#push-templates-to-review-firm-push_to_review_firmyml)
 
 
 ## Overview
@@ -197,4 +199,44 @@ _Prerequisites:_
     * [BE](https://slack.com/shortcuts/Ft09CP21L86M/ed8f5f30038e6ecca4adf2d01df996ef)
 * This workflow will then generate a URL, which is called a webhook. 
 * The webhook from the workflow should be stored in an environment variable in the market specific repository: `SLACK_WEBHOOK_URL`
-* The Github action will create a text object (containing the formatted message) and will post this to the Slack webhook. This will then create the message in a pre-defined channel. 
+* The GitHub action will create a text object (containing the formatted message) and will post this to the Slack webhook. This will then create the message in a pre-defined channel. 
+
+
+
+### Review firm deployment
+
+#### Push templates to review firm `(push_to_review_firm.yml)`
+
+_Description_:
+Reusable workflow. Pushes the latest template code from the development Pull Request(s) linked to a functional-review Jira ticket to a Silverfin "review" firm, so a product manager can populate their review environment with one click. It is the dispatch-driven, multi-PR, parameterised generalisation of `update_templates_review.yml`.
+
+A market repo wraps this workflow with a `repository_dispatch` trigger (fired by a Jira Automation button on the functional-review ticket) and/or `workflow_dispatch` for manual testing, passing the development ticket key(s) and the product manager's review firm id.
+
+_Trigger:_
+
+* Called via `workflow_call` from a market-repo wrapper (which is itself triggered by `repository_dispatch` from Jira and/or `workflow_dispatch`).
+
+_Inputs:_
+
+* `dev_ticket_keys` (required) — comma-separated Jira keys of the development tickets linked to the functional-review ticket (e.g. `BE-1234,BE-5678`). Every open PR whose head branch equals or starts with one of these keys is pushed.
+* `firm_id` (optional) — the firm to push to (the product manager's review firm). If empty, falls back to `firm_id_review_fallback`, then to the calling repo's `FIRM_ID_REVIEW` variable.
+* `fr_ticket_key` (optional) — the functional-review ticket key (used in the PR comment and the Silverfin changelog message).
+* `firm_id_review_fallback` (optional) — the wrapper should pass `vars.FIRM_ID_REVIEW` here so it is resolvable inside the reusable workflow.
+
+_Steps:_
+
+* Resolves the review firm id (`firm_id` → `firm_id_review_fallback` → `FIRM_ID_REVIEW`) and verifies it is authorized in `CONFIG_JSON`.
+* Finds the open PR(s) whose head branch matches one of the development ticket keys.
+* For each PR: checks out the head branch, diffs it against `main`, and for every changed template directory (`reconciliation_texts`, `shared_parts`, `account_templates`, `export_files`) runs `silverfin update-<type>` (or `create-<type>` if the template does not yet exist on the firm). A template touched by more than one PR is pushed once.
+* If any shared part was pushed, runs `add-shared-part --all` to (re)link shared parts to their templates.
+* Posts a status comment on each PR. Fails the run if any push failed.
+
+_Authentication note:_
+
+* This workflow only **reads** `CONFIG_JSON`; it never refreshes tokens and never writes the secret back, so it does not become a concurrent writer of `CONFIG_JSON`. It relies on the existing refresher to keep the secret fresh — see [docs/github_actions_authentication.md](docs/github_actions_authentication.md).
+
+_Prerequisites:_
+
+* `SF_API_CLIENT_ID`, `SF_API_SECRET` and `CONFIG_JSON` available to the caller (e.g. `secrets: inherit`).
+* The review firm must already be authorized with the Silverfin CLI (its OAuth tokens present in `CONFIG_JSON`). If it isn't, the run fails with a message asking the developer who implemented the linked development ticket(s) to authorize it.
+* `FIRM_ID_REVIEW` repository variable in the market repo (used as the default when no `firm_id` is supplied).
