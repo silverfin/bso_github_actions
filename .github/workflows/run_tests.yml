@@ -24,11 +24,6 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - name: Emit non-ASCII paths raw
-        # With git's default core.quotepath=true, paths with non-ASCII characters (e.g. a curly
-        # apostrophe in an account template name) are emitted octal-escaped and silently dropped
-        # by the changed-files glob filter, so the template would never be tested.
-        run: git config --global core.quotepath false
       - name: Get changed liquid files
         id: changed-files
         uses: tj-actions/changed-files@24d32ffd492484c1d75e0c0b894501ddb9d30d62 # v47
@@ -42,9 +37,14 @@ jobs:
           # safe_output: false stops backslash-escaping of shell metacharacters (& ( ) ...) inside
           # the JSON values, which is invalid JSON and would silently empty the template list.
           # Safe here: the list is passed via env and parsed with jq, never eval'd by the shell.
+          # quotepath: false emits paths with non-ASCII characters (e.g. a curly apostrophe in an
+          # account template name) as-is; the action defaults this to true, which octal-escapes
+          # them so they no longer match the glob and the template is silently dropped (setting
+          # git's global core.quotepath does not help - the action overrides it from this input).
           json: true
           escape_json: false
           safe_output: false
+          quotepath: false
           files: |
             **/**.{liquid,yml,yaml,json}
       - name: Filter templates changed
