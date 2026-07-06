@@ -78,16 +78,25 @@ jobs:
 
   test-templates:
     runs-on: ubuntu-latest
+    # A single platform test run can take up to ~33 minutes (the CLI's own polling limit),
+    # and transient errors are retried, so give the job room without letting it hang forever.
+    timeout-minutes: 120
     env:
       SF_API_CLIENT_ID: "${{ secrets.SF_API_CLIENT_ID }}"
       SF_API_SECRET: "${{ secrets.SF_API_SECRET }}"
       SF_TEST_FIRM_ID: "${{ vars.SF_TEST_FIRM_ID }}"
       CHANGED_TEMPLATES: "${{ needs.check-changed-templates.outputs.changed_templates }}"
-      # Maximum number of liquid tests run in parallel against the live platform per batch.
-      # A single `run-test --status` call fires all of its handles concurrently (Promise.all)
-      # with no client-side rate limiting, so we cap the batch size and run batches
-      # sequentially to keep the global number of in-flight tests bounded.
+      # Concurrency and retry knobs. One `run-test --status` call runs all of its templates
+      # concurrently (Promise.all) with no client-side rate limiting, so the global number of
+      # in-flight tests is bounded by MAX_PARALLEL_TESTS (per call) x MAX_PARALLEL_FIRMS
+      # (buckets running at the same time).
       MAX_PARALLEL_TESTS: 10
+      # How many firm|type buckets run at the same time. Different firms no longer wait for
+      # each other; a slow firm only delays its own bucket.
+      MAX_PARALLEL_FIRMS: 3
+      # Attempts per template for TRANSIENT platform errors (internal error, no response,
+      # run never completed). Genuine test failures are never retried.
+      MAX_TEST_ATTEMPTS: 3
     if: ${{ needs.check-changed-templates.outputs.changed_templates != '[]' }}
     needs: [check-auth, check-changed-templates]
     steps:
@@ -112,13 +121,16 @@ jobs:
       - name: Run liquid tests for updated templates (grouped per firm, run in parallel)
         run: |
           MAX_PARALLEL="${MAX_PARALLEL_TESTS:-10}"
-          # Testable templates grouped by "<firm id>|<template type>". Each bucket maps to one
-          # `run-test` call, because the CLI takes a single firm and a single template type per
-          # invocation. Identifiers are stored newline-separated so account template names
-          # (which contain spaces and other characters) stay intact.
+          MAX_FIRMS="${MAX_PARALLEL_FIRMS:-3}"
+          MAX_ATTEMPTS="${MAX_TEST_ATTEMPTS:-3}"
+          # Testable templates grouped by "<firm id>|<template type>". Each bucket maps to
+          # `run-test` calls for a single firm and a single template type (a CLI constraint).
+          # Identifiers are stored newline-separated so account template names (which contain
+          # spaces and other characters) stay intact.
           declare -A TEMPLATE_BUCKETS
           declare -a ERRORS
           declare -a SUMMARY
+          FALLBACK_COUNT=0
           # CHANGED_TEMPLATES is a JSON array; read it space-safely. The process substitution
           # keeps the loop in the current shell so the arrays above survive.
           while IFS= read -r CURRENT_DIR; do
@@ -198,8 +210,11 @@ jobs:
                 fi
                 
                 if [[ -z "$FIRM_ID" ]]; then
-                  # 3. Default behavior - use first available firm ID
+                  # 3. Default behavior - use first available firm ID. This choice is NOT
+                  # stable: regenerating config.json can reorder the ".id" keys and silently
+                  # move the test to a different firm, so count it and warn once below.
                   FIRM_ID=$(cat "${CURRENT_DIR}/config.json" | jq -r ".id" | jq "keys_unsorted" | jq "first" | tr -d '"')
+                  FALLBACK_COUNT=$((FALLBACK_COUNT+1))
                 fi
 
                 # Group this template under "<firm>|<type>" so all templates that share a firm
@@ -214,76 +229,173 @@ jobs:
               fi
             done
           done < <(printf '%s' "${CHANGED_TEMPLATES}" | jq -r '.[]')
-          # Run each bucket. All identifiers passed to a single `run-test --status` call run
-          # concurrently in the CLI (Promise.all), so we cap each batch at MAX_PARALLEL and run
-          # batches sequentially to keep the number of in-flight tests against the platform bounded.
-          for KEY in "${!TEMPLATE_BUCKETS[@]}"; do
+          if (( FALLBACK_COUNT > 0 )); then
+            echo "::warning::${FALLBACK_COUNT} template(s) have no valid test_firm_id and no matching SF_TEST_FIRM_ID, so they default to the first firm id in their config.json. That choice can silently change when config.json is regenerated, and tests then run against a firm without the right test data. Pin test_firm_id in the template config (or set the SF_TEST_FIRM_ID repository variable) for stable firm assignment."
+          fi
+
+          # ---- Run phase -------------------------------------------------------------
+          # Each "<firm>|<type>" bucket runs as its own background job, so different firms
+          # proceed in parallel (capped at MAX_FIRMS) and a slow firm only delays its own
+          # bucket. Within a bucket the CLI runs up to MAX_PARALLEL templates concurrently
+          # per call.
+          #
+          # Transient platform problems (internal error, no response, run never completed)
+          # are retried up to MAX_ATTEMPTS per template. Genuine test failures - the CLI
+          # lists the failing unit tests as the reason - are never retried.
+          WORKDIR=$(mktemp -d)
+
+          run_bucket() {
+            # $1=firm  $2=template type  $3=identifier list file  $4=output file  $5=verdict file
+            # Writes only to its own files; the main shell prints them when the bucket ends.
+            # Verdict lines are "<status>\t<attempts>\t<name>".
+            local FIRM="$1" TYPE="$2" LIST="$3" OUT="$4" VERDICTS="$5"
+            local CLI_FLAG="--handle"
+            [[ "${TYPE}" == "accountTemplate" ]] && CLI_FLAG="--account-template"
+            local -A FINAL=() ATTEMPT_OF=()
+            local -a REMAINING=() NEXT=() BATCH=()
+            local ATTEMPT=1 TOTAL START RAW PARSED BATCH_EXIT NAME STATUS TRANSIENT
+            mapfile -t REMAINING < "${LIST}"
+            while (( ${#REMAINING[@]} > 0 && ATTEMPT <= MAX_ATTEMPTS )); do
+              if (( ATTEMPT > 1 )); then
+                echo "--- attempt ${ATTEMPT}: retrying ${#REMAINING[@]} template(s) after a transient platform error ---" >> "${OUT}"
+                sleep 10
+              fi
+              NEXT=()
+              TOTAL=${#REMAINING[@]}
+              for (( START=0; START<TOTAL; START+=MAX_PARALLEL )); do
+                BATCH=("${REMAINING[@]:START:MAX_PARALLEL}")
+                RAW=$(mktemp "${WORKDIR}/raw.XXXXXX")
+                BATCH_EXIT=0
+                node ./node_modules/silverfin-cli/bin/cli.js run-test --firm "${FIRM}" --status ${CLI_FLAG} "${BATCH[@]}" > "${RAW}" 2>&1 || BATCH_EXIT=$?
+                cat "${RAW}" >> "${OUT}"
+                # Normalise (split carriage-return frames, strip ANSI escapes), then read the
+                # top-level "[log] <name>: PASSED|FAILED" lines. The indented "[log]   ..."
+                # lines that follow a FAILED line carry the reason: named failing unit tests
+                # mean a genuine failure, platform-error texts mean a transient one (retry).
+                # Names are matched exactly (never inside a regex): account template names
+                # contain spaces and characters like & ( ).
+                PARSED=$(mktemp "${WORKDIR}/parsed.XXXXXX")
+                tr '\r' '\n' < "${RAW}" | sed -E $'s/\033\\[[0-9;?]*[A-Za-z]//g' | awk '
+                  /^\[log\] [^[:space:]]/ {
+                    line = substr($0, 7)
+                    if (line ~ /: PASSED[[:space:]]*$/) { name = line; sub(/: PASSED[[:space:]]*$/, "", name); verdict[name] = "PASSED"; cur = name; next }
+                    if (line ~ /: FAILED[[:space:]]*$/) { name = line; sub(/: FAILED[[:space:]]*$/, "", name); verdict[name] = "FAILED"; cur = name; next }
+                    cur = ""; next
+                  }
+                  /^\[log\]  / {
+                    if (cur != "" && tolower($0) ~ /internal error|no response from the platform|test run did not complete|timeout\. try to run your test again/) transient[cur] = 1
+                  }
+                  END { for (n in verdict) printf "%s\t%d\t%s\n", verdict[n], (n in transient) ? 1 : 0, n }
+                ' > "${PARSED}"
+                local -A RESULTS=() RETRYABLE=()
+                while IFS=$'\t' read -r STATUS TRANSIENT NAME; do
+                  RESULTS["${NAME}"]="${STATUS}"
+                  RETRYABLE["${NAME}"]="${TRANSIENT}"
+                done < "${PARSED}"
+                for NAME in "${BATCH[@]}"; do
+                  ATTEMPT_OF["${NAME}"]=${ATTEMPT}
+                  case "${RESULTS[${NAME}]:-}" in
+                    PASSED)
+                      FINAL["${NAME}"]="PASS"
+                      ;;
+                    FAILED)
+                      if [[ "${RETRYABLE[${NAME}]:-0}" == "1" ]] && (( ATTEMPT < MAX_ATTEMPTS )); then
+                        NEXT+=("${NAME}")
+                      elif [[ "${RETRYABLE[${NAME}]:-0}" == "1" ]]; then
+                        FINAL["${NAME}"]="FAIL - transient platform error persisted"
+                      else
+                        FINAL["${NAME}"]="FAIL"
+                      fi
+                      ;;
+                    *)
+                      # No verdict line for this template: the CLI died or dropped it.
+                      if (( ATTEMPT < MAX_ATTEMPTS )); then
+                        NEXT+=("${NAME}")
+                      else
+                        FINAL["${NAME}"]="FAIL - no verdict from the CLI (exit code ${BATCH_EXIT})"
+                      fi
+                      ;;
+                  esac
+                done
+              done
+              REMAINING=("${NEXT[@]}")
+              ATTEMPT=$((ATTEMPT+1))
+            done
+            for NAME in "${!FINAL[@]}"; do
+              printf '%s\t%s\t%s\n' "${FINAL[${NAME}]}" "${ATTEMPT_OF[${NAME}]}" "${NAME}" >> "${VERDICTS}"
+            done
+          }
+
+          # Launch buckets (at most MAX_FIRMS at a time) and flush results in launch order.
+          KEYS=("${!TEMPLATE_BUCKETS[@]}")
+          declare -A BUCKET_PID
+          NEXT_LAUNCH=0
+          launch_ready_buckets() {
+            local KEY FIRM TYPE
+            while (( NEXT_LAUNCH < ${#KEYS[@]} )) && (( $(jobs -rp | wc -l) < MAX_FIRMS )); do
+              KEY="${KEYS[${NEXT_LAUNCH}]}"
+              FIRM="${KEY%%|*}"
+              TYPE="${KEY##*|}"
+              # `|| true`: grep exits 1 when a bucket's identifiers are all empty (e.g. a
+              # config with "handle": ""), which under `set -eo pipefail` would abort the
+              # whole step and kill every bucket. An empty list is handled downstream.
+              printf '%s' "${TEMPLATE_BUCKETS[${KEY}]}" | sort -u | grep -v '^$' > "${WORKDIR}/list.${NEXT_LAUNCH}" || true
+              : > "${WORKDIR}/out.${NEXT_LAUNCH}"
+              : > "${WORKDIR}/verdicts.${NEXT_LAUNCH}"
+              run_bucket "${FIRM}" "${TYPE}" "${WORKDIR}/list.${NEXT_LAUNCH}" "${WORKDIR}/out.${NEXT_LAUNCH}" "${WORKDIR}/verdicts.${NEXT_LAUNCH}" &
+              BUCKET_PID[${NEXT_LAUNCH}]=$!
+              echo "▶ firm ${FIRM} · ${TYPE}: started ($(wc -l < "${WORKDIR}/list.${NEXT_LAUNCH}" | tr -d ' ') template(s))"
+              NEXT_LAUNCH=$((NEXT_LAUNCH+1))
+            done
+          }
+          launch_ready_buckets
+          for (( i=0; i<${#KEYS[@]}; i++ )); do
+            # A slot may only free up when an earlier bucket ends, so keep trying to launch.
+            while [[ -z "${BUCKET_PID[${i}]:-}" ]]; do
+              sleep 5
+              launch_ready_buckets
+            done
+            KEY="${KEYS[${i}]}"
             FIRM_ID="${KEY%%|*}"
             TEMPLATE_TYPE="${KEY##*|}"
-            # The CLI uses a different flag per template type.
-            if [[ "${TEMPLATE_TYPE}" == "accountTemplate" ]]; then
-              CLI_FLAG="--account-template"
-            else
-              CLI_FLAG="--handle"
-            fi
-            # Deduplicate the identifiers for this bucket (newline-separated, so names with
-            # spaces stay intact).
-            mapfile -t IDENTIFIERS < <(printf '%s' "${TEMPLATE_BUCKETS[$KEY]}" | sort -u | grep -v '^$')
-            TOTAL=${#IDENTIFIERS[@]}
-            for (( START=0; START<TOTAL; START+=MAX_PARALLEL )); do
-              BATCH=("${IDENTIFIERS[@]:START:MAX_PARALLEL}")
-              # Fold each parallel batch into a collapsible log group so the raw CLI output
-              # (spinner frames included) stays out of the way unless you open it.
-              echo "::group::firm ${FIRM_ID} · ${TEMPLATE_TYPE} · ${#BATCH[@]} in parallel"
-              if OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-test --firm "${FIRM_ID}" --status ${CLI_FLAG} "${BATCH[@]}" 2>&1); then
-                BATCH_EXIT=0
-              else
-                BATCH_EXIT=$?
+            WAITED=0
+            while kill -0 "${BUCKET_PID[${i}]}" 2>/dev/null; do
+              sleep 10
+              WAITED=$((WAITED+10))
+              launch_ready_buckets
+              if (( WAITED % 60 == 0 )); then
+                echo "… firm ${FIRM_ID} · ${TEMPLATE_TYPE} still running (${WAITED}s)"
               fi
-              echo "${OUTPUT}"
-              # Parse the per-template status. In CI, consola prefixes every line with "[log] "
-              # and the test spinner interleaves frames via carriage returns, so split on carriage
-              # returns and strip ANSI escapes first. We then read the top-level
-              # "[log] <name>: PASSED|FAILED" lines (a leading space after "[log] " marks an
-              # indented sub-result, which is skipped; trailing whitespace is tolerated) and match
-              # by EXACT name: account template names contain spaces and characters that are
-              # unsafe inside a regex.
-              CLEAN_OUTPUT=$(printf '%s\n' "${OUTPUT}" | tr '\r' '\n' | sed -E $'s/\033\\[[0-9;?]*[A-Za-z]//g')
-              declare -A RESULTS=()
-              while IFS= read -r LINE; do
-                STATUS="${LINE##*: }"
-                STATUS="${STATUS%%[[:space:]]*}"
-                NAME="${LINE#\[log\] }"
-                NAME="${NAME%: *}"
-                RESULTS["${NAME}"]="${STATUS}"
-              done < <(printf '%s\n' "${CLEAN_OUTPUT}" | grep -oE '\[log\] [^[:space:]].*: (PASSED|FAILED)[[:space:]]*$')
-              for IDENTIFIER in "${BATCH[@]}"; do
-                case "${RESULTS[${IDENTIFIER}]:-}" in
-                  PASSED)
-                    echo "${IDENTIFIER}: passed"
-                    SUMMARY+=("PASS"$'\t'"${FIRM_ID}"$'\t'"${IDENTIFIER}")
-                    ;;
-                  FAILED)
-                    echo "${IDENTIFIER}: failed"
-                    ERRORS+=("${IDENTIFIER}")
-                    SUMMARY+=("FAIL"$'\t'"${FIRM_ID}"$'\t'"${IDENTIFIER}")
-                    ;;
-                  *)
-                    echo "${IDENTIFIER}: status could not be determined (batch exit code ${BATCH_EXIT})"
-                    ERRORS+=("${IDENTIFIER}")
-                    SUMMARY+=("????"$'\t'"${FIRM_ID}"$'\t'"${IDENTIFIER}")
-                    ;;
-                esac
-              done
-              echo "::endgroup::"
             done
+            wait "${BUCKET_PID[${i}]}" 2>/dev/null || true
+            # Full CLI output of the bucket, folded away unless opened.
+            echo "::group::firm ${FIRM_ID} · ${TEMPLATE_TYPE} · raw CLI output"
+            cat "${WORKDIR}/out.${i}"
+            echo "::endgroup::"
+            # Per-template verdicts; any queued template without one means the runner died.
+            declare -A SEEN=()
+            while IFS=$'\t' read -r STATUS ATTEMPTS NAME; do
+              SEEN["${NAME}"]=1
+              NOTE=""
+              (( ATTEMPTS > 1 )) && NOTE=" (attempt ${ATTEMPTS})"
+              echo "${NAME}: ${STATUS}${NOTE}"
+              SUMMARY+=("${STATUS}${NOTE}"$'\t'"${FIRM_ID}"$'\t'"${NAME}")
+              [[ "${STATUS}" != "PASS" ]] && ERRORS+=("${NAME}")
+            done < "${WORKDIR}/verdicts.${i}"
+            while IFS= read -r NAME; do
+              if [[ -z "${SEEN[${NAME}]:-}" ]]; then
+                echo "${NAME}: FAIL - the bucket runner crashed before producing a verdict"
+                ERRORS+=("${NAME}")
+                SUMMARY+=("FAIL - runner crashed"$'\t'"${FIRM_ID}"$'\t'"${NAME}")
+              fi
+            done < "${WORKDIR}/list.${i}"
           done
-          # Flat summary keyed on the two columns that matter: template and firm.
+          # Flat summary: template, firm, outcome (with the attempt count when retried).
           if [ ${#SUMMARY[@]} -gt 0 ]; then
             echo ""
             echo "─ Results ─────────────────────────────────────────────────────"
             while IFS=$'\t' read -r RESULT FIRM NAME; do
-              printf ' %-4s %-45s firm %s\n' "${RESULT}" "${NAME}" "${FIRM}"
+              printf ' %-45s firm %-8s %s\n' "${NAME}" "${FIRM}" "${RESULT}"
             done < <(printf '%s\n' "${SUMMARY[@]}")
             echo "────────────────────────────────────────────────────────────────"
             echo "${#ERRORS[@]} failed, $(( ${#SUMMARY[@]} - ${#ERRORS[@]} )) passed"
