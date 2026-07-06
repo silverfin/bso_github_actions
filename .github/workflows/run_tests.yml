@@ -336,7 +336,10 @@ jobs:
               KEY="${KEYS[${NEXT_LAUNCH}]}"
               FIRM="${KEY%%|*}"
               TYPE="${KEY##*|}"
-              printf '%s' "${TEMPLATE_BUCKETS[${KEY}]}" | sort -u | grep -v '^$' > "${WORKDIR}/list.${NEXT_LAUNCH}"
+              # `|| true`: grep exits 1 when a bucket's identifiers are all empty (e.g. a
+              # config with "handle": ""), which under `set -eo pipefail` would abort the
+              # whole step and kill every bucket. An empty list is handled downstream.
+              printf '%s' "${TEMPLATE_BUCKETS[${KEY}]}" | sort -u | grep -v '^$' > "${WORKDIR}/list.${NEXT_LAUNCH}" || true
               : > "${WORKDIR}/out.${NEXT_LAUNCH}"
               : > "${WORKDIR}/verdicts.${NEXT_LAUNCH}"
               run_bucket "${FIRM}" "${TYPE}" "${WORKDIR}/list.${NEXT_LAUNCH}" "${WORKDIR}/out.${NEXT_LAUNCH}" "${WORKDIR}/verdicts.${NEXT_LAUNCH}" &
@@ -376,12 +379,8 @@ jobs:
               NOTE=""
               (( ATTEMPTS > 1 )) && NOTE=" (attempt ${ATTEMPTS})"
               echo "${NAME}: ${STATUS}${NOTE}"
-              if [[ "${STATUS}" == "PASS" ]]; then
-                SUMMARY+=("${STATUS}${NOTE}"$'\t'"${FIRM_ID}"$'\t'"${NAME}")
-              else
-                ERRORS+=("${NAME}")
-                SUMMARY+=("${STATUS}${NOTE}"$'\t'"${FIRM_ID}"$'\t'"${NAME}")
-              fi
+              SUMMARY+=("${STATUS}${NOTE}"$'\t'"${FIRM_ID}"$'\t'"${NAME}")
+              [[ "${STATUS}" != "PASS" ]] && ERRORS+=("${NAME}")
             done < "${WORKDIR}/verdicts.${i}"
             while IFS= read -r NAME; do
               if [[ -z "${SEEN[${NAME}]:-}" ]]; then
