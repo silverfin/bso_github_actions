@@ -1,0 +1,332 @@
+# Reusable workflow. Runs the Liquid Sampler (silverfin-cli `run-sampler`) for a single
+# partner's changed reconciliation/account templates and posts the result on a PR.
+#
+# This is deliberately partner-agnostic and repo-layout-agnostic: given a partner id, a list
+# of already-classified handles/account templates, and firm ids, it loads that partner's
+# credentials, runs the sampler, and reports back. All market-specific logic (which templates
+# changed, which partner they belong to) lives in the calling wrapper — see
+# docs/liquid_sampler.md and the CI_AUTH_SAMPLER_PLAN.md design notes (§6, §8) this implements.
+#
+# Design decisions this encodes (see plan §6 D1-D9, §8):
+# - Serialized per partner: the backend allows only one sampler run per partner at a time.
+#   `concurrency: { group, queue: max }` queues overlapping runs FIFO instead of cancelling —
+#   cancelling the CI job does NOT cancel the backend run, it just orphans it and blocks the
+#   partner until it clears.
+# - Cross-repo collisions (two market repos sharing a partner id) can't be solved by GitHub
+#   Actions concurrency groups (they don't span repos), so a 422 "already in progress" from the
+#   backend is treated as the real mutex: poll-and-retry instead of failing immediately.
+# - The partner api_key is a single rotate-on-401 credential stored in its own
+#   PARTNER_CONFIG_JSON_<partner> secret (never the firm CONFIG_JSON). This workflow is the
+#   sole writer of that secret, and only writes back if the on-disk token actually changed
+#   during the run (diffed before/after, not inferred from log output).
+# - `results.zip` is uploaded as a short-lived workflow artifact (7 days) for the rare
+#   rendering-only regression the compact named_results diff can't see; the presigned report
+#   URL is the long-lived source of truth.
+name: run-liquid-sampler
+run-name: "Liquid sampler · partner ${{ inputs.partner }}"
+
+on:
+  workflow_call:
+    inputs:
+      partner:
+        description: "Partner environment id (must be authorized — see PARTNER_CONFIG_JSON secret)"
+        required: true
+        type: string
+      handles:
+        description: "Reconciliation text handles to sample, space-separated (directory names under reconciliation_texts/). Optional if account_templates is set."
+        required: false
+        type: string
+        default: ""
+      account_templates:
+        description: "Account template names to sample, space-separated (directory names under account_templates/). Optional if handles is set."
+        required: false
+        type: string
+        default: ""
+      firm_ids:
+        description: "Firm id(s) to sample against, space-separated. The backend 422s if empty."
+        required: true
+        type: string
+      ref:
+        description: "Git ref (commit SHA) to check out — the PR head, so sampled template content matches the PR under review."
+        required: true
+        type: string
+      pull_request_number:
+        description: "PR number to post the result comment on. If empty, no comment is posted (results still upload as an artifact)."
+        required: false
+        type: string
+        default: ""
+    secrets:
+      SF_API_CLIENT_ID:
+        description: "Silverfin API OAuth client id (silverfin-cli needs it at startup)."
+        required: true
+      SF_API_SECRET:
+        description: "Silverfin API OAuth client secret."
+        required: true
+      SF_BASIC_AUTH:
+        description: "HTTP Basic credentials (base64) for the staging gateway. The CLI only sends this when it auto-detects a *.staging.getsilverfin.com host; a no-op elsewhere."
+        required: false
+      PARTNER_CONFIG_JSON:
+        description: "This partner's stored credentials (host + partnerCredentials.<partner>.token). Caller resolves the per-partner secret, e.g. secrets[format('PARTNER_CONFIG_JSON_{0}', matrix.partner)]."
+        required: true
+      REPO_ACCESS_TOKEN:
+        description: "PAT with repo scope, used to write the rotated partner token back via `gh secret set`."
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# Lives inside the reusable workflow itself (not the wrapper) so every adopter gets the
+# serialization for free with no way to forget it. `github.repository` here resolves to the
+# CALLER's repo (GitHub Actions behavior for reusable workflows), so two different market repos
+# each get their own group — see the cross-repo mitigation below for why that's not sufficient
+# on its own.
+concurrency:
+  group: sampler-${{ github.repository }}-${{ inputs.partner }}
+  # 'queue: max' is a GitHub Actions beta sub-key (FIFO, nothing cancelled). If a target repo's
+  # plan rejects it, fall back to `queue: single` or plain `cancel-in-progress: false` — never
+  # cancel-in-progress: true, since cancelling this job does not cancel the backend run.
+  queue: max
+
+jobs:
+  run-sampler:
+    runs-on: ubuntu-latest
+    # Generous ceiling: a single run is ~30-60 min, plus up to ~90 min of poll-and-retry on a
+    # cross-repo 422 collision (see the retry loop below).
+    timeout-minutes: 180
+    steps:
+      - name: Validate inputs
+        run: |
+          if [[ -z "${{ inputs.handles }}" && -z "${{ inputs.account_templates }}" ]]; then
+            echo "::error::Neither handles nor account_templates was supplied — nothing to sample."
+            exit 1
+          fi
+          if [[ -z "${{ inputs.firm_ids }}" ]]; then
+            echo "::error::firm_ids is empty. The sampler backend 422s without firm ids."
+            exit 1
+          fi
+
+      - name: Checkout repository at PR head
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Install silverfin-cli
+        run: |
+          # Unpinned, matching every other production workflow's convention (none pin to a
+          # branch/SHA/tag) — relies on run-sampler + --compact + result-URL surfacing being on
+          # main (silverfin-cli PR #261, "agustin-bso-sampler-easy-results", not yet merged as of
+          # this writing). Merge that first, or this step still installs a CLI without --compact.
+          npm install https://github.com/silverfin/silverfin-cli.git
+          VERSION=$(node ./node_modules/silverfin-cli/bin/cli.js -V)
+          echo "CLI version: ${VERSION}"
+
+      - name: Load PARTNER_CONFIG_JSON (host + partnerCredentials)
+        env:
+          PARTNER_CONFIG_JSON: ${{ secrets.PARTNER_CONFIG_JSON }}
+        run: |
+          echo "::add-mask::${PARTNER_CONFIG_JSON}"
+          mkdir -p "$HOME/.silverfin"
+          printf '%s' "${PARTNER_CONFIG_JSON}" > "$HOME/.silverfin/config.json"
+          if ! jq -e --arg p "${{ inputs.partner }}" '.partnerCredentials[$p].token' "$HOME/.silverfin/config.json" > /dev/null 2>&1; then
+            echo "::error::PARTNER_CONFIG_JSON has no partnerCredentials entry for partner ${{ inputs.partner }}. Authorize it first with 'silverfin authorize-partner -i ${{ inputs.partner }} -k <api-key>' and store the resulting config.json as this secret."
+            exit 1
+          fi
+          echo "Host: $(jq -r '.host // \"(default)\"' "$HOME/.silverfin/config.json")"
+
+      - name: Capture partner token before the run
+        id: before
+        run: |
+          TOKEN=$(jq -r --arg p "${{ inputs.partner }}" '.partnerCredentials[$p].token' "$HOME/.silverfin/config.json")
+          echo "::add-mask::${TOKEN}"
+          echo "token=${TOKEN}" >> "$GITHUB_OUTPUT"
+
+      - name: Run liquid sampler (retries on a cross-repo 422 collision)
+        id: sampler
+        env:
+          SF_API_CLIENT_ID: ${{ secrets.SF_API_CLIENT_ID }}
+          SF_API_SECRET: ${{ secrets.SF_API_SECRET }}
+          SF_BASIC_AUTH: ${{ secrets.SF_BASIC_AUTH }}
+          SAMPLER_PARTNER: ${{ inputs.partner }}
+          SAMPLER_HANDLES: ${{ inputs.handles }}
+          SAMPLER_ACCOUNT_TEMPLATES: ${{ inputs.account_templates }}
+          SAMPLER_FIRM_IDS: ${{ inputs.firm_ids }}
+        run: |
+          # Intentional word-splitting: handles/account templates arrive as a single
+          # space-separated string and must become separate CLI args (shellcheck SC2206).
+          HANDLE_ARGS=()
+          # shellcheck disable=SC2206
+          [[ -n "${SAMPLER_HANDLES}" ]] && HANDLE_ARGS=(-h ${SAMPLER_HANDLES})
+          ACCOUNT_ARGS=()
+          # shellcheck disable=SC2206
+          [[ -n "${SAMPLER_ACCOUNT_TEMPLATES}" ]] && ACCOUNT_ARGS=(-at ${SAMPLER_ACCOUNT_TEMPLATES})
+
+          # GitHub Actions concurrency (group + queue: max) serializes runs within THIS repo, but
+          # concurrency groups do not span repositories — two market repos sharing this partner id
+          # can still collide. The backend's own one-run-per-partner 422 is the real cross-repo
+          # mutex, so treat it as a "try again shortly" signal, not a hard failure. Bounded to
+          # match the worst-case run length (~60 min) plus margin.
+          DEADLINE=$(( $(date +%s) + 90*60 ))
+          ATTEMPT=1
+          while true; do
+            echo "[$(date -u +%H:%M:%S)] run-sampler attempt ${ATTEMPT}: -p ${SAMPLER_PARTNER} ${HANDLE_ARGS[*]} ${ACCOUNT_ARGS[*]} --firm-ids ${SAMPLER_FIRM_IDS} --compact"
+            set +e
+            # shellcheck disable=SC2086 # SAMPLER_FIRM_IDS is intentionally word-split (space-separated ids -> separate args)
+            OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1 | tr -d '\r')
+            RC=$?
+            set -e
+            echo "----- run-sampler output (exit ${RC}) -----"
+            echo "$OUTPUT"
+            echo "--------------------------------------------"
+
+            if echo "$OUTPUT" | grep -qi "already in progress"; then
+              NOW=$(date +%s)
+              if (( NOW >= DEADLINE )); then
+                # Don't exit here: fall through to the normal output-setting logic below (which
+                # will correctly record sampler_ok=false / no report_url) so downstream steps
+                # (write-back, PR comment) still run via their own `if:` conditions instead of
+                # being skipped by a hard step failure. The final "Fail job" step still fails
+                # the job overall.
+                echo "::error::Partner ${SAMPLER_PARTNER} still has a sampler run in progress after 90 minutes of retrying. Giving up — check whether a previous run is stuck (§2.3/2.4c: no CLI cancel exists for a backend run)."
+                break
+              fi
+              echo "[$(date -u +%H:%M:%S)] partner ${SAMPLER_PARTNER} has a run in progress elsewhere (cross-repo or stale) — retrying in 60s..."
+              sleep 60
+              ATTEMPT=$((ATTEMPT+1))
+              continue
+            fi
+            break
+          done
+
+          {
+            echo "rc=${RC}"
+          } >> "$GITHUB_OUTPUT"
+
+          if [[ "${RC}" -ne 0 ]]; then
+            echo "sampler_ok=false" >> "$GITHUB_OUTPUT"
+          elif echo "$OUTPUT" | grep -qi "completed successfully"; then
+            echo "sampler_ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sampler_ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Report URL: "Sampler report: https://..." (strip ANSI first).
+          REPORT_URL=$(echo "$OUTPUT" | sed 's/\x1b\[[0-9;]*m//g' | grep -oE 'Sampler report: https?://[^[:space:]]+' | head -n1 | sed 's/^Sampler report: //')
+          echo "report_url=${REPORT_URL}" >> "$GITHUB_OUTPUT"
+
+          # Compact named_results diff, between the CLI's own markers.
+          COMPACT=$(echo "$OUTPUT" | sed 's/\x1b\[[0-9;]*m//g' | awk '/SAMPLER_COMPACT_START/{f=1;next} /SAMPLER_COMPACT_END/{f=0} f')
+          {
+            echo "compact<<SAMPLER_COMPACT_EOF_9c2a"
+            echo "$COMPACT"
+            echo "SAMPLER_COMPACT_EOF_9c2a"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Capture partner token after the run and write back if rotated
+        id: after
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+        run: |
+          if [[ ! -f "$HOME/.silverfin/config.json" ]]; then
+            echo "No config.json on disk (load step must have failed) — nothing to write back."
+            exit 0
+          fi
+          AFTER_TOKEN=$(jq -r --arg p "${{ inputs.partner }}" '.partnerCredentials[$p].token' "$HOME/.silverfin/config.json")
+          echo "::add-mask::${AFTER_TOKEN}"
+          if [[ "${AFTER_TOKEN}" == "${{ steps.before.outputs.token }}" ]]; then
+            echo "Partner token unchanged — no write-back needed (sole-writer secret stays untouched)."
+            exit 0
+          fi
+          echo "Partner token rotated mid-run (401 refresh) — writing PARTNER_CONFIG_JSON_${{ inputs.partner }} back."
+          CONFIG_JSON=$(cat "$HOME/.silverfin/config.json" | tr -d '\n')
+          echo "::add-mask::${CONFIG_JSON}"
+          echo "$CONFIG_JSON" | gh secret set "PARTNER_CONFIG_JSON_${{ inputs.partner }}"
+
+      - name: Download results.zip for the workflow artifact
+        id: download
+        if: steps.sampler.outputs.report_url != ''
+        env:
+          REPORT_URL: ${{ steps.sampler.outputs.report_url }}
+        run: |
+          # The CLI's --compact path downloads to a temp dir and deletes it after printing the
+          # diff, so results.zip never lands on disk on its own — fetch it again here for the
+          # artifact (Q12: full zip kept for rendering-only regressions the compact diff can't see).
+          if curl -sL --max-time 300 -o results.zip "${REPORT_URL}"; then
+            echo "downloaded=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Could not download results.zip from the report URL for the artifact upload (the report link itself is still valid)."
+            echo "downloaded=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload results.zip artifact
+        if: steps.download.outputs.downloaded == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sampler-results-partner-${{ inputs.partner }}
+          path: results.zip
+          retention-days: 7
+
+      - name: Post result comment on the PR
+        if: inputs.pull_request_number != ''
+        uses: actions/github-script@v7
+        env:
+          PARTNER: ${{ inputs.partner }}
+          HANDLES: ${{ inputs.handles }}
+          ACCOUNT_TEMPLATES: ${{ inputs.account_templates }}
+          FIRM_IDS: ${{ inputs.firm_ids }}
+          SAMPLER_OK: ${{ steps.sampler.outputs.sampler_ok }}
+          REPORT_URL: ${{ steps.sampler.outputs.report_url }}
+          COMPACT: ${{ steps.sampler.outputs.compact }}
+          PR_NUMBER: ${{ inputs.pull_request_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const marker = `<!-- silverfin-sampler-result-${process.env.PARTNER} -->`;
+            const ok = process.env.SAMPLER_OK === "true";
+            const reportUrl = process.env.REPORT_URL || "";
+            const compact = (process.env.COMPACT || "").trim();
+            const runUrl = process.env.RUN_URL;
+
+            const lines = [`## Liquid sampler · partner \`${process.env.PARTNER}\``, ""];
+            if (ok) {
+              lines.push("This is a **review artifact, not a pass/fail gate** — check the diff below (or the full report) for unintended changes.");
+            } else {
+              lines.push(`⚠️ The sampler run did not complete cleanly — see the [workflow run](${runUrl}) for details.`);
+            }
+            lines.push("");
+            if (process.env.HANDLES) lines.push(`- Reconciliation handles: \`${process.env.HANDLES}\``);
+            if (process.env.ACCOUNT_TEMPLATES) lines.push(`- Account templates: \`${process.env.ACCOUNT_TEMPLATES}\``);
+            lines.push(`- Firm(s): \`${process.env.FIRM_IDS}\``);
+            if (reportUrl) lines.push(`- **[📊 Open full sampler report](${reportUrl})** (downloads \`results.zip\`)`);
+            lines.push(`- Workflow run: ${runUrl}`);
+            lines.push("");
+            if (compact) {
+              lines.push(compact);
+            } else if (ok) {
+              lines.push("_No compact diff was produced (see the run log)._");
+            }
+            lines.push("", marker);
+            const body = lines.join("\n");
+
+            const { owner, repo } = context.repo;
+            const prNumber = parseInt(process.env.PR_NUMBER, 10);
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: prNumber, per_page: 100 });
+            const existing = comments.find(c => c.user && c.user.type === "Bot" && c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+            }
+
+      - name: Fail job if the sampler run did not complete successfully
+        if: steps.sampler.outputs.sampler_ok != 'true'
+        run: |
+          echo "::error::Sampler run for partner ${{ inputs.partner }} did not complete successfully — see the run-sampler step output above."
+          exit 1
