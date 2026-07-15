@@ -217,7 +217,13 @@ jobs:
           fi
 
           # Report URL: "Sampler report: https://..." (strip ANSI first).
-          REPORT_URL=$(echo "$OUTPUT" | sed 's/\x1b\[[0-9;]*m//g' | grep -oE 'Sampler report: https?://[^[:space:]]+' | head -n1 | sed 's/^Sampler report: //')
+          # `|| true`: under `set -eo pipefail`, grep finding no match (a failed/timed-out run
+          # never prints this line) makes the whole pipeline's exit status non-zero even though
+          # head/sed after it succeed on empty input - that would abort this step here, before
+          # the compact-diff extraction below and before the "always run" downstream steps ever
+          # see a value, silently dropping the PR comment on failure. Confirmed by reproducing
+          # locally: without `|| true` this line aborted the step on every non-completed run.
+          REPORT_URL=$(echo "$OUTPUT" | sed 's/\x1b\[[0-9;]*m//g' | grep -oE 'Sampler report: https?://[^[:space:]]+' | head -n1 | sed 's/^Sampler report: //') || true
           echo "report_url=${REPORT_URL}" >> "$GITHUB_OUTPUT"
 
           # Compact named_results diff, between the CLI's own markers.
