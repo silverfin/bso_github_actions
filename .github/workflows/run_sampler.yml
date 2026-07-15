@@ -127,8 +127,7 @@ jobs:
         run: |
           # Unpinned, matching every other production workflow's convention (none pin to a
           # branch/SHA/tag) — relies on run-sampler + --compact + result-URL surfacing being on
-          # main (silverfin-cli PR #261, "agustin-bso-sampler-easy-results", not yet merged as of
-          # this writing). Merge that first, or this step still installs a CLI without --compact.
+          # main (silverfin-cli PR #261, "agustin-bso-sampler-easy-results", merged 2026-07-15).
           npm install https://github.com/silverfin/silverfin-cli.git
           VERSION=$(node ./node_modules/silverfin-cli/bin/cli.js -V)
           echo "CLI version: ${VERSION}"
