@@ -240,7 +240,14 @@ jobs:
 
       - name: Capture partner token after the run and write back if rotated
         id: after
-        if: always()
+        # Gated on steps.before succeeding, not just always(): if "Load"/"Capture...before" never
+        # got a valid token for this partner (e.g. the secret is missing a partnerCredentials
+        # entry), steps.before.outputs.token is empty - comparing that against whatever
+        # AFTER_TOKEN happens to parse to would read as "rotated" and write back a config that
+        # was never actually valid to begin with. Caught live: a run that failed at "Load"
+        # (invalid secret content) still had this step fire under bare always() and wrote the
+        # same bad content back to the secret - a no-op here, but the wrong behavior in general.
+        if: always() && steps.before.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
         run: |
