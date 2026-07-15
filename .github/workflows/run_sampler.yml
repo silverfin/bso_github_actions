@@ -94,6 +94,12 @@ jobs:
     # Generous ceiling: a single run is ~30-60 min, plus up to ~90 min of poll-and-retry on a
     # cross-repo 422 collision (see the retry loop below).
     timeout-minutes: 180
+    # Job-level (not just on the sampler step): the CLI checks for these at process startup for
+    # every command, including a bare `-V` version probe - confirmed live (the "Install
+    # silverfin-cli" step failed with "Missing API credentials" before these were job-scoped).
+    env:
+      SF_API_CLIENT_ID: ${{ secrets.SF_API_CLIENT_ID }}
+      SF_API_SECRET: ${{ secrets.SF_API_SECRET }}
     steps:
       - name: Validate inputs
         run: |
@@ -150,8 +156,6 @@ jobs:
       - name: Run liquid sampler (retries on a cross-repo 422 collision)
         id: sampler
         env:
-          SF_API_CLIENT_ID: ${{ secrets.SF_API_CLIENT_ID }}
-          SF_API_SECRET: ${{ secrets.SF_API_SECRET }}
           SF_BASIC_AUTH: ${{ secrets.SF_BASIC_AUTH }}
           SAMPLER_PARTNER: ${{ inputs.partner }}
           SAMPLER_HANDLES: ${{ inputs.handles }}
