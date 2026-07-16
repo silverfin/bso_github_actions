@@ -107,11 +107,11 @@ jobs:
           ACCOUNT_TEMPLATES: ${{ inputs.account_templates }}
           FIRM_IDS: ${{ inputs.firm_ids }}
         run: |
-          if [[ -z "${HANDLES// /}" && -z "${ACCOUNT_TEMPLATES// /}" ]]; then
+          if [[ -z "${HANDLES//[[:space:]]/}" && -z "${ACCOUNT_TEMPLATES//[[:space:]]/}" ]]; then
             echo "::error::Neither handles nor account_templates was supplied — nothing to sample."
             exit 1
           fi
-          if [[ -z "${FIRM_IDS// /}" ]]; then
+          if [[ -z "${FIRM_IDS//[[:space:]]/}" ]]; then
             echo "::error::firm_ids is empty. The sampler backend 422s without firm ids."
             exit 1
           fi
@@ -145,7 +145,7 @@ jobs:
           echo "::add-mask::${PARTNER_CONFIG_JSON}"
           mkdir -p "$HOME/.silverfin"
           printf '%s' "${PARTNER_CONFIG_JSON}" > "$HOME/.silverfin/config.json"
-          if ! jq -e --arg p "${PARTNER}" '.partnerCredentials[$p].token' "$HOME/.silverfin/config.json" > /dev/null 2>&1; then
+          if ! jq -e --arg p "${PARTNER}" '(.partnerCredentials[$p].token | type == "string" and length > 0)' "$HOME/.silverfin/config.json" > /dev/null 2>&1; then
             echo "::error::PARTNER_CONFIG_JSON has no partnerCredentials entry for partner ${PARTNER}. Authorize it first with 'silverfin authorize-partner -i ${PARTNER} -k <api-key>' and store the resulting config.json as this secret."
             exit 1
           fi
@@ -258,6 +258,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
           PARTNER: ${{ inputs.partner }}
+          BEFORE_TOKEN: ${{ steps.before.outputs.token }}
         run: |
           if [[ ! -f "$HOME/.silverfin/config.json" ]]; then
             echo "No config.json on disk (load step must have failed) — nothing to write back."
@@ -265,7 +266,7 @@ jobs:
           fi
           AFTER_TOKEN=$(jq -r --arg p "${PARTNER}" '.partnerCredentials[$p].token' "$HOME/.silverfin/config.json")
           echo "::add-mask::${AFTER_TOKEN}"
-          if [[ "${AFTER_TOKEN}" == "${{ steps.before.outputs.token }}" ]]; then
+          if [[ "${AFTER_TOKEN}" == "${BEFORE_TOKEN}" ]]; then
             echo "Partner token unchanged — no write-back needed (sole-writer secret stays untouched)."
             exit 0
           fi

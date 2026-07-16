@@ -273,7 +273,7 @@ _Steps:_
 * Runs `run-sampler`, retrying on a cross-repo "already in progress" 422 (the backend allows only one sampler run per partner at a time; retries for up to 90 minutes).
 * Captures the token again after the run and writes it back to `PARTNER_CONFIG_JSON_<partner>` via `gh secret set` only if it rotated (401 refresh mid-run).
 * Downloads `results.zip` and uploads it as a short-lived (7-day) workflow artifact, for the rare rendering-only regression the compact diff can't see.
-* Posts (or updates) a result comment on the PR with the compact diff and a link to the full report.
+* Posts (or updates) a result comment on the PR with the compact diff and, when a report URL was produced, a link to the full report — otherwise the `results.zip` artifact is the fallback.
 * Fails the job if the sampler run did not complete successfully.
 
 _Authentication note:_
