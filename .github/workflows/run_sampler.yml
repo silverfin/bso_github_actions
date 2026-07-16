@@ -102,12 +102,16 @@ jobs:
       SF_API_SECRET: ${{ secrets.SF_API_SECRET }}
     steps:
       - name: Validate inputs
+        env:
+          HANDLES: ${{ inputs.handles }}
+          ACCOUNT_TEMPLATES: ${{ inputs.account_templates }}
+          FIRM_IDS: ${{ inputs.firm_ids }}
         run: |
-          if [[ -z "${{ inputs.handles }}" && -z "${{ inputs.account_templates }}" ]]; then
+          if [[ -z "${HANDLES// /}" && -z "${ACCOUNT_TEMPLATES// /}" ]]; then
             echo "::error::Neither handles nor account_templates was supplied — nothing to sample."
             exit 1
           fi
-          if [[ -z "${{ inputs.firm_ids }}" ]]; then
+          if [[ -z "${FIRM_IDS// /}" ]]; then
             echo "::error::firm_ids is empty. The sampler backend 422s without firm ids."
             exit 1
           fi
@@ -117,6 +121,7 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -135,20 +140,23 @@ jobs:
       - name: Load PARTNER_CONFIG_JSON (host + partnerCredentials)
         env:
           PARTNER_CONFIG_JSON: ${{ secrets.PARTNER_CONFIG_JSON }}
+          PARTNER: ${{ inputs.partner }}
         run: |
           echo "::add-mask::${PARTNER_CONFIG_JSON}"
           mkdir -p "$HOME/.silverfin"
           printf '%s' "${PARTNER_CONFIG_JSON}" > "$HOME/.silverfin/config.json"
-          if ! jq -e --arg p "${{ inputs.partner }}" '.partnerCredentials[$p].token' "$HOME/.silverfin/config.json" > /dev/null 2>&1; then
-            echo "::error::PARTNER_CONFIG_JSON has no partnerCredentials entry for partner ${{ inputs.partner }}. Authorize it first with 'silverfin authorize-partner -i ${{ inputs.partner }} -k <api-key>' and store the resulting config.json as this secret."
+          if ! jq -e --arg p "${PARTNER}" '.partnerCredentials[$p].token' "$HOME/.silverfin/config.json" > /dev/null 2>&1; then
+            echo "::error::PARTNER_CONFIG_JSON has no partnerCredentials entry for partner ${PARTNER}. Authorize it first with 'silverfin authorize-partner -i ${PARTNER} -k <api-key>' and store the resulting config.json as this secret."
             exit 1
           fi
-          echo "Host: $(jq -r '.host // \"(default)\"' "$HOME/.silverfin/config.json")"
+          echo "Host: $(jq -r '.host // "(default)"' "$HOME/.silverfin/config.json")"
 
       - name: Capture partner token before the run
         id: before
+        env:
+          PARTNER: ${{ inputs.partner }}
         run: |
-          TOKEN=$(jq -r --arg p "${{ inputs.partner }}" '.partnerCredentials[$p].token' "$HOME/.silverfin/config.json")
+          TOKEN=$(jq -r --arg p "${PARTNER}" '.partnerCredentials[$p].token' "$HOME/.silverfin/config.json")
           echo "::add-mask::${TOKEN}"
           echo "token=${TOKEN}" >> "$GITHUB_OUTPUT"
 
@@ -249,21 +257,22 @@ jobs:
         if: always() && steps.before.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+          PARTNER: ${{ inputs.partner }}
         run: |
           if [[ ! -f "$HOME/.silverfin/config.json" ]]; then
             echo "No config.json on disk (load step must have failed) — nothing to write back."
             exit 0
           fi
-          AFTER_TOKEN=$(jq -r --arg p "${{ inputs.partner }}" '.partnerCredentials[$p].token' "$HOME/.silverfin/config.json")
+          AFTER_TOKEN=$(jq -r --arg p "${PARTNER}" '.partnerCredentials[$p].token' "$HOME/.silverfin/config.json")
           echo "::add-mask::${AFTER_TOKEN}"
           if [[ "${AFTER_TOKEN}" == "${{ steps.before.outputs.token }}" ]]; then
             echo "Partner token unchanged — no write-back needed (sole-writer secret stays untouched)."
             exit 0
           fi
-          echo "Partner token rotated mid-run (401 refresh) — writing PARTNER_CONFIG_JSON_${{ inputs.partner }} back."
+          echo "Partner token rotated mid-run (401 refresh) — writing PARTNER_CONFIG_JSON_${PARTNER} back."
           CONFIG_JSON=$(cat "$HOME/.silverfin/config.json" | tr -d '\n')
           echo "::add-mask::${CONFIG_JSON}"
-          echo "$CONFIG_JSON" | gh secret set "PARTNER_CONFIG_JSON_${{ inputs.partner }}"
+          echo "$CONFIG_JSON" | gh secret set "PARTNER_CONFIG_JSON_${PARTNER}"
 
       - name: Download results.zip for the workflow artifact
         id: download
@@ -274,7 +283,7 @@ jobs:
           # The CLI's --compact path downloads to a temp dir and deletes it after printing the
           # diff, so results.zip never lands on disk on its own — fetch it again here for the
           # artifact (Q12: full zip kept for rendering-only regressions the compact diff can't see).
-          if curl -sL --max-time 300 -o results.zip "${REPORT_URL}"; then
+          if curl -sL --fail --max-time 300 -o results.zip "${REPORT_URL}"; then
             echo "downloaded=true" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::Could not download results.zip from the report URL for the artifact upload (the report link itself is still valid)."
@@ -282,7 +291,7 @@ jobs:
           fi
 
       - name: Upload results.zip artifact
-        if: steps.download.outputs.downloaded == 'true'
+        if: always() && steps.download.outputs.downloaded == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: sampler-results-partner-${{ inputs.partner }}
@@ -290,7 +299,7 @@ jobs:
           retention-days: 7
 
       - name: Post result comment on the PR
-        if: inputs.pull_request_number != ''
+        if: always() && inputs.pull_request_number != ''
         uses: actions/github-script@v7
         env:
           PARTNER: ${{ inputs.partner }}
@@ -342,7 +351,9 @@ jobs:
             }
 
       - name: Fail job if the sampler run did not complete successfully
-        if: steps.sampler.outputs.sampler_ok != 'true'
+        if: always() && steps.sampler.outputs.sampler_ok != 'true'
+        env:
+          PARTNER: ${{ inputs.partner }}
         run: |
-          echo "::error::Sampler run for partner ${{ inputs.partner }} did not complete successfully — see the run-sampler step output above."
+          echo "::error::Sampler run for partner ${PARTNER} did not complete successfully — see the run-sampler step output above."
           exit 1

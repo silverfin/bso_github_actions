@@ -48,6 +48,8 @@ The document will go over all the Github Actions that currently automate a coupl
     * [Automated slack update (slack_changelog.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf862cf4257e68475d8b47891c6)
   * [Review firm deployment](#review-firm-deployment)
     * [Push templates to review firm (push_to_review_firm.yml)](#push-templates-to-review-firm-push_to_review_firmyml)
+  * [Liquid sampler](#liquid-sampler)
+    * [Run liquid sampler (run_sampler.yml)](#run-liquid-sampler-run_sampleryml)
 
 
 ## Overview
@@ -240,3 +242,46 @@ _Prerequisites:_
 * `SF_API_CLIENT_ID`, `SF_API_SECRET` and `CONFIG_JSON` available to the caller (e.g. `secrets: inherit`).
 * The review firm must already be authorized with the Silverfin CLI (its OAuth tokens present in `CONFIG_JSON`). If it isn't, the run fails with a message asking the developer who implemented the linked development ticket(s) to authorize it.
 * `FIRM_ID_REVIEW` repository variable in the market repo (used as the default when no `firm_id` is supplied).
+
+
+
+### Liquid sampler
+
+#### Run liquid sampler `(run_sampler.yml)`
+
+_Description_:
+Reusable workflow. Runs the Liquid Sampler (`silverfin-cli run-sampler`) for a single partner's changed reconciliation/account templates and posts the result on a PR. It is deliberately partner-agnostic and repo-layout-agnostic: given a partner id, a list of already-classified handles/account templates, and firm ids, it loads that partner's credentials, runs the sampler, and reports back. All market-specific logic (which templates changed, which partner they belong to) lives in the calling wrapper.
+
+_Trigger:_
+
+* Called via `workflow_call` from a market-repo wrapper.
+
+_Inputs:_
+
+* `partner` (required) — partner environment id (must be authorized — see `PARTNER_CONFIG_JSON` secret).
+* `handles` (optional) — reconciliation text handles to sample, space-separated (directory names under `reconciliation_texts/`). Optional if `account_templates` is set.
+* `account_templates` (optional) — account template names to sample, space-separated (directory names under `account_templates/`). Optional if `handles` is set.
+* `firm_ids` (required) — firm id(s) to sample against, space-separated. The backend 422s if empty.
+* `ref` (required) — git ref (commit SHA) to check out — the PR head, so sampled template content matches the PR under review.
+* `pull_request_number` (optional) — PR number to post the result comment on. If empty, no comment is posted (results still upload as an artifact).
+
+_Steps:_
+
+* Validates that at least one of `handles`/`account_templates`, and `firm_ids`, were supplied.
+* Checks out the repo at `ref` and installs `silverfin-cli`.
+* Loads the partner's credentials from the `PARTNER_CONFIG_JSON` secret and captures the token on disk before the run.
+* Runs `run-sampler`, retrying on a cross-repo "already in progress" 422 (the backend allows only one sampler run per partner at a time; retries for up to 90 minutes).
+* Captures the token again after the run and writes it back to `PARTNER_CONFIG_JSON_<partner>` via `gh secret set` only if it rotated (401 refresh mid-run).
+* Downloads `results.zip` and uploads it as a short-lived (7-day) workflow artifact, for the rare rendering-only regression the compact diff can't see.
+* Posts (or updates) a result comment on the PR with the compact diff and a link to the full report.
+* Fails the job if the sampler run did not complete successfully.
+
+_Authentication note:_
+
+* This workflow is the sole writer of `PARTNER_CONFIG_JSON_<partner>` — it only writes back if the on-disk token actually changed during the run (diffed before/after, not inferred from log output).
+
+_Prerequisites:_
+
+* `SF_API_CLIENT_ID`, `SF_API_SECRET`, `PARTNER_CONFIG_JSON` (per-partner secret resolved by the caller) and `REPO_ACCESS_TOKEN` (repo-scoped write PAT, for the token write-back) available to the caller.
+* `SF_BASIC_AUTH` if the partner's host is a `*.staging.getsilverfin.com` gateway.
+* The partner must already be authorized with the Silverfin CLI (`silverfin authorize-partner`) and its `config.json` stored as the `PARTNER_CONFIG_JSON_<partner>` secret.
