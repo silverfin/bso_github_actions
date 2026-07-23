@@ -266,6 +266,10 @@ jobs:
           fi
           AFTER_TOKEN=$(jq -r --arg p "${PARTNER}" '.partnerCredentials[$p].token' "$HOME/.silverfin/config.json")
           echo "::add-mask::${AFTER_TOKEN}"
+          if ! jq -e --arg p "${PARTNER}" '(.partnerCredentials[$p].token | type == "string" and length > 0)' "$HOME/.silverfin/config.json" > /dev/null 2>&1; then
+            echo "::error::Partner ${PARTNER} config.json has no valid token after the run — refusing to write back a possibly broken config."
+            exit 1
+          fi
           if [[ "${AFTER_TOKEN}" == "${BEFORE_TOKEN}" ]]; then
             echo "Partner token unchanged — no write-back needed (sole-writer secret stays untouched)."
             exit 0
