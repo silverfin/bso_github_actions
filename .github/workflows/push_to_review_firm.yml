@@ -163,6 +163,12 @@ jobs:
         run: |
           mkdir -p "$HOME/.silverfin"
           echo '${{ secrets.CONFIG_JSON }}' > "$HOME/.silverfin/config.json"
+          # Blank every firm's refreshToken so an expired access token fails cleanly on a 401
+          # instead of silently rotating (and poisoning) the shared CONFIG_JSON secret this
+          # workflow never writes back to.
+          jq 'to_entries | map(if (.key|test("^[0-9]+$")) then .value.refreshToken = "" else . end) | from_entries' \
+            "$HOME/.silverfin/config.json" > "$HOME/.silverfin/config.stripped.json"
+          mv "$HOME/.silverfin/config.stripped.json" "$HOME/.silverfin/config.json"
           node ./node_modules/silverfin-cli/bin/cli.js config --set-firm="${FIRM_ID}"
           node ./node_modules/silverfin-cli/bin/cli.js config --get-firm
 
