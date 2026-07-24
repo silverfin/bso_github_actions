@@ -18,22 +18,21 @@
 
 set -euo pipefail
 
-declare -A MARKET_REPOS=(
-  [nl]="silverfin/nl_market"
-  [be]="silverfin/be_market"
-  [lu]="silverfin/lu_market"
-  [uk]="silverfin/uk_market"
-)
+market_repo() {
+  case "$1" in
+    nl) echo "silverfin/nl_market" ;;
+    be) echo "silverfin/be_market" ;;
+    lu) echo "silverfin/lu_market" ;;
+    uk) echo "silverfin/uk_market" ;;
+    *) echo "$1" ;;
+  esac
+}
 
 PARTNER_ID="${1:?Usage: $0 <partner_id> <market> [host]}"
 MARKET="${2:?Usage: $0 <partner_id> <market> [host]}"
 HOST="${3:-https://bso-staging-beta.staging.getsilverfin.com}"
 
-if [[ -n "${MARKET_REPOS[$MARKET]:-}" ]]; then
-  REPO="${MARKET_REPOS[$MARKET]}"
-else
-  REPO="$MARKET"
-fi
+REPO="$(market_repo "$MARKET")"
 
 printf '%s' "API key for partner ${PARTNER_ID} (${REPO}): "
 read -rs API_KEY
