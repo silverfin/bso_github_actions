@@ -292,6 +292,25 @@ _Prerequisites:_
 _Description:_
 One-off setup script that authorizes a partner `api_key` against staging and stores the result as that partner's `PARTNER_CONFIG_JSON_<partner_id>` GitHub secret — the secret [`run_sampler.yml`](#run-liquid-sampler-run_sampleryml) reads from. Run this once per partner, and again any time a partner's staging token is lost for good (see _When you need to re-run this_ below) — day-to-day token rotation during sampler runs is handled automatically by the workflow itself and does **not** need this script.
 
+_Prerequisites:_
+
+* `silverfin` CLI installed and on `PATH`.
+* `gh` CLI installed and authenticated (`gh auth login`), with write access to the target market repo's secrets.
+* A fresh partner `api_key`, obtained via the staging login flow below. Get this **right before** running the script — the token is shown once, in a banner, and you paste it straight into the prompt.
+
+_Getting the partner `api_key` (staging login flow):_
+
+By default your browser is logged into production (`https://live.getsilverfin.com`). To fetch a staging partner token:
+
+1. In your browser, change the URL from `https://live.getsilverfin.com` to `https://bso-staging-beta.staging.getsilverfin.com`.
+2. A basic-auth popup appears — log in with the **"Silverfin staging basic-auth"** credentials from 1Password. (This is the staging gateway's basic auth, not your Silverfin login.)
+3. Adjust the URL again to `https://bso-staging-beta.staging.getsilverfin.com/partners`.
+4. Log in with your normal partner credentials for the specific partner id you want to authorize.
+5. In that partner env, click **"Configuration partners"** in the header.
+6. Click the red **"Refresh API token"** button.
+7. A banner appears with the token — copy it. Then immediately run the script (below) and paste the token when it prompts for the api key.
+8. **Repeat steps 3–7 for every partner env** you need to authorize — each partner has its own login and its own token.
+
 _Usage:_
 
 ```bash
@@ -300,7 +319,7 @@ _Usage:_
 
 * `<partner_id>` — numeric partner environment id, e.g. `2`.
 * `<market>` — either a short code (`nl`, `be`, `lu`, `uk`, mapped to `silverfin/<market>_market` in the script's `MARKET_REPOS` table) or a full `owner/repo`.
-* `[host]` — optional. Defaults to `https://bso-staging-beta.staging.getsilverfin.com`. Pass an explicit URL to target a different environment (e.g. a different staging tier), or edit the `HOST` default in the script if you're permanently moving to a new environment.
+* `[host]` — optional. Defaults to `https://bso-staging-beta.staging.getsilverfin.com` (the same staging beta host used in the login flow above). Pass an explicit URL to target a different environment, or edit the `HOST` default in the script if you're permanently moving to a new environment.
 
 Examples:
 
@@ -310,12 +329,6 @@ Examples:
 ./scripts/authorize-partner-secret.sh 1 silverfin/be_market
 ./scripts/authorize-partner-secret.sh 2 nl https://some-other-staging-host.example.com
 ```
-
-_Prerequisites:_
-
-* `silverfin` CLI installed and on `PATH`.
-* `gh` CLI installed and authenticated (`gh auth login`), with write access to the target market repo's secrets.
-* The partner's `api_key` from the partner console — the script prompts for it with hidden input, so it's never passed as an argument or written to shell history.
 
 _What it does:_
 
