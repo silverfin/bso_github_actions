@@ -34,6 +34,18 @@ HOST="${3:-https://bso-staging-beta.staging.getsilverfin.com}"
 
 REPO="$(market_repo "$MARKET")"
 
+if ! gh auth status >/dev/null 2>&1; then
+  cat >&2 <<MSG
+gh is not authenticated (or its stored token is invalid/expired) — the
+final step of this script (gh secret set) would fail on ${REPO}.
+
+Fix it, then re-run this script:
+  1. gh auth login
+  2. gh auth status   # confirm it now shows a valid logged-in account
+MSG
+  exit 1
+fi
+
 printf '%s' "API key for partner ${PARTNER_ID} (${REPO}): "
 read -rs API_KEY
 echo
