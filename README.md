@@ -50,6 +50,7 @@ The document will go over all the Github Actions that currently automate a coupl
     * [Push templates to review firm (push_to_review_firm.yml)](#push-templates-to-review-firm-push_to_review_firmyml)
   * [Liquid sampler](#liquid-sampler)
     * [Run liquid sampler (run_sampler.yml)](#run-liquid-sampler-run_sampleryml)
+    * [Authorizing a partner for staging (scripts/authorize-partner-secret.sh)](#authorizing-a-partner-for-staging-scriptsauthorize-partner-secretsh)
 
 
 ## Overview
@@ -285,3 +286,46 @@ _Prerequisites:_
 * `SF_API_CLIENT_ID`, `SF_API_SECRET`, `PARTNER_CONFIG_JSON` (per-partner secret resolved by the caller) and `REPO_ACCESS_TOKEN` (repo-scoped write PAT, for the token write-back) available to the caller.
 * `SF_BASIC_AUTH` if the partner's host is a `*.staging.getsilverfin.com` gateway.
 * The partner must already be authorized with the Silverfin CLI (`silverfin authorize-partner`) and its `config.json` stored as the `PARTNER_CONFIG_JSON_<partner>` secret.
+
+#### Authorizing a partner for staging (`scripts/authorize-partner-secret.sh`)
+
+_Description:_
+One-off setup script that authorizes a partner `api_key` against staging and stores the result as that partner's `PARTNER_CONFIG_JSON_<partner_id>` GitHub secret — the secret [`run_sampler.yml`](#run-liquid-sampler-run_sampleryml) reads from. Run this once per partner, and again any time a partner's staging token is lost for good (see _When you need to re-run this_ below) — day-to-day token rotation during sampler runs is handled automatically by the workflow itself and does **not** need this script.
+
+_Usage:_
+
+```bash
+./scripts/authorize-partner-secret.sh <partner_id> <market> [host]
+```
+
+* `<partner_id>` — numeric partner environment id, e.g. `2`.
+* `<market>` — either a short code (`nl`, `be`, `lu`, `uk`, mapped to `silverfin/<market>_market` in the script's `MARKET_REPOS` table) or a full `owner/repo`.
+* `[host]` — optional. Defaults to `https://bso-staging-beta.staging.getsilverfin.com`. Pass an explicit URL to target a different environment (e.g. a different staging tier), or edit the `HOST` default in the script if you're permanently moving to a new environment.
+
+Examples:
+
+```bash
+./scripts/authorize-partner-secret.sh 2 nl
+./scripts/authorize-partner-secret.sh 11 lu
+./scripts/authorize-partner-secret.sh 1 silverfin/be_market
+./scripts/authorize-partner-secret.sh 2 nl https://some-other-staging-host.example.com
+```
+
+_Prerequisites:_
+
+* `silverfin` CLI installed and on `PATH`.
+* `gh` CLI installed and authenticated (`gh auth login`), with write access to the target market repo's secrets.
+* The partner's `api_key` from the partner console — the script prompts for it with hidden input, so it's never passed as an argument or written to shell history.
+
+_What it does:_
+
+* Prompts for the api key (hidden input).
+* Creates a throwaway `HOME` directory so the authorization doesn't touch your real `~/.silverfin/config.json`.
+* Runs `silverfin config --set-host <host>` and `silverfin authorize-partner -i <partner_id> -k <api_key> -n partner-<partner_id>` inside that throwaway `HOME`.
+* Pushes the resulting `config.json` straight to the `PARTNER_CONFIG_JSON_<partner_id>` secret on the target repo via `gh secret set`.
+* Deletes the throwaway `HOME` on exit (success or failure), via a `trap`.
+
+_When you need to re-run this:_
+
+* **Not needed for normal 401s.** A partner token that's simply gone stale (>24h old) self-heals — the sampler workflow's own refresh call authenticates on a digest match, not the token's age, so it mints a fresh token automatically mid-run and writes it back itself.
+* **Re-run this script only after a staging DB snapshot/reset**, which overwrites the partner's stored credentials server-side — that invalidates any token you're holding client-side, including the refresh path, so the sampler workflow's automatic 401 recovery also fails. Signature: a partner token fails on first use *and* on the workflow's automatic refresh attempt in the same run. Get a backend/console regeneration of the partner's api_key first, then re-run this script with the new key.
