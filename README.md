@@ -50,6 +50,7 @@ The document will go over all the Github Actions that currently automate a coupl
     * [Push templates to review firm (push_to_review_firm.yml)](#push-templates-to-review-firm-push_to_review_firmyml)
   * [Liquid sampler](#liquid-sampler)
     * [Run liquid sampler (run_sampler.yml)](#run-liquid-sampler-run_sampleryml)
+    * [Authorizing a partner for staging (scripts/authorize-partner-secret.sh)](#authorizing-a-partner-for-staging-scriptsauthorize-partner-secretsh)
 
 
 ## Overview
@@ -285,3 +286,59 @@ _Prerequisites:_
 * `SF_API_CLIENT_ID`, `SF_API_SECRET`, `PARTNER_CONFIG_JSON` (per-partner secret resolved by the caller) and `REPO_ACCESS_TOKEN` (repo-scoped write PAT, for the token write-back) available to the caller.
 * `SF_BASIC_AUTH` if the partner's host is a `*.staging.getsilverfin.com` gateway.
 * The partner must already be authorized with the Silverfin CLI (`silverfin authorize-partner`) and its `config.json` stored as the `PARTNER_CONFIG_JSON_<partner>` secret.
+
+#### Authorizing a partner for staging (`scripts/authorize-partner-secret.sh`)
+
+_Description:_
+One-off setup script that authorizes a partner `api_key` against staging and stores the result as that partner's `PARTNER_CONFIG_JSON_<partner_id>` GitHub secret — the secret [`run_sampler.yml`](#run-liquid-sampler-run_sampleryml) reads from. Run this once per partner, and again any time a partner's staging token is lost for good (see _When you need to re-run this_ below) — day-to-day token rotation during sampler runs is handled automatically by the workflow itself and does **not** need this script.
+
+_Prerequisites:_
+
+* `silverfin` CLI installed and on `PATH`.
+* `gh` CLI installed and authenticated (`gh auth login`), with write access to the target market repo's secrets.
+* A fresh partner `api_key`, obtained via the staging login flow below. Get this **right before** running the script — the token is shown once, in a banner, and you paste it straight into the prompt.
+
+_Getting the partner `api_key` (staging login flow):_
+
+By default your browser is logged into production (`https://live.getsilverfin.com`). To fetch a staging partner token:
+
+1. In your browser, change the URL from `https://live.getsilverfin.com` to `https://bso-staging-beta.staging.getsilverfin.com`.
+2. A basic-auth popup appears — log in with the **"Silverfin staging basic-auth"** credentials from 1Password. (This is the staging gateway's basic auth, not your Silverfin login.)
+3. Adjust the URL again to `https://bso-staging-beta.staging.getsilverfin.com/partners`.
+4. Log in with your normal partner credentials for the specific partner id you want to authorize.
+5. In that partner env, click **"Configuration partners"** in the header.
+6. Click the red **"Refresh API token"** button.
+7. A banner appears with the token — copy it. Then immediately run the script (below) and paste the token when it prompts for the api key.
+8. **Repeat steps 3–7 for every partner env** you need to authorize — each partner has its own login and its own token.
+
+_Usage:_
+
+```bash
+./scripts/authorize-partner-secret.sh <partner_id> <market> [host]
+```
+
+* `<partner_id>` — numeric partner environment id, e.g. `2`.
+* `<market>` — either a short code (`nl`, `be`, `lu`, `uk`, mapped to `silverfin/<market>_market` in the script's `MARKET_REPOS` table) or a full `owner/repo`.
+* `[host]` — optional. Defaults to `https://bso-staging-beta.staging.getsilverfin.com` (the same staging beta host used in the login flow above). Pass an explicit URL to target a different environment, or edit the `HOST` default in the script if you're permanently moving to a new environment.
+
+Examples:
+
+```bash
+./scripts/authorize-partner-secret.sh 2 nl
+./scripts/authorize-partner-secret.sh 11 lu
+./scripts/authorize-partner-secret.sh 1 silverfin/be_market
+./scripts/authorize-partner-secret.sh 2 nl https://some-other-staging-host.example.com
+```
+
+_What it does:_
+
+* Prompts for the api key (hidden input).
+* Creates a throwaway `HOME` directory so the authorization doesn't touch your real `~/.silverfin/config.json`.
+* Runs `silverfin config --set-host <host>` and `silverfin authorize-partner -i <partner_id> -k <api_key> -n partner-<partner_id>` inside that throwaway `HOME`.
+* Pushes the resulting `config.json` straight to the `PARTNER_CONFIG_JSON_<partner_id>` secret on the target repo via `gh secret set`.
+* Deletes the throwaway `HOME` on exit (success or failure), via a `trap`.
+
+_When you need to re-run this:_
+
+* **Not needed for normal 401s.** A partner token that's simply gone stale (>24h old) self-heals — the sampler workflow's own refresh call authenticates on a digest match, not the token's age, so it mints a fresh token automatically mid-run and writes it back itself.
+* **Re-run this script only after a staging DB snapshot/reset**, which overwrites the partner's stored credentials server-side — that invalidates any token you're holding client-side, including the refresh path, so the sampler workflow's automatic 401 recovery also fails. Signature: a partner token fails on first use *and* on the workflow's automatic refresh attempt in the same run. Get a backend/console regeneration of the partner's api_key first, then re-run this script with the new key.
