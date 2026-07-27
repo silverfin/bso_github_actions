@@ -295,7 +295,11 @@ One-off setup script that authorizes a partner `api_key` against staging and sto
 _Prerequisites:_
 
 * `silverfin` CLI installed and on `PATH`.
-* `gh` CLI installed and authenticated (`gh auth login`), with write access to the target market repo's secrets.
+* `gh` CLI installed and authenticated, with write access to the target market repo's secrets. Check this **before** you get a fresh token below — a bad `gh` session is a common failure mode (expired token, or needing to re-run `gh auth login` after a while):
+  ```bash
+  gh auth status
+  ```
+  If that doesn't show a valid logged-in account, run `gh auth login` and check again. The script also checks this itself right before it would need it, and prints these same steps if it isn't set up — but confirming it upfront saves you from going through the staging login flow below only to hit an avoidable failure at the very last step.
 * A fresh partner `api_key`, obtained via the staging login flow below. Get this **right before** running the script — the token is shown once, in a banner, and you paste it straight into the prompt.
 
 _Getting the partner `api_key` (staging login flow):_
@@ -318,7 +322,7 @@ _Usage:_
 ```
 
 * `<partner_id>` — numeric partner environment id, e.g. `2`.
-* `<market>` — either a short code (`nl`, `be`, `lu`, `uk`, mapped to `silverfin/<market>_market` in the script's `MARKET_REPOS` table) or a full `owner/repo`.
+* `<market>` — either a short code (`nl`, `be`, `lu`, `uk`, mapped to `silverfin/<market>_market` by the script's market → repo lookup) or a full `owner/repo`.
 * `[host]` — optional. Defaults to `https://bso-staging-beta.staging.getsilverfin.com` (the same staging beta host used in the login flow above). Pass an explicit URL to target a different environment, or edit the `HOST` default in the script if you're permanently moving to a new environment.
 
 Examples:
@@ -332,6 +336,7 @@ Examples:
 
 _What it does:_
 
+* Resolves `<market>` to a repo, then checks `gh auth status` — exits immediately with the `gh auth login` steps above if it's not valid, before asking for anything sensitive.
 * Prompts for the api key (hidden input).
 * Creates a throwaway `HOME` directory so the authorization doesn't touch your real `~/.silverfin/config.json`.
 * Runs `silverfin config --set-host <host>` and `silverfin authorize-partner -i <partner_id> -k <api_key> -n partner-<partner_id>` inside that throwaway `HOME`.
