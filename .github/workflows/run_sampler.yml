@@ -288,14 +288,27 @@ jobs:
           # The CLI's --compact path downloads to a temp dir and deletes it after printing the
           # diff, so results.zip never lands on disk on its own — fetch it again here for the
           # artifact (Q12: full zip kept for rendering-only regressions the compact diff can't see).
+          # Note: the presigned REPORT_URL itself is short-lived (measured at ~5 minutes past
+          # run completion, not the long-lived link it was originally assumed to be — see
+          # silverfin-cli's CI_AUTH_SAMPLER_PLAN.md §10.4). A failure here means the human-facing
+          # PR comment link below falls back to that presigned URL, which may already be dead.
           if curl -sL --fail --max-time 300 -o results.zip "${REPORT_URL}"; then
             echo "downloaded=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::Could not download results.zip from the report URL for the artifact upload (the report link itself is still valid)."
+            echo "::warning::Could not download results.zip from the report URL for the artifact upload."
             echo "downloaded=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Add diffs/ folder for the entries the compact diff flagged
+        # Pure local re-analysis of the zip already on disk - no network call, no partner API
+        # (silverfin-cli's --from-zip path). Best-effort: a failure here shouldn't cost the
+        # reviewer the plain results.zip artifact they'd otherwise get.
+        if: always() && steps.download.outputs.downloaded == 'true'
+        continue-on-error: true
+        run: node ./node_modules/silverfin-cli/bin/cli.js run-sampler --from-zip results.zip --add-diffs-folder
+
       - name: Upload results.zip artifact
+        id: upload
         if: always() && steps.download.outputs.downloaded == 'true'
         uses: actions/upload-artifact@v4
         with:
@@ -313,6 +326,7 @@ jobs:
           FIRM_IDS: ${{ inputs.firm_ids }}
           SAMPLER_OK: ${{ steps.sampler.outputs.sampler_ok }}
           REPORT_URL: ${{ steps.sampler.outputs.report_url }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
           COMPACT: ${{ steps.sampler.outputs.compact }}
           PR_NUMBER: ${{ inputs.pull_request_number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -321,6 +335,12 @@ jobs:
             const marker = `<!-- silverfin-sampler-result-${process.env.PARTNER} -->`;
             const ok = process.env.SAMPLER_OK === "true";
             const reportUrl = process.env.REPORT_URL || "";
+            // The backend's presigned reportUrl expires ~5 minutes after the run completes
+            // (CI_AUTH_SAMPLER_PLAN.md §10.4) — by the time a human reads this comment it's
+            // always dead. Prefer the GitHub Actions artifact link, which stays valid for the
+            // full 7-day retention window; fall back to the presigned URL only if the artifact
+            // upload itself didn't happen (e.g. the post-run download failed).
+            const artifactUrl = process.env.ARTIFACT_URL || "";
             const compact = (process.env.COMPACT || "").trim();
             const runUrl = process.env.RUN_URL;
 
@@ -334,7 +354,11 @@ jobs:
             if (process.env.HANDLES) lines.push(`- Reconciliation handles: \`${process.env.HANDLES}\``);
             if (process.env.ACCOUNT_TEMPLATES) lines.push(`- Account templates: \`${process.env.ACCOUNT_TEMPLATES}\``);
             lines.push(`- Firm(s): \`${process.env.FIRM_IDS}\``);
-            if (reportUrl) lines.push(`- **[📊 Open full sampler report](${reportUrl})** (downloads \`results.zip\`)`);
+            if (artifactUrl) {
+              lines.push(`- **[📊 Open full sampler report](${artifactUrl})** (downloads \`results.zip\`, kept 7 days)`);
+            } else if (reportUrl) {
+              lines.push(`- **[📊 Open full sampler report](${reportUrl})** (downloads \`results.zip\` — this direct link expires ~5 minutes after the run, may already be gone)`);
+            }
             lines.push(`- Workflow run: ${runUrl}`);
             lines.push("");
             if (compact) {
