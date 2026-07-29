@@ -335,6 +335,7 @@ jobs:
           SAMPLER_OK: ${{ steps.sampler.outputs.sampler_ok }}
           REPORT_URL: ${{ steps.sampler.outputs.report_url }}
           ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          DIFFS_ADDED: ${{ steps.add_diffs.outputs.diffs_added }}
           COMPACT: ${{ steps.sampler.outputs.compact }}
           PR_NUMBER: ${{ inputs.pull_request_number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -349,6 +350,7 @@ jobs:
             // full 7-day retention window; fall back to the presigned URL only if the artifact
             // upload itself didn't happen (e.g. the post-run download failed).
             const artifactUrl = process.env.ARTIFACT_URL || "";
+            const diffsAdded = process.env.DIFFS_ADDED || "";
             const compact = (process.env.COMPACT || "").trim();
             const runUrl = process.env.RUN_URL;
 
@@ -364,6 +366,9 @@ jobs:
             lines.push(`- Firm(s): \`${process.env.FIRM_IDS}\``);
             if (artifactUrl) {
               lines.push(`- **[📊 Open full sampler report](${artifactUrl})** (GitHub sign-in required; downloads \`results.zip\`, kept 7 days)`);
+              if (diffsAdded === "false") {
+                lines.push(`  - ⚠️ Could not add the \`diffs/\` folder to this artifact — see the [workflow run](${runUrl}) logs. The plain \`results.zip\` is still there.`);
+              }
             } else if (reportUrl) {
               lines.push(`- **[📊 Open full sampler report](${reportUrl})** (downloads \`results.zip\` — this direct link expires ~5 minutes after the run, may already be gone)`);
             } else {
