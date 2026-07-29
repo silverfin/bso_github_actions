@@ -130,10 +130,11 @@ jobs:
 
       - name: Install silverfin-cli
         run: |
-          # Unpinned, matching every other production workflow's convention (none pin to a
-          # branch/SHA/tag) — relies on run-sampler + --compact + result-URL surfacing being on
-          # main (silverfin-cli PR #261, "agustin-bso-sampler-easy-results", merged 2026-07-15).
-          npm install https://github.com/silverfin/silverfin-cli.git
+          # Pinned to a commit on silverfin-cli's sampler-compact-diff-v2 branch, since
+          # --add-diffs-folder (used below) is not yet on main. Switch back to installing
+          # unpinned main, matching every other production workflow's convention, once that
+          # branch's PR merges.
+          npm install https://github.com/silverfin/silverfin-cli.git#5accd6b
           VERSION=$(node ./node_modules/silverfin-cli/bin/cli.js -V)
           echo "CLI version: ${VERSION}"
 
@@ -300,12 +301,19 @@ jobs:
           fi
 
       - name: Add diffs/ folder for the entries the compact diff flagged
+        id: add_diffs
         # Pure local re-analysis of the zip already on disk - no network call, no partner API
         # (silverfin-cli's --from-zip path). Best-effort: a failure here shouldn't cost the
         # reviewer the plain results.zip artifact they'd otherwise get.
         if: always() && steps.download.outputs.downloaded == 'true'
         continue-on-error: true
-        run: node ./node_modules/silverfin-cli/bin/cli.js run-sampler --from-zip results.zip --add-diffs-folder
+        run: |
+          if node ./node_modules/silverfin-cli/bin/cli.js run-sampler --from-zip results.zip --add-diffs-folder; then
+            echo "diffs_added=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Failed to add diffs/ folder to results.zip — the uploaded artifact is the plain sampler output for this run."
+            echo "diffs_added=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Upload results.zip artifact
         id: upload
@@ -355,9 +363,11 @@ jobs:
             if (process.env.ACCOUNT_TEMPLATES) lines.push(`- Account templates: \`${process.env.ACCOUNT_TEMPLATES}\``);
             lines.push(`- Firm(s): \`${process.env.FIRM_IDS}\``);
             if (artifactUrl) {
-              lines.push(`- **[📊 Open full sampler report](${artifactUrl})** (downloads \`results.zip\`, kept 7 days)`);
+              lines.push(`- **[📊 Open full sampler report](${artifactUrl})** (GitHub sign-in required; downloads \`results.zip\`, kept 7 days)`);
             } else if (reportUrl) {
               lines.push(`- **[📊 Open full sampler report](${reportUrl})** (downloads \`results.zip\` — this direct link expires ~5 minutes after the run, may already be gone)`);
+            } else {
+              lines.push(`- ⚠️ No sampler report link available for this run — see the [workflow run](${runUrl}) logs.`);
             }
             lines.push(`- Workflow run: ${runUrl}`);
             lines.push("");
