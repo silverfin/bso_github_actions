@@ -282,7 +282,7 @@ jobs:
 
       - name: Download results.zip for the workflow artifact
         id: download
-        if: steps.sampler.outputs.report_url != ''
+        if: always() && steps.sampler.outputs.report_url != ''
         env:
           REPORT_URL: ${{ steps.sampler.outputs.report_url }}
         run: |
