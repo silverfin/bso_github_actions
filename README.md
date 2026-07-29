@@ -274,7 +274,7 @@ _Steps:_
 * Runs `run-sampler`, retrying on a cross-repo "already in progress" 422 (the backend allows only one sampler run per partner at a time; retries for up to 90 minutes).
 * Captures the token again after the run and writes it back to `PARTNER_CONFIG_JSON_<partner>` via `gh secret set` only if it rotated (401 refresh mid-run).
 * Downloads `results.zip`, best-effort adds a `diffs/` folder of before/after `view.html` for the entries the compact diff flagged, and uploads it as a 7-day workflow artifact.
-* Posts (or updates) a result comment on the PR with the compact diff and a link to the workflow artifact (kept 7 days) as the primary way to open the full report; falls back to the presigned report URL (short-lived, ~5 min) only if the artifact upload did not happen.
+* Posts (or updates) a result comment on the PR with the compact diff and a link to the workflow artifact (kept 7 days; GitHub sign-in required) as the primary way to open the full report; falls back to the presigned report URL (short-lived, ~5 min) only if the artifact upload did not happen.
 * Fails the job if the sampler run did not complete successfully.
 
 _Authentication note:_
