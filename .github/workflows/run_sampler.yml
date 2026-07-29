@@ -326,7 +326,7 @@ jobs:
 
       - name: Post result comment on the PR
         if: always() && inputs.pull_request_number != ''
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           PARTNER: ${{ inputs.partner }}
           HANDLES: ${{ inputs.handles }}
