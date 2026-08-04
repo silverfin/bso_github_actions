@@ -176,14 +176,33 @@ jobs:
           # handed the CLI "Investment-" as a template name:
           #   [error] Config file for account template "Investment-" not found
           # Same convention as run_tests.yml's TEMPLATE_BUCKETS.
-          HANDLE_ARGS=()
+          HANDLE_NAMES=()
+          ACCOUNT_NAMES=()
           if [[ -n "${SAMPLER_HANDLES//[[:space:]]/}" ]]; then
             mapfile -t HANDLE_NAMES < <(printf '%s\n' "${SAMPLER_HANDLES}" | sed '/^[[:space:]]*$/d')
+          fi
+          if [[ -n "${SAMPLER_ACCOUNT_TEMPLATES//[[:space:]]/}" ]]; then
+            mapfile -t ACCOUNT_NAMES < <(printf '%s\n' "${SAMPLER_ACCOUNT_TEMPLATES}" | sed '/^[[:space:]]*$/d')
+          fi
+
+          # A name starting with "-" would be read by the CLI's option parser as a FLAG rather
+          # than a value: commander stops consuming a variadic option (-h/-at take <names...>) at
+          # the first "-"-prefixed token, and a leading "--" separator does not protect variadic
+          # values either. Reject such a name up front instead of letting the CLI silently
+          # reinterpret it as an option — the actionable fix is to rename the template directory.
+          for NAME in "${HANDLE_NAMES[@]}" "${ACCOUNT_NAMES[@]}"; do
+            if [[ "${NAME}" == -* ]]; then
+              echo "::error::Template name '${NAME}' starts with '-', which silverfin-cli would parse as an option instead of a template name. Rename the template directory."
+              exit 1
+            fi
+          done
+
+          HANDLE_ARGS=()
+          if [[ ${#HANDLE_NAMES[@]} -gt 0 ]]; then
             HANDLE_ARGS=(-h "${HANDLE_NAMES[@]}")
           fi
           ACCOUNT_ARGS=()
-          if [[ -n "${SAMPLER_ACCOUNT_TEMPLATES//[[:space:]]/}" ]]; then
-            mapfile -t ACCOUNT_NAMES < <(printf '%s\n' "${SAMPLER_ACCOUNT_TEMPLATES}" | sed '/^[[:space:]]*$/d')
+          if [[ ${#ACCOUNT_NAMES[@]} -gt 0 ]]; then
             ACCOUNT_ARGS=(-at "${ACCOUNT_NAMES[@]}")
           fi
 
