@@ -375,7 +375,18 @@ jobs:
             // Newline-separated on the way in (names can contain spaces) — render one code-quoted
             // name per entry, comma-separated. A multi-line value inside one backtick pair
             // renders as garbage in a PR comment.
-            const fmtNames = v => (v || "").split("\n").map(s => s.trim()).filter(Boolean).map(s => `\`${s}\``).join(", ");
+            //
+            // These names are directory names from the PR's own tree, so treat them as untrusted
+            // text: a name containing a backtick would otherwise close its code span and inject
+            // markdown into this comment. Per CommonMark, fence with one more backtick than the
+            // longest run inside the name, and pad when it starts/ends with a backtick.
+            const codeSpan = (s) => {
+              const longest = Math.max(0, ...[...s.matchAll(/`+/g)].map((m) => m[0].length));
+              const fence = "`".repeat(longest + 1);
+              const pad = s.startsWith("`") || s.endsWith("`") ? " " : "";
+              return `${fence}${pad}${s}${pad}${fence}`;
+            };
+            const fmtNames = v => (v || "").split("\n").map(s => s.trim()).filter(Boolean).map(codeSpan).join(", ");
             if (process.env.HANDLES) lines.push(`- Reconciliation handles: ${fmtNames(process.env.HANDLES)}`);
             if (process.env.ACCOUNT_TEMPLATES) lines.push(`- Account templates: ${fmtNames(process.env.ACCOUNT_TEMPLATES)}`);
             lines.push(`- Firm(s): \`${process.env.FIRM_IDS}\``);
