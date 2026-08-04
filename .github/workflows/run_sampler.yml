@@ -33,12 +33,12 @@ on:
         required: true
         type: string
       handles:
-        description: "Reconciliation text handles to sample, space-separated (directory names under reconciliation_texts/). Optional if account_templates is set."
+        description: "Reconciliation text handles to sample, ONE PER LINE (directory names under reconciliation_texts/). Newline-separated, not space-separated — names may contain spaces. Optional if account_templates is set."
         required: false
         type: string
         default: ""
       account_templates:
-        description: "Account template names to sample, space-separated (directory names under account_templates/). Optional if handles is set."
+        description: "Account template names to sample, ONE PER LINE (directory names under account_templates/). Newline-separated, not space-separated — these names routinely contain spaces. Optional if handles is set."
         required: false
         type: string
         default: ""
@@ -170,14 +170,22 @@ jobs:
           SAMPLER_ACCOUNT_TEMPLATES: ${{ inputs.account_templates }}
           SAMPLER_FIRM_IDS: ${{ inputs.firm_ids }}
         run: |
-          # Intentional word-splitting: handles/account templates arrive as a single
-          # space-separated string and must become separate CLI args (shellcheck SC2206).
+          # One name per line, and each line becomes exactly ONE CLI arg. Newline-separated (not
+          # space-separated) keeps identifiers that contain spaces intact — account template
+          # names do (e.g. "Investment- and depreciation details"), and word-splitting them
+          # handed the CLI "Investment-" as a template name:
+          #   [error] Config file for account template "Investment-" not found
+          # Same convention as run_tests.yml's TEMPLATE_BUCKETS.
           HANDLE_ARGS=()
-          # shellcheck disable=SC2206
-          [[ -n "${SAMPLER_HANDLES}" ]] && HANDLE_ARGS=(-h ${SAMPLER_HANDLES})
+          if [[ -n "${SAMPLER_HANDLES//[[:space:]]/}" ]]; then
+            mapfile -t HANDLE_NAMES < <(printf '%s\n' "${SAMPLER_HANDLES}" | sed '/^[[:space:]]*$/d')
+            HANDLE_ARGS=(-h "${HANDLE_NAMES[@]}")
+          fi
           ACCOUNT_ARGS=()
-          # shellcheck disable=SC2206
-          [[ -n "${SAMPLER_ACCOUNT_TEMPLATES}" ]] && ACCOUNT_ARGS=(-at ${SAMPLER_ACCOUNT_TEMPLATES})
+          if [[ -n "${SAMPLER_ACCOUNT_TEMPLATES//[[:space:]]/}" ]]; then
+            mapfile -t ACCOUNT_NAMES < <(printf '%s\n' "${SAMPLER_ACCOUNT_TEMPLATES}" | sed '/^[[:space:]]*$/d')
+            ACCOUNT_ARGS=(-at "${ACCOUNT_NAMES[@]}")
+          fi
 
           # GitHub Actions concurrency (group + queue: max) serializes runs within THIS repo, but
           # concurrency groups do not span repositories — two market repos sharing this partner id
@@ -187,7 +195,10 @@ jobs:
           DEADLINE=$(( $(date +%s) + 90*60 ))
           ATTEMPT=1
           while true; do
-            echo "[$(date -u +%H:%M:%S)] run-sampler attempt ${ATTEMPT}: -p ${SAMPLER_PARTNER} ${HANDLE_ARGS[*]} ${ACCOUNT_ARGS[*]} --firm-ids ${SAMPLER_FIRM_IDS} --compact"
+            # %q-quoted so a name containing spaces is visibly one argument in the log.
+            printf '[%s] run-sampler attempt %s: -p %s' "$(date -u +%H:%M:%S)" "${ATTEMPT}" "${SAMPLER_PARTNER}"
+            printf ' %q' "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}"
+            printf ' --firm-ids %s --compact\n' "${SAMPLER_FIRM_IDS}"
             set +e
             # shellcheck disable=SC2086 # SAMPLER_FIRM_IDS is intentionally word-split (space-separated ids -> separate args)
             OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1 | tr -d '\r')
@@ -361,8 +372,12 @@ jobs:
               lines.push(`⚠️ The sampler run did not complete cleanly — see the [workflow run](${runUrl}) for details.`);
             }
             lines.push("");
-            if (process.env.HANDLES) lines.push(`- Reconciliation handles: \`${process.env.HANDLES}\``);
-            if (process.env.ACCOUNT_TEMPLATES) lines.push(`- Account templates: \`${process.env.ACCOUNT_TEMPLATES}\``);
+            // Newline-separated on the way in (names can contain spaces) — render one code-quoted
+            // name per entry, comma-separated. A multi-line value inside one backtick pair
+            // renders as garbage in a PR comment.
+            const fmtNames = v => (v || "").split("\n").map(s => s.trim()).filter(Boolean).map(s => `\`${s}\``).join(", ");
+            if (process.env.HANDLES) lines.push(`- Reconciliation handles: ${fmtNames(process.env.HANDLES)}`);
+            if (process.env.ACCOUNT_TEMPLATES) lines.push(`- Account templates: ${fmtNames(process.env.ACCOUNT_TEMPLATES)}`);
             lines.push(`- Firm(s): \`${process.env.FIRM_IDS}\``);
             if (artifactUrl) {
               lines.push(`- **[📊 Open full sampler report](${artifactUrl})** (GitHub sign-in required; downloads \`results.zip\`, kept 7 days)`);
