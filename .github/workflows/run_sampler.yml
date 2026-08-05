@@ -33,12 +33,12 @@ on:
         required: true
         type: string
       handles:
-        description: "Reconciliation text handles to sample, space-separated (directory names under reconciliation_texts/). Optional if account_templates is set."
+        description: "Reconciliation text handles to sample, ONE PER LINE (directory names under reconciliation_texts/). Newline-separated, not space-separated — names may contain spaces. A name starting with '-' is rejected (the CLI would parse it as an option). Optional if account_templates is set."
         required: false
         type: string
         default: ""
       account_templates:
-        description: "Account template names to sample, space-separated (directory names under account_templates/). Optional if handles is set."
+        description: "Account template names to sample, ONE PER LINE (directory names under account_templates/). Newline-separated, not space-separated — these names routinely contain spaces. A name starting with '-' is rejected (the CLI would parse it as an option). Optional if handles is set."
         required: false
         type: string
         default: ""
@@ -131,10 +131,17 @@ jobs:
       - name: Install silverfin-cli
         run: |
           # Pinned to a commit on silverfin-cli's sampler-compact-diff-v2 branch, since
-          # --add-diffs-folder (used below) is not yet on main. Switch back to installing
-          # unpinned main, matching every other production workflow's convention, once that
-          # branch's PR merges.
-          npm install https://github.com/silverfin/silverfin-cli.git#5accd6b
+          # --compact/--from-zip/--add-diffs-folder (used below) are not yet on main. Switch back
+          # to installing unpinned main, matching every other production workflow's convention,
+          # once that branch's PR (silverfin-cli#265) merges.
+          #
+          # Re-pin to the branch tip whenever that branch gains fixes — a commit pin silently goes
+          # stale, and a rebase can orphan it entirely. The previous pin (5accd6b) was exactly
+          # that: a pre-rebase copy of "Make --add-diffs-folder's zip write atomic", no longer an
+          # ancestor of the branch, and missing five later fixes to the compact diff (flag-array
+          # flip direction, radio-checked attribute boundary, flag-flip suffix side, the
+          # no-view.html rewrite skip, and the identical-render diffs/ skip).
+          npm install https://github.com/silverfin/silverfin-cli.git#1ba5a0f
           VERSION=$(node ./node_modules/silverfin-cli/bin/cli.js -V)
           echo "CLI version: ${VERSION}"
 
@@ -170,14 +177,49 @@ jobs:
           SAMPLER_ACCOUNT_TEMPLATES: ${{ inputs.account_templates }}
           SAMPLER_FIRM_IDS: ${{ inputs.firm_ids }}
         run: |
-          # Intentional word-splitting: handles/account templates arrive as a single
-          # space-separated string and must become separate CLI args (shellcheck SC2206).
+          # One name per line, and each line becomes exactly ONE CLI arg. Newline-separated (not
+          # space-separated) keeps identifiers that contain spaces intact — account template
+          # names do (e.g. "Investment- and depreciation details"), and word-splitting them
+          # handed the CLI "Investment-" as a template name:
+          #   [error] Config file for account template "Investment-" not found
+          # Same convention as run_tests.yml's TEMPLATE_BUCKETS.
+          HANDLE_NAMES=()
+          ACCOUNT_NAMES=()
+          if [[ -n "${SAMPLER_HANDLES//[[:space:]]/}" ]]; then
+            mapfile -t HANDLE_NAMES < <(printf '%s\n' "${SAMPLER_HANDLES}" | sed '/^[[:space:]]*$/d')
+          fi
+          if [[ -n "${SAMPLER_ACCOUNT_TEMPLATES//[[:space:]]/}" ]]; then
+            mapfile -t ACCOUNT_NAMES < <(printf '%s\n' "${SAMPLER_ACCOUNT_TEMPLATES}" | sed '/^[[:space:]]*$/d')
+          fi
+
+          # A name starting with "-" would be read by the CLI's option parser as a FLAG rather
+          # than a value: commander stops consuming a variadic option (-h/-at take <names...>) at
+          # the first "-"-prefixed token, and a leading "--" separator does not protect variadic
+          # values either. Reject such a name up front instead of letting the CLI silently
+          # reinterpret it as an option. Both lists are checked, so the message names which kind
+          # of value and which directory to rename.
+          reject_option_like_names() {
+            local kind="$1" dir="$2"
+            shift 2
+            local name
+            for name in "$@"; do
+              if [[ "${name}" == -* ]]; then
+                echo "::error::${kind} '${name}' starts with '-', which silverfin-cli would parse as an option instead of a value. Rename the ${dir} directory."
+                exit 1
+              fi
+            done
+          }
+          reject_option_like_names "Reconciliation handle" "reconciliation_texts/" "${HANDLE_NAMES[@]}"
+          reject_option_like_names "Account template name" "account_templates/" "${ACCOUNT_NAMES[@]}"
+
           HANDLE_ARGS=()
-          # shellcheck disable=SC2206
-          [[ -n "${SAMPLER_HANDLES}" ]] && HANDLE_ARGS=(-h ${SAMPLER_HANDLES})
+          if [[ ${#HANDLE_NAMES[@]} -gt 0 ]]; then
+            HANDLE_ARGS=(-h "${HANDLE_NAMES[@]}")
+          fi
           ACCOUNT_ARGS=()
-          # shellcheck disable=SC2206
-          [[ -n "${SAMPLER_ACCOUNT_TEMPLATES}" ]] && ACCOUNT_ARGS=(-at ${SAMPLER_ACCOUNT_TEMPLATES})
+          if [[ ${#ACCOUNT_NAMES[@]} -gt 0 ]]; then
+            ACCOUNT_ARGS=(-at "${ACCOUNT_NAMES[@]}")
+          fi
 
           # GitHub Actions concurrency (group + queue: max) serializes runs within THIS repo, but
           # concurrency groups do not span repositories — two market repos sharing this partner id
@@ -187,7 +229,10 @@ jobs:
           DEADLINE=$(( $(date +%s) + 90*60 ))
           ATTEMPT=1
           while true; do
-            echo "[$(date -u +%H:%M:%S)] run-sampler attempt ${ATTEMPT}: -p ${SAMPLER_PARTNER} ${HANDLE_ARGS[*]} ${ACCOUNT_ARGS[*]} --firm-ids ${SAMPLER_FIRM_IDS} --compact"
+            # %q-quoted so a name containing spaces is visibly one argument in the log.
+            printf '[%s] run-sampler attempt %s: -p %s' "$(date -u +%H:%M:%S)" "${ATTEMPT}" "${SAMPLER_PARTNER}"
+            printf ' %q' "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}"
+            printf ' --firm-ids %s --compact\n' "${SAMPLER_FIRM_IDS}"
             set +e
             # shellcheck disable=SC2086 # SAMPLER_FIRM_IDS is intentionally word-split (space-separated ids -> separate args)
             OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1 | tr -d '\r')
@@ -361,8 +406,23 @@ jobs:
               lines.push(`⚠️ The sampler run did not complete cleanly — see the [workflow run](${runUrl}) for details.`);
             }
             lines.push("");
-            if (process.env.HANDLES) lines.push(`- Reconciliation handles: \`${process.env.HANDLES}\``);
-            if (process.env.ACCOUNT_TEMPLATES) lines.push(`- Account templates: \`${process.env.ACCOUNT_TEMPLATES}\``);
+            // Newline-separated on the way in (names can contain spaces) — render one code-quoted
+            // name per entry, comma-separated. A multi-line value inside one backtick pair
+            // renders as garbage in a PR comment.
+            //
+            // These names are directory names from the PR's own tree, so treat them as untrusted
+            // text: a name containing a backtick would otherwise close its code span and inject
+            // markdown into this comment. Per CommonMark, fence with one more backtick than the
+            // longest run inside the name, and pad when it starts/ends with a backtick.
+            const codeSpan = (s) => {
+              const longest = Math.max(0, ...[...s.matchAll(/`+/g)].map((m) => m[0].length));
+              const fence = "`".repeat(longest + 1);
+              const pad = s.startsWith("`") || s.endsWith("`") ? " " : "";
+              return `${fence}${pad}${s}${pad}${fence}`;
+            };
+            const fmtNames = v => (v || "").split("\n").map(s => s.trim()).filter(Boolean).map(codeSpan).join(", ");
+            if (process.env.HANDLES) lines.push(`- Reconciliation handles: ${fmtNames(process.env.HANDLES)}`);
+            if (process.env.ACCOUNT_TEMPLATES) lines.push(`- Account templates: ${fmtNames(process.env.ACCOUNT_TEMPLATES)}`);
             lines.push(`- Firm(s): \`${process.env.FIRM_IDS}\``);
             if (artifactUrl) {
               lines.push(`- **[📊 Open full sampler report](${artifactUrl})** (GitHub sign-in required; downloads \`results.zip\`, kept 7 days)`);

@@ -260,8 +260,10 @@ _Trigger:_
 _Inputs:_
 
 * `partner` (required) — partner environment id (must be authorized — see `PARTNER_CONFIG_JSON` secret).
-* `handles` (optional) — reconciliation text handles to sample, space-separated (directory names under `reconciliation_texts/`). Optional if `account_templates` is set.
-* `account_templates` (optional) — account template names to sample, space-separated (directory names under `account_templates/`). Optional if `handles` is set.
+* `handles` (optional) — reconciliation text handles to sample, **one per line** (directory names under `reconciliation_texts/`). Optional if `account_templates` is set.
+* `account_templates` (optional) — account template names to sample, **one per line** (directory names under `account_templates/`). Optional if `handles` is set.
+  * Both lists are newline-separated, **not** space-separated: account template directory names routinely contain spaces (e.g. `Investment- and depreciation details`), so a space-joined list is ambiguous and gets word-split into template names that don't exist (`Config file for account template "Investment-" not found`). Same convention as [`run_tests.yml`](#run-liquid-tests-run_testsyml). `firm_ids` is the exception — numeric, so it stays space-separated.
+  * A name that **starts with `-`** is rejected before the CLI is called, and the job fails with the directory to rename. `silverfin-cli`'s `-h`/`-at` are variadic options, so commander stops consuming values at the first `-`-prefixed token and would read such a name as a flag; a `--` separator does not protect variadic values. Only a leading `-` is affected — internal and trailing hyphens (`Cut-off`, `Investment- and depreciation details`) are fine.
 * `firm_ids` (required) — firm id(s) to sample against, space-separated. The backend 422s if empty.
 * `ref` (required) — git ref (commit SHA) to check out — the PR head, so sampled template content matches the PR under review.
 * `pull_request_number` (optional) — PR number to post the result comment on. If empty, no comment is posted (results still upload as an artifact).
