@@ -33,12 +33,12 @@ on:
         required: true
         type: string
       handles:
-        description: "Reconciliation text handles to sample, ONE PER LINE (directory names under reconciliation_texts/). Newline-separated, not space-separated — names may contain spaces. Optional if account_templates is set."
+        description: "Reconciliation text handles to sample, ONE PER LINE (directory names under reconciliation_texts/). Newline-separated, not space-separated — names may contain spaces. A name starting with '-' is rejected (the CLI would parse it as an option). Optional if account_templates is set."
         required: false
         type: string
         default: ""
       account_templates:
-        description: "Account template names to sample, ONE PER LINE (directory names under account_templates/). Newline-separated, not space-separated — these names routinely contain spaces. Optional if handles is set."
+        description: "Account template names to sample, ONE PER LINE (directory names under account_templates/). Newline-separated, not space-separated — these names routinely contain spaces. A name starting with '-' is rejected (the CLI would parse it as an option). Optional if handles is set."
         required: false
         type: string
         default: ""
@@ -196,13 +196,21 @@ jobs:
           # than a value: commander stops consuming a variadic option (-h/-at take <names...>) at
           # the first "-"-prefixed token, and a leading "--" separator does not protect variadic
           # values either. Reject such a name up front instead of letting the CLI silently
-          # reinterpret it as an option — the actionable fix is to rename the template directory.
-          for NAME in "${HANDLE_NAMES[@]}" "${ACCOUNT_NAMES[@]}"; do
-            if [[ "${NAME}" == -* ]]; then
-              echo "::error::Template name '${NAME}' starts with '-', which silverfin-cli would parse as an option instead of a template name. Rename the template directory."
-              exit 1
-            fi
-          done
+          # reinterpret it as an option. Both lists are checked, so the message names which kind
+          # of value and which directory to rename.
+          reject_option_like_names() {
+            local kind="$1" dir="$2"
+            shift 2
+            local name
+            for name in "$@"; do
+              if [[ "${name}" == -* ]]; then
+                echo "::error::${kind} '${name}' starts with '-', which silverfin-cli would parse as an option instead of a value. Rename the ${dir} directory."
+                exit 1
+              fi
+            done
+          }
+          reject_option_like_names "Reconciliation handle" "reconciliation_texts/" "${HANDLE_NAMES[@]}"
+          reject_option_like_names "Account template name" "account_templates/" "${ACCOUNT_NAMES[@]}"
 
           HANDLE_ARGS=()
           if [[ ${#HANDLE_NAMES[@]} -gt 0 ]]; then
