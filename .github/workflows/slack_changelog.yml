@@ -21,14 +21,13 @@ jobs:
 
       - name: Get PR Details
         id: pr-details
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          BRANCH_NAME: ${{ github.event.pull_request.head.ref }}
         run: |
-          # Extract PR information
-          PR_NUMBER="${{ github.event.pull_request.number }}"
-          PR_TITLE="${{ github.event.pull_request.title }}"
-          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
-          PR_URL="${{ github.event.pull_request.html_url }}"
-          BRANCH_NAME="${{ github.event.pull_request.head.ref }}"
-
           # Get changed files from the merge commit
           echo "Getting files from merge commit..."
           git diff --name-only HEAD~1 HEAD > changed_files.txt
@@ -59,7 +58,7 @@ jobs:
           fi
 
           # Set outputs
-          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+        echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
           echo "pr_title=$PR_TITLE" >> $GITHUB_OUTPUT
           echo "pr_author=$PR_AUTHOR" >> $GITHUB_OUTPUT
           echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
@@ -74,34 +73,42 @@ jobs:
 
       - name: Generate Changelog Message
         id: changelog
+        env:
+          PR_TITLE: ${{ steps.pr-details.outputs.pr_title }}
+          PR_AUTHOR: ${{ steps.pr-details.outputs.pr_author }}
+          PR_URL: ${{ steps.pr-details.outputs.pr_url }}
+          TEMPLATE_FOLDERS: ${{ steps.pr-details.outputs.template_folders }}
+          TOTAL_TEMPLATES: ${{ steps.pr-details.outputs.total_templates }}
         run: |
           # Create a formatted changelog message
           TIMESTAMP=$(TZ='Europe/Brussels' date +"%d/%m/%Y %H:%M")
 
           # Build the complete message (using clean Slack formatting)
           MESSAGE="
-          📝 ${{ steps.pr-details.outputs.pr_title }}
-          👤 ${{ steps.pr-details.outputs.pr_author }}
-          🔗 ${{ steps.pr-details.outputs.pr_url }}
+          📝 $PR_TITLE
+          👤 $PR_AUTHOR
+          🔗 $PR_URL
           ⏰ $TIMESTAMP
 
           Templates:
-          ${{ steps.pr-details.outputs.template_folders }}"
+          $TEMPLATE_FOLDERS"
 
           # If more than 10 templates, add a note
-          if [ ${{ steps.pr-details.outputs.total_templates }} -gt 10 ]; then
+          if [ "$TOTAL_TEMPLATES" -gt 10 ]; then
             MESSAGE="$MESSAGE
-          _...and $((${{ steps.pr-details.outputs.total_templates }} - 10)) more templates_"
+          _...and $((TOTAL_TEMPLATES - 10)) more templates_"
           fi
 
-          # Set output (escape for JSON)
-          # Escape quotes and newlines for JSON
-          MESSAGE_ESCAPED=$(echo "$MESSAGE" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+          # Set output (escape for JSON: backslashes first, then quotes, then newlines)
+          MESSAGE_ESCAPED=$(echo "$MESSAGE" | sed 's/\\/\\\\/g; s/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
           echo "message=$MESSAGE_ESCAPED" >> $GITHUB_OUTPUT
 
       - name: Post to Slack
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_MESSAGE: ${{ steps.changelog.outputs.message }}
         run: |
           # Send changelog message as text field for Workflow Builder
-          curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
-            -H "Content-Type: application/json" \
-            -d "{\"text\":\"${{ steps.changelog.outputs.message }}\"}"
+          curl -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: ion/json" \
+            -d "{\"text\":\"$SLACK_MESSAGE\"}"
