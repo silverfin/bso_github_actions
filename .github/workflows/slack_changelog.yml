@@ -58,7 +58,7 @@ jobs:
           fi
 
           # Set outputs
-        echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
           echo "pr_title=$PR_TITLE" >> $GITHUB_OUTPUT
           echo "pr_author=$PR_AUTHOR" >> $GITHUB_OUTPUT
           echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
@@ -110,5 +110,5 @@ jobs:
         run: |
           # Send changelog message as text field for Workflow Builder
           curl -X POST "$SLACK_WEBHOOK_URL" \
-            -H "Content-Type: ion/json" \
+            -H "Content-Type: application/json" \
             -d "{\"text\":\"$SLACK_MESSAGE\"}"
