@@ -1,0 +1,48 @@
+name: Silverfin UK support-article update
+run-name: Sync Notion support articles for merged PR #${{ inputs.pr_number }}
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: "Number of the merged PR in the calling repo"
+        required: true
+        type: number
+      merge_sha:
+        description: "Merge commit SHA of the PR"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  update-support-articles:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.merge_sha }}
+
+      - uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          display_report: true
+          plugins: bso-cursor-rules
+          plugin_marketplaces: https://github.com/silverfin/bso-cursor-rules.git
+          prompt: |
+            A PR just merged into main on this repo: PR #${{ inputs.pr_number }}
+            (merge commit ${{ inputs.merge_sha }}).
+
+            Invoke the skill bso-cursor-rules:silverfin-uk-support-article-update
+            for this merged PR, unattended. Pass the PR as its number/URL per the
+            skill's own instructions. Do not stop to ask questions or wait for
+            input — follow the skill's unattended/hard rules exactly, and produce
+            the final handoff report as your last message.
+          claude_args: |
+            --mcp-config '{"mcpServers":{"notion":{"command":"npx","args":["-y","@notionhq/notion-mcp-server"],"env":{"NOTION_TOKEN":"${{ secrets.NOTION_TOKEN }}"}}}}'
+            --allowedTools "Bash(gh pr view*),Bash(gh api*),Bash(git show*),Read,Grep,Glob,WebFetch,Skill,mcp__notion__notion-fetch,mcp__notion__notion-query-data-sources,mcp__notion__notion-query-database-view,mcp__notion__notion-update-page,mcp__notion__notion-create-comment"
