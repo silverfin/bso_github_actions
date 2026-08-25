@@ -76,6 +76,17 @@ jobs:
           # Create a formatted changelog message
           TIMESTAMP=$(TZ='Europe/Brussels' date +"%d/%m/%Y %H:%M")
 
+          # Slack parses the webhook `text` field as mrkdwn, so escape the three
+          # characters that carry meaning there in the contributor-controlled
+          # values. Without this a title can broadcast with <!channel> or render
+          # a disguised <https://…|label> link from a trusted bot. Order matters:
+          # & first, or the entities below get double-escaped.
+          escape_mrkdwn() {
+            printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+          }
+          PR_TITLE=$(escape_mrkdwn "$PR_TITLE")
+          PR_AUTHOR=$(escape_mrkdwn "$PR_AUTHOR")
+
           # Build the complete message (using clean Slack formatting)
           MESSAGE="
           📝 $PR_TITLE
@@ -109,8 +120,12 @@ jobs:
           # reason (invalid_payload, no_text, ...). The retry/timeout flags keep
           # a transient blip or a hung POST from failing a run nobody can
           # re-trigger: this job runs on `pull_request: closed`.
+          # Plain --retry covers 408, 429, 5xx and connection/timeout failures;
+          # --retry-all-errors is deliberately absent so a permanent rejection
+          # (400 invalid_payload -> exit 22) fails at once instead of resending a
+          # doomed POST. --max-time is per attempt, --retry-max-time caps the total.
           curl --fail-with-body --show-error --silent -X POST "$SLACK_WEBHOOK_URL" \
-            --retry 3 --retry-all-errors --retry-delay 5 \
+            --retry 3 --retry-delay 5 --retry-max-time 60 \
             --connect-timeout 10 --max-time 30 \
             -H "Content-Type: application/json" \
             -d "{\"text\":$SLACK_MESSAGE}"
