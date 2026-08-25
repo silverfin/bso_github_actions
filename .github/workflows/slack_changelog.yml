@@ -35,7 +35,7 @@ jobs:
           cat changed_files.txt
 
           # Extract unique template folders
-          TEMPLATE_FOLDERS=$(cat changed_files.txt | \
+          ALL_TEMPLATE_FOLDERS=$(cat changed_files.txt | \
             grep -E "(reconciliation_texts|shared_parts|export_files|account_templates)/" | \
             sed 's|/[^/]*$||' | \
             sed 's|/text_parts||' | \
@@ -45,31 +45,30 @@ jobs:
             sed 's|^reconciliation_texts/||' | \
             sed 's|^shared_parts/||' | \
             sed 's|^export_files/||' | \
-            sed 's|^account_templates/||' | \
-            head -10 | \
-            sed 's/^/• /')
+            sed 's|^account_templates/||')
 
-          # Count template folders 
-          if [ -z "$TEMPLATE_FOLDERS" ]; then
+          # Count the full list first, then truncate it to 10 for display
+          if [ -z "$ALL_TEMPLATE_FOLDERS" ]; then
             TOTAL_TEMPLATES=0
             TEMPLATE_FOLDERS="No template changes"
           else
-            TOTAL_TEMPLATES=$(echo "$TEMPLATE_FOLDERS" | wc -l)
+            TOTAL_TEMPLATES=$(echo "$ALL_TEMPLATE_FOLDERS" | wc -l | tr -d ' ')
+            TEMPLATE_FOLDERS=$(echo "$ALL_TEMPLATE_FOLDERS" | head -10 | sed 's/^/• /')
           fi
 
           # Set outputs
-          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
-          echo "pr_title=$PR_TITLE" >> $GITHUB_OUTPUT
-          echo "pr_author=$PR_AUTHOR" >> $GITHUB_OUTPUT
-          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
-          echo "total_templates=$TOTAL_TEMPLATES" >> $GITHUB_OUTPUT
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "pr_title=$PR_TITLE" >> "$GITHUB_OUTPUT"
+          echo "pr_author=$PR_AUTHOR" >> "$GITHUB_OUTPUT"
+          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+          echo "total_templates=$TOTAL_TEMPLATES" >> "$GITHUB_OUTPUT"
 
           # Handle multiline output for template folders
           {
             echo 'template_folders<<EOF'
             echo "$TEMPLATE_FOLDERS"
             echo 'EOF'
-          } >> $GITHUB_OUTPUT
+          } >> "$GITHUB_OUTPUT"
 
       - name: Generate Changelog Message
         id: changelog
@@ -99,16 +98,20 @@ jobs:
           _...and $((TOTAL_TEMPLATES - 10)) more templates_"
           fi
 
-          # Set output (escape for JSON: backslashes first, then quotes, then newlines)
-          MESSAGE_ESCAPED=$(echo "$MESSAGE" | sed 's/\\/\\\\/g; s/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
-          echo "message=$MESSAGE_ESCAPED" >> $GITHUB_OUTPUT
+          # Set output as a complete JSON string (quotes included), so the Slack
+          # payload never has to re-escape it. jq -Rs handles backslashes, quotes,
+          # newlines, tabs and other control characters, and emits a single line.
+          MESSAGE_JSON=$(printf '%s' "$MESSAGE" | jq -Rs .)
+          echo "message=$MESSAGE_JSON" >> "$GITHUB_OUTPUT"
 
       - name: Post to Slack
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           SLACK_MESSAGE: ${{ steps.changelog.outputs.message }}
         run: |
-          # Send changelog message as text field for Workflow Builder
-          curl -X POST "$SLACK_WEBHOOK_URL" \
+          # Send changelog message as text field for Workflow Builder.
+          # SLACK_MESSAGE is already a JSON string (jq -Rs), so it is not re-quoted.
+          # --fail --show-error makes a 4xx/5xx from the webhook fail the job.
+          curl --fail --show-error --silent -X POST "$SLACK_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
-            -d "{\"text\":\"$SLACK_MESSAGE\"}"
+            -d "{\"text\":$SLACK_MESSAGE}"
