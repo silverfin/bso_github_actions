@@ -31,7 +31,9 @@ jobs:
           echo "Files changed:"
           cat changed_files.txt
 
-          # Extract unique template folders
+          # Extract unique template folders. The trailing `|| true` keeps a
+          # docs-only merge (no template paths, so grep exits 1) from killing
+          # the step if this ever runs under `shell: bash`, which adds pipefail.
           ALL_TEMPLATE_FOLDERS=$(cat changed_files.txt | \
             grep -E "(reconciliation_texts|shared_parts|export_files|account_templates)/" | \
             sed 's|/[^/]*$||' | \
@@ -42,7 +44,7 @@ jobs:
             sed 's|^reconciliation_texts/||' | \
             sed 's|^shared_parts/||' | \
             sed 's|^export_files/||' | \
-            sed 's|^account_templates/||')
+            sed 's|^account_templates/||' || true)
 
           # Count the full list first, then truncate it to 10 for display
           if [ -z "$ALL_TEMPLATE_FOLDERS" ]; then
