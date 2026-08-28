@@ -16,27 +16,25 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          # The merge commit only exists in the base repo, and this job holds an
+          # inherited SLACK_WEBHOOK_URL — never check out the PR author's repo.
+          repository: ${{ github.repository }}
           ref: ${{ github.event.pull_request.merge_commit_sha }}
+          persist-credentials: false
 
       - name: Get PR Details
         id: pr-details
         run: |
-          # Extract PR information
-          PR_NUMBER="${{ github.event.pull_request.number }}"
-          PR_TITLE="${{ github.event.pull_request.title }}"
-          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
-          PR_URL="${{ github.event.pull_request.html_url }}"
-          BRANCH_NAME="${{ github.event.pull_request.head.ref }}"
-
           # Get changed files from the merge commit
           echo "Getting files from merge commit..."
           git diff --name-only HEAD~1 HEAD > changed_files.txt
           echo "Files changed:"
           cat changed_files.txt
 
-          # Extract unique template folders
-          TEMPLATE_FOLDERS=$(cat changed_files.txt | \
+          # Extract unique template folders. The trailing `|| true` keeps a
+          # docs-only merge (no template paths, so grep exits 1) from killing
+          # the step if this ever runs under `shell: bash`, which adds pipefail.
+          ALL_TEMPLATE_FOLDERS=$(cat changed_files.txt | \
             grep -E "(reconciliation_texts|shared_parts|export_files|account_templates)/" | \
             sed 's|/[^/]*$||' | \
             sed 's|/text_parts||' | \
@@ -46,62 +44,90 @@ jobs:
             sed 's|^reconciliation_texts/||' | \
             sed 's|^shared_parts/||' | \
             sed 's|^export_files/||' | \
-            sed 's|^account_templates/||' | \
-            head -10 | \
-            sed 's/^/• /')
+            sed 's|^account_templates/||' || true)
 
-          # Count template folders 
-          if [ -z "$TEMPLATE_FOLDERS" ]; then
+          # Count the full list first, then truncate it to 10 for display
+          if [ -z "$ALL_TEMPLATE_FOLDERS" ]; then
             TOTAL_TEMPLATES=0
             TEMPLATE_FOLDERS="No template changes"
           else
-            TOTAL_TEMPLATES=$(echo "$TEMPLATE_FOLDERS" | wc -l)
+            TOTAL_TEMPLATES=$(echo "$ALL_TEMPLATE_FOLDERS" | wc -l | tr -d ' ')
+            TEMPLATE_FOLDERS=$(echo "$ALL_TEMPLATE_FOLDERS" | head -10 | sed 's/^/• /')
           fi
 
-          # Set outputs
-          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
-          echo "pr_title=$PR_TITLE" >> $GITHUB_OUTPUT
-          echo "pr_author=$PR_AUTHOR" >> $GITHUB_OUTPUT
-          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
-          echo "total_templates=$TOTAL_TEMPLATES" >> $GITHUB_OUTPUT
+          # Set outputs (PR title/author/url are read straight from the github
+          # context by the next step, so they never pass through this channel)
+          echo "total_templates=$TOTAL_TEMPLATES" >> "$GITHUB_OUTPUT"
 
           # Handle multiline output for template folders
           {
             echo 'template_folders<<EOF'
             echo "$TEMPLATE_FOLDERS"
             echo 'EOF'
-          } >> $GITHUB_OUTPUT
+          } >> "$GITHUB_OUTPUT"
 
       - name: Generate Changelog Message
         id: changelog
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          TEMPLATE_FOLDERS: ${{ steps.pr-details.outputs.template_folders }}
+          TOTAL_TEMPLATES: ${{ steps.pr-details.outputs.total_templates }}
         run: |
           # Create a formatted changelog message
           TIMESTAMP=$(TZ='Europe/Brussels' date +"%d/%m/%Y %H:%M")
 
+          # Slack parses the webhook `text` field as mrkdwn, so escape the three
+          # characters that carry meaning there in the contributor-controlled
+          # values. Without this a title can broadcast with <!channel> or render
+          # a disguised <https://…|label> link from a trusted bot. Order matters:
+          # & first, or the entities below get double-escaped.
+          escape_mrkdwn() {
+            printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+          }
+          PR_TITLE=$(escape_mrkdwn "$PR_TITLE")
+          PR_AUTHOR=$(escape_mrkdwn "$PR_AUTHOR")
+
           # Build the complete message (using clean Slack formatting)
           MESSAGE="
-          📝 ${{ steps.pr-details.outputs.pr_title }}
-          👤 ${{ steps.pr-details.outputs.pr_author }}
-          🔗 ${{ steps.pr-details.outputs.pr_url }}
+          📝 $PR_TITLE
+          👤 $PR_AUTHOR
+          🔗 $PR_URL
           ⏰ $TIMESTAMP
 
           Templates:
-          ${{ steps.pr-details.outputs.template_folders }}"
+          $TEMPLATE_FOLDERS"
 
           # If more than 10 templates, add a note
-          if [ ${{ steps.pr-details.outputs.total_templates }} -gt 10 ]; then
+          if [ "$TOTAL_TEMPLATES" -gt 10 ]; then
             MESSAGE="$MESSAGE
-          _...and $((${{ steps.pr-details.outputs.total_templates }} - 10)) more templates_"
+          _...and $((TOTAL_TEMPLATES - 10)) more templates_"
           fi
 
-          # Set output (escape for JSON)
-          # Escape quotes and newlines for JSON
-          MESSAGE_ESCAPED=$(echo "$MESSAGE" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
-          echo "message=$MESSAGE_ESCAPED" >> $GITHUB_OUTPUT
+          # Set output as a complete JSON string (quotes included), so the Slack
+          # payload never has to re-escape it. jq -Rs handles backslashes, quotes,
+          # newlines, tabs and other control characters, and emits a single line.
+          MESSAGE_JSON=$(printf '%s' "$MESSAGE" | jq -Rs .)
+          echo "message=$MESSAGE_JSON" >> "$GITHUB_OUTPUT"
 
       - name: Post to Slack
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_MESSAGE: ${{ steps.changelog.outputs.message }}
         run: |
-          # Send changelog message as text field for Workflow Builder
-          curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+          # Send changelog message as text field for Workflow Builder.
+          # SLACK_MESSAGE is already a JSON string (jq -Rs), so it is not re-quoted.
+          # --fail-with-body fails the job on 4xx/5xx but still prints Slack's
+          # reason (invalid_payload, no_text, ...). The retry/timeout flags keep
+          # a transient blip or a hung POST from failing a run nobody can
+          # re-trigger: this job runs on `pull_request: closed`.
+          # Plain --retry covers 408, 429, 5xx and connection/timeout failures;
+          # --retry-all-errors is deliberately absent so a permanent rejection
+          # (400 invalid_payload -> exit 22) fails at once instead of resending a
+          # doomed POST. --max-time is per attempt, --retry-max-time caps the total.
+          curl --fail-with-body --show-error --silent -X POST "$SLACK_WEBHOOK_URL" \
+            --retry 3 --retry-delay 5 --retry-max-time 60 \
+            --connect-timeout 10 --max-time 30 \
             -H "Content-Type: application/json" \
-            -d "{\"text\":\"${{ steps.changelog.outputs.message }}\"}"
+            -d "{\"text\":$SLACK_MESSAGE}"
