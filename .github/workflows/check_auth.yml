@@ -34,23 +34,33 @@ jobs:
           echo '${{ secrets.CONFIG_JSON }}' > $HOME/.silverfin/config.json
       # A failing firm must not abort the loop: under `bash -e` the first failure skipped the
       # write-back below, discarding renewals already made and starving later firms of refreshes.
-      # Record failures and fail the job in a later step instead. Firm IDs are not secrets.
+      # Record failures and fail the job in a later step instead. Firm IDs are logged on purpose -
+      # they are not secrets, and the alert has to name the firm that was not refreshed.
       - name: Refresh tokens
         run: |
+          # Enumerated into a variable rather than straight into the `for` word list: a jq failure
+          # inside `$(...)` there leaves zero loop items and still exits 0, which would report every
+          # firm as refreshed. An assignment lets `bash -e` catch it.
+          FIRM_IDS=$(jq -r 'del(.defaultFirmIDs, .host) | keys[] | select(test("^[0-9]+$"))' "$HOME/.silverfin/config.json")
+          if [[ -z "${FIRM_IDS}" ]]; then
+            echo "::error::[Action] no firms in the config, refusing to continue"
+            exit 1
+          fi
+          echo "EXPECTED_FIRMS=$(wc -l <<< "${FIRM_IDS}" | tr -d ' ')" >> "$GITHUB_ENV"
           FAILED_FIRMS=""
-          CONFIG_JSON=$(cat $HOME/.silverfin/config.json)
-          echo "EXPECTED_FIRMS=$(echo $CONFIG_JSON | jq '[keys[] | select(test("^[0-9]+$"))] | length')" >> "$GITHUB_ENV"
-          for FIRM_ID in $(echo $CONFIG_JSON | jq 'del(.defaultFirmIDs, .host) | keys[]'); do
-            FIRM_ID=$(echo $FIRM_ID | tr -d '"')
-            if [[ -n "$FIRM_ID" && "$FIRM_ID" =~ ^[0-9]+$  ]]; then
-              echo "[Action] refreshing token for firm $FIRM_ID"
-              if ! node ./node_modules/silverfin-cli/bin/cli.js config --refresh-token $FIRM_ID; then
-                echo "::error::[Action] failed to refresh token for firm ${FIRM_ID}"
-                FAILED_FIRMS="${FAILED_FIRMS:+${FAILED_FIRMS} }${FIRM_ID}"
-              fi
+          while IFS= read -r FIRM_ID; do
+            echo "[Action] refreshing token for firm ${FIRM_ID}"
+            if ! node ./node_modules/silverfin-cli/bin/cli.js config --refresh-token "${FIRM_ID}"; then
+              echo "::error::[Action] failed to refresh token for firm ${FIRM_ID}"
+              FAILED_FIRMS="${FAILED_FIRMS:+${FAILED_FIRMS} }${FIRM_ID}"
             fi
-          done
-          echo "REFRESH_FAILED_FIRMS=${FAILED_FIRMS}" >> "$GITHUB_ENV"
+          done <<< "${FIRM_IDS}"
+          # REFRESH_COMPLETED distinguishes "the loop ran and these firms failed" from "the step
+          # aborted before writing anything", which would otherwise look identical downstream.
+          {
+            echo "REFRESH_FAILED_FIRMS=${FAILED_FIRMS}"
+            echo "REFRESH_COMPLETED=true"
+          } >> "$GITHUB_ENV"
       # `always()`: keeps the renewals that succeeded when another firm failed. Because it also runs
       # when an earlier step failed, the config must be shape-checked first - an empty or truncated
       # file here would overwrite every firm's tokens.
@@ -66,7 +76,7 @@ jobs:
             echo "::error::[Action] config holds ${FOUND_FIRMS} firms, expected ${EXPECTED_FIRMS}, refusing to write CONFIG_JSON"
             exit 1
           fi
-          CONFIG_JSON=$(cat $HOME/.silverfin/config.json | tr -d '\n')
+          CONFIG_JSON=$(tr -d '\n' < "$HOME/.silverfin/config.json")
           echo "::add-mask::$CONFIG_JSON"
           echo "$CONFIG_JSON" | gh secret set CONFIG_JSON
         env:
@@ -76,6 +86,10 @@ jobs:
       - name: Fail if any firm was not refreshed
         if: always()
         run: |
+          if [[ "${REFRESH_COMPLETED}" != "true" ]]; then
+            echo "::error::[Action] the refresh step did not complete"
+            exit 1
+          fi
           if [[ -n "${REFRESH_FAILED_FIRMS}" ]]; then
             echo "::error::[Action] token refresh incomplete for firm(s): ${REFRESH_FAILED_FIRMS}"
             exit 1
