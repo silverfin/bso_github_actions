@@ -32,20 +32,40 @@ jobs:
           mkdir -p $HOME/.silverfin/
           touch $HOME/.silverfin/config.json
           echo '${{ secrets.CONFIG_JSON }}' > $HOME/.silverfin/config.json
+      # A failing firm must not abort the loop: under `bash -e` the first failure skipped the
+      # write-back below, discarding renewals already made and starving later firms of refreshes.
+      # Record failures and fail the job in a later step instead. Firm IDs are not secrets.
       - name: Refresh tokens
         run: |
+          FAILED_FIRMS=""
           CONFIG_JSON=$(cat $HOME/.silverfin/config.json)
           for FIRM_ID in $(echo $CONFIG_JSON | jq 'del(.defaultFirmIDs, .host) | keys[]'); do
             FIRM_ID=$(echo $FIRM_ID | tr -d '"')
             if [[ -n "$FIRM_ID" && "$FIRM_ID" =~ ^[0-9]+$  ]]; then
               echo "[Action] refreshing token for firm $FIRM_ID"
-              node ./node_modules/silverfin-cli/bin/cli.js config --refresh-token $FIRM_ID
+              if ! node ./node_modules/silverfin-cli/bin/cli.js config --refresh-token $FIRM_ID; then
+                echo "::error::[Action] failed to refresh token for firm ${FIRM_ID}"
+                FAILED_FIRMS="${FAILED_FIRMS:+${FAILED_FIRMS} }${FIRM_ID}"
+              fi
             fi
           done
+          echo "REFRESH_FAILED_FIRMS=${FAILED_FIRMS}" >> "$GITHUB_ENV"
+      # `always()`: keeps the renewals that succeeded when another firm failed.
       - name: Prepare and store updated CONFIG_JSON as secret
+        if: always()
         run: |
           CONFIG_JSON=$(cat $HOME/.silverfin/config.json | tr -d '\n')
           echo "::add-mask::$CONFIG_JSON"
           echo "$CONFIG_JSON" | gh secret set CONFIG_JSON
         env:
           GH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+      # Last, so an incomplete pass goes red without costing the write-back. A per-firm failure
+      # means "not refreshed this pass", not necessarily a credential fault.
+      - name: Fail if any firm was not refreshed
+        if: always()
+        run: |
+          if [[ -n "${REFRESH_FAILED_FIRMS}" ]]; then
+            echo "::error::[Action] token refresh incomplete for firm(s): ${REFRESH_FAILED_FIRMS}"
+            exit 1
+          fi
+          echo "[Action] all firms refreshed"
