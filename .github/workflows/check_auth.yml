@@ -41,12 +41,18 @@ jobs:
           # Enumerated into a variable rather than straight into the `for` word list: a jq failure
           # inside `$(...)` there leaves zero loop items and still exits 0, which would report every
           # firm as refreshed. An assignment lets `bash -e` catch it.
+          if [[ ! -s "$HOME/.silverfin/config.json" ]] || ! jq -e . "$HOME/.silverfin/config.json" > /dev/null 2>&1; then
+            echo "::error::[Action] the CONFIG_JSON secret is empty or not valid JSON"
+            exit 1
+          fi
           FIRM_IDS=$(jq -r 'del(.defaultFirmIDs, .host) | keys[] | select(test("^[0-9]+$"))' "$HOME/.silverfin/config.json")
           if [[ -z "${FIRM_IDS}" ]]; then
             echo "::error::[Action] no firms in the config, refusing to continue"
             exit 1
           fi
-          echo "EXPECTED_FIRMS=$(wc -l <<< "${FIRM_IDS}" | tr -d ' ')" >> "$GITHUB_ENV"
+          # The ID set, not a count: a config that lost one firm and gained another numeric-looking
+          # key would pass a count check.
+          echo "EXPECTED_FIRM_IDS=$(tr '\n' ' ' <<< "${FIRM_IDS}")" >> "$GITHUB_ENV"
           FAILED_FIRMS=""
           while IFS= read -r FIRM_ID; do
             echo "[Action] refreshing token for firm ${FIRM_ID}"
@@ -67,15 +73,17 @@ jobs:
       - name: Prepare and store updated CONFIG_JSON as secret
         if: always()
         run: |
-          if [[ -z "${EXPECTED_FIRMS}" ]]; then
+          if [[ -z "${EXPECTED_FIRM_IDS}" ]]; then
             echo "::error::[Action] refresh never ran, refusing to write CONFIG_JSON"
             exit 1
           fi
-          FOUND_FIRMS=$(jq '[keys[] | select(test("^[0-9]+$"))] | length' "$HOME/.silverfin/config.json")
-          if [[ "${FOUND_FIRMS}" -lt "${EXPECTED_FIRMS}" ]]; then
-            echo "::error::[Action] config holds ${FOUND_FIRMS} firms, expected ${EXPECTED_FIRMS}, refusing to write CONFIG_JSON"
-            exit 1
-          fi
+          FOUND_FIRM_IDS=$(jq -r 'del(.defaultFirmIDs, .host) | keys[] | select(test("^[0-9]+$"))' "$HOME/.silverfin/config.json" | tr '\n' ' ')
+          for FIRM_ID in ${EXPECTED_FIRM_IDS}; do
+            if [[ " ${FOUND_FIRM_IDS} " != *" ${FIRM_ID} "* ]]; then
+              echo "::error::[Action] firm ${FIRM_ID} is missing from the config, refusing to write CONFIG_JSON"
+              exit 1
+            fi
+          done
           CONFIG_JSON=$(tr -d '\n' < "$HOME/.silverfin/config.json")
           echo "::add-mask::$CONFIG_JSON"
           echo "$CONFIG_JSON" | gh secret set CONFIG_JSON
