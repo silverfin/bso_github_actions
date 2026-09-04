@@ -15,6 +15,63 @@ jobs:
     uses: ./.github/workflows/check_auth.yml
     secrets: inherit
 
+  # `always() && result != 'success'`, not `if: failure()`: the latter is skipped outright when
+  # check-auth fails having run none of its own jobs - a startup_failure, or a run cancelled
+  # while still queued behind check_auth.yml's own `concurrency:` group. That zero-step shape
+  # would otherwise alert as silence.
+  alert-on-check-auth-failure:
+    needs: check-auth
+    if: always() && needs.check-auth.result != 'success'
+    runs-on: ubuntu-latest
+    # This job never calls the GitHub API - only secrets, needs outputs, and an external
+    # webhook - so it gets none of the default GITHUB_TOKEN permissions.
+    permissions: {}
+    steps:
+      # A job-level `if:` cannot read the `secrets` context, so "does this repo have a webhook"
+      # has to be a runtime guard here - this repo (bso_github_actions) has no CONFIG_JSON or
+      # SLACK_CI_ALERTS_WEBHOOK_URL of its own, so check-auth fails on every one of its own PRs
+      # by design, and this job must no-op rather than try to alert with an empty URL.
+      #
+      # Names the failing firm and echoes the CLI's own error line, sourced from check_auth.yml's
+      # failed_firms/failed_firms_summary outputs. Both are empty in two different shapes that
+      # must not be reported the same way, distinguished by refresh_completed - see
+      # check_auth.yml's own output description for what each shape means.
+      #
+      # Built with jq rather than interpolated straight into the curl `-d` string: the CLI error
+      # text is untrusted dynamic content and can contain quotes or newlines that would otherwise
+      # produce invalid JSON or break out of the payload.
+      - name: Alert Slack on check-auth failure
+        run: |
+          if [[ -z "${SLACK}" ]]; then
+            echo "No SLACK_CI_ALERTS_WEBHOOK_URL secret in this repository, skipping alert"
+            exit 0
+          fi
+          if [[ "${REFRESH_COMPLETED}" != "true" ]]; then
+            FIRMS="unknown"
+            DETAIL="the refresh loop did not finish - check the job log (a zero-step startup_failure/cancellation, or an early abort inside check_auth.yml's own refresh step, e.g. an invalid CONFIG_JSON or no firms in it)"
+          elif [[ -z "${FAILED_FIRMS}" ]]; then
+            FIRMS="none"
+            DETAIL="no firm failed its own token refresh - a later step (the CONFIG_JSON write-back, or its own firm-set validation) failed instead; check the job log"
+          else
+            FIRMS="${FAILED_FIRMS}"
+            DETAIL="${FAILED_SUMMARY}"
+          fi
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TEXT=$(printf '⚠️ check-auth failed in %s during a liquid-test run (%s) — firm(s): %s\n%s\n%s' \
+            "${{ github.repository }}" "${{ github.event_name }}" "$FIRMS" "$DETAIL" "$RUN_URL")
+          # This job also runs after check-auth is cancelled (always() matches 'cancelled', not
+          # just 'failure'), so a hard curl failure here (webhook down, network blip) must not
+          # flip that run's conclusion from cancelled to failed - the alert is best-effort.
+          curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
+            -X POST "$SLACK" -H 'Content-Type: application/json' \
+            --data-binary "$(jq -n --arg text "$TEXT" '{text: $text}')" \
+            || echo "::warning::failed to post the check-auth alert to Slack"
+        env:
+          SLACK: ${{ secrets.SLACK_CI_ALERTS_WEBHOOK_URL }}
+          FAILED_FIRMS: ${{ needs.check-auth.outputs.failed_firms }}
+          FAILED_SUMMARY: ${{ needs.check-auth.outputs.failed_firms_summary }}
+          REFRESH_COMPLETED: ${{ needs.check-auth.outputs.refresh_completed }}
+
   check-changed-templates:
     runs-on: ubuntu-latest
     outputs:
