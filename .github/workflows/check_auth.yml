@@ -7,11 +7,11 @@ on:
         description: "Space-separated firm IDs whose token refresh failed this run, if any."
         value: ${{ jobs.refresh-tokens.outputs.failed_firms }}
       failed_firms_summary:
-        description: "One line per failed firm: 'firm <id>: <CLI error>'."
+        description: "Single line, semicolon-separated: 'firm <id>: <CLI error>; firm <id>: <CLI error>'."
         value: ${{ jobs.refresh-tokens.outputs.failed_firms_summary }}
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   refresh-tokens:
@@ -67,17 +67,40 @@ jobs:
           # The ID set, not a count: a config that lost one firm and gained another numeric-looking
           # key would pass a count check.
           echo "EXPECTED_FIRM_IDS=$(tr '\n' ' ' <<< "${FIRM_IDS}")" >> "$GITHUB_ENV"
+          # Caps keep failed_firms_summary a single Slack-sized line even with many failures -
+          # GitHub's own job-output limit is 1MB, but an unbounded summary would still make a
+          # firm-refresh incident unreadable, or push a pathological run over that limit.
+          MAX_ERROR_LINE_LEN=200
+          MAX_SUMMARY_LEN=4000
           FAILED_FIRMS=""
           FAILED_SUMMARY=""
           while IFS= read -r FIRM_ID; do
             echo "[Action] refreshing token for firm ${FIRM_ID}"
             if ! node ./node_modules/silverfin-cli/bin/cli.js config --refresh-token "${FIRM_ID}" 2>&1 | tee /tmp/refresh-"${FIRM_ID}".log; then
-              ERROR_LINE=$(tail -1 /tmp/refresh-"${FIRM_ID}".log)
+              # silverfin-cli's refreshFirm always ends an HTTP failure with a generic "try
+              # running the authentication process again" line - tail -1 would report only that,
+              # dropping the actual "Response Status: 401 (...)" / "Error description: ..." lines
+              # printed just before it. Prefer those; fall back to the last non-empty line for any
+              # other failure shape (e.g. a network error with no HTTP response at all).
+              ERROR_LINE=$(grep -E 'Response Status|Error description' /tmp/refresh-"${FIRM_ID}".log | paste -sd' ' -)
+              if [[ -z "${ERROR_LINE}" ]]; then
+                ERROR_LINE=$(grep -v '^[[:space:]]*$' /tmp/refresh-"${FIRM_ID}".log | tail -1)
+              fi
+              if [[ ${#ERROR_LINE} -gt ${MAX_ERROR_LINE_LEN} ]]; then
+                ERROR_LINE="${ERROR_LINE:0:${MAX_ERROR_LINE_LEN}}... (truncated, see the job log)"
+              fi
               echo "::error::[Action] failed to refresh token for firm ${FIRM_ID}: ${ERROR_LINE}"
               FAILED_FIRMS="${FAILED_FIRMS:+${FAILED_FIRMS} }${FIRM_ID}"
-              FAILED_SUMMARY="${FAILED_SUMMARY}${FAILED_SUMMARY:+$'\n'}firm ${FIRM_ID}: ${ERROR_LINE}"
+              # A single line, not one per firm: $GITHUB_ENV/env: mappings in a caller workflow
+              # can't reliably carry a raw embedded newline through, and downstream Slack alerts
+              # want one line anyway.
+              FAILED_SUMMARY="${FAILED_SUMMARY}${FAILED_SUMMARY:+; }firm ${FIRM_ID}: ${ERROR_LINE}"
             fi
+            rm -f /tmp/refresh-"${FIRM_ID}".log
           done <<< "${FIRM_IDS}"
+          if [[ ${#FAILED_SUMMARY} -gt ${MAX_SUMMARY_LEN} ]]; then
+            FAILED_SUMMARY="${FAILED_SUMMARY:0:${MAX_SUMMARY_LEN}}... (truncated, see the job log for the rest)"
+          fi
           # REFRESH_COMPLETED distinguishes "the loop ran and these firms failed" from "the step
           # aborted before writing anything", which would otherwise look identical downstream.
           {
@@ -89,9 +112,7 @@ jobs:
           # workflow_call boundary, only declared outputs do.
           {
             echo "failed_firms=${FAILED_FIRMS}"
-            echo "failed_firms_summary<<GHOUTPUT_EOF"
-            echo "${FAILED_SUMMARY}"
-            echo "GHOUTPUT_EOF"
+            echo "failed_firms_summary=${FAILED_SUMMARY}"
           } >> "$GITHUB_OUTPUT"
       # `always()`: keeps the renewals that succeeded when another firm failed. Because it also runs
       # when an earlier step failed, the config must be shape-checked first - an empty or truncated
