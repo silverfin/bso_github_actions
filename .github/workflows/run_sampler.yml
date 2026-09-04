@@ -323,7 +323,21 @@ jobs:
           echo "Partner token rotated mid-run (401 refresh) — writing PARTNER_CONFIG_JSON_${PARTNER} back."
           CONFIG_JSON=$(cat "$HOME/.silverfin/config.json" | tr -d '\n')
           echo "::add-mask::${CONFIG_JSON}"
-          echo "$CONFIG_JSON" | gh secret set "PARTNER_CONFIG_JSON_${PARTNER}"
+          # Retry on a transient GitHub API error (502/503) rather than silently dropping this
+          # run's rotated token - a write failure here is a poisoning event, identical in effect
+          # to the CLI auto-renewing and the runner discarding it.
+          MAX_ATTEMPTS=3
+          ATTEMPT=1
+          until echo "$CONFIG_JSON" | gh secret set "PARTNER_CONFIG_JSON_${PARTNER}"; do
+            if (( ATTEMPT >= MAX_ATTEMPTS )); then
+              echo "::error::[Action] failed to write PARTNER_CONFIG_JSON_${PARTNER} after ${MAX_ATTEMPTS} attempts"
+              exit 1
+            fi
+            SLEEP=$(( 2 ** ATTEMPT ))
+            echo "::warning::[Action] gh secret set PARTNER_CONFIG_JSON_${PARTNER} failed (attempt ${ATTEMPT}/${MAX_ATTEMPTS}), retrying in ${SLEEP}s"
+            sleep "${SLEEP}"
+            ATTEMPT=$((ATTEMPT+1))
+          done
 
       - name: Download results.zip for the workflow artifact
         id: download

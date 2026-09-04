@@ -149,7 +149,22 @@ jobs:
           done
           CONFIG_JSON=$(tr -d '\n' < "$HOME/.silverfin/config.json")
           echo "::add-mask::$CONFIG_JSON"
-          echo "$CONFIG_JSON" | gh secret set CONFIG_JSON
+          # Retry on a transient GitHub API error (502/503) rather than losing this run's
+          # renewals outright - a write failure here is otherwise indistinguishable from the
+          # refresh loop itself failing, and forces the exact re-authorization dance R2 exists
+          # to avoid.
+          MAX_ATTEMPTS=3
+          ATTEMPT=1
+          until echo "$CONFIG_JSON" | gh secret set CONFIG_JSON; do
+            if (( ATTEMPT >= MAX_ATTEMPTS )); then
+              echo "::error::[Action] failed to write CONFIG_JSON after ${MAX_ATTEMPTS} attempts"
+              exit 1
+            fi
+            SLEEP=$(( 2 ** ATTEMPT ))
+            echo "::warning::[Action] gh secret set CONFIG_JSON failed (attempt ${ATTEMPT}/${MAX_ATTEMPTS}), retrying in ${SLEEP}s"
+            sleep "${SLEEP}"
+            ATTEMPT=$((ATTEMPT+1))
+          done
         env:
           GH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
       # Last, so an incomplete pass goes red without costing the write-back. A per-firm failure
