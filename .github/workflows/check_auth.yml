@@ -9,6 +9,9 @@ on:
       failed_firms_summary:
         description: "Single line, semicolon-separated: 'firm <id>: <CLI error>; firm <id>: <CLI error>'."
         value: ${{ jobs.refresh-tokens.outputs.failed_firms_summary }}
+      refresh_completed:
+        description: "\"true\" once the refresh loop has run to completion (whether or not any firm failed). Empty on a zero-step failure (startup_failure, or cancelled while queued) - and also empty if a later step (the CONFIG_JSON write-back, or its own validation) fails, even though every firm's own refresh succeeded. A caller must check this before treating empty failed_firms as \"nothing failed\"."
+        value: ${{ jobs.refresh-tokens.outputs.refresh_completed }}
 
 permissions:
   contents: read
@@ -18,6 +21,7 @@ jobs:
     outputs:
       failed_firms: ${{ steps.refresh.outputs.failed_firms }}
       failed_firms_summary: ${{ steps.refresh.outputs.failed_firms_summary }}
+      refresh_completed: ${{ steps.refresh.outputs.refresh_completed }}
     # There's missing feature within GitHub Actions where there's a max of 2 concurrent jobs that can be enqueued, if you exceed it, it will auto-cancel the job unfortunately and you need to manually re-run the "failed" job. A big thread for GitHub to add a feature for this is already open here: https://github.com/orgs/community/discussions/12835
     concurrency:
       group: refresh-tokens
@@ -109,10 +113,16 @@ jobs:
           } >> "$GITHUB_ENV"
           # Mirrored as step outputs (not just $GITHUB_ENV) so a caller of this reusable workflow
           # can name the failing firm in its own alert - env vars set here don't cross the
-          # workflow_call boundary, only declared outputs do.
+          # workflow_call boundary, only declared outputs do. refresh_completed is set here, at
+          # the end of this step, so it is empty for every exit above (config not a single
+          # object, no firms found) as well as for a zero-step startup_failure/cancellation - but
+          # "true" whenever this loop itself finished, even if a later step (the CONFIG_JSON
+          # write-back, or its own validation) is what ultimately fails the job. A caller must not
+          # read empty failed_firms plus this being "true" as "the refresh step never ran".
           {
             echo "failed_firms=${FAILED_FIRMS}"
             echo "failed_firms_summary=${FAILED_SUMMARY}"
+            echo "refresh_completed=true"
           } >> "$GITHUB_OUTPUT"
       # `always()`: keeps the renewals that succeeded when another firm failed. Because it also runs
       # when an earlier step failed, the config must be shape-checked first - an empty or truncated
