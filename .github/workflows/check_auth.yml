@@ -2,12 +2,26 @@ name: Check authentication
 run-name: Check authentication
 on:
   workflow_call:
+    outputs:
+      failed_firms:
+        description: "Space-separated firm IDs whose token refresh failed this run, if any."
+        value: ${{ jobs.refresh-tokens.outputs.failed_firms }}
+      failed_firms_summary:
+        description: "Single line, semicolon-separated: 'firm <id>: <CLI error>; firm <id>: <CLI error>'."
+        value: ${{ jobs.refresh-tokens.outputs.failed_firms_summary }}
+      refresh_completed:
+        description: "\"true\" once the refresh step's own loop has run to completion (whether or not any firm failed) - this stays \"true\" even if a *later* step (the CONFIG_JSON write-back, or its own validation) is what fails the job. Empty only if the refresh step itself never ran or exited early: a zero-step failure (startup_failure, or cancelled while queued), or an early validation failure inside that step (CONFIG_JSON not a single JSON object, or no firms found in it). A caller must check this before treating empty failed_firms as \"nothing failed\"."
+        value: ${{ jobs.refresh-tokens.outputs.refresh_completed }}
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   refresh-tokens:
+    outputs:
+      failed_firms: ${{ steps.refresh.outputs.failed_firms }}
+      failed_firms_summary: ${{ steps.refresh.outputs.failed_firms_summary }}
+      refresh_completed: ${{ steps.refresh.outputs.refresh_completed }}
     # There's missing feature within GitHub Actions where there's a max of 2 concurrent jobs that can be enqueued, if you exceed it, it will auto-cancel the job unfortunately and you need to manually re-run the "failed" job. A big thread for GitHub to add a feature for this is already open here: https://github.com/orgs/community/discussions/12835
     concurrency:
       group: refresh-tokens
@@ -37,7 +51,9 @@ jobs:
       # Record failures and fail the job in a later step instead. Firm IDs are logged on purpose -
       # they are not secrets, and the alert has to name the firm that was not refreshed.
       - name: Refresh tokens
+        id: refresh
         run: |
+          set -o pipefail
           # Enumerated into a variable rather than straight into the `for` word list: a jq failure
           # inside `$(...)` there leaves zero loop items and still exits 0, which would report every
           # firm as refreshed. An assignment lets `bash -e` catch it.
@@ -55,20 +71,65 @@ jobs:
           # The ID set, not a count: a config that lost one firm and gained another numeric-looking
           # key would pass a count check.
           echo "EXPECTED_FIRM_IDS=$(tr '\n' ' ' <<< "${FIRM_IDS}")" >> "$GITHUB_ENV"
+          # Caps keep failed_firms_summary a single Slack-sized line even with many failures -
+          # GitHub's own job-output limit is 1MB, but an unbounded summary would still make a
+          # firm-refresh incident unreadable, or push a pathological run over that limit.
+          MAX_ERROR_LINE_LEN=200
+          MAX_SUMMARY_LEN=4000
           FAILED_FIRMS=""
+          FAILED_SUMMARY=""
           while IFS= read -r FIRM_ID; do
             echo "[Action] refreshing token for firm ${FIRM_ID}"
-            if ! node ./node_modules/silverfin-cli/bin/cli.js config --refresh-token "${FIRM_ID}"; then
-              echo "::error::[Action] failed to refresh token for firm ${FIRM_ID}"
+            if ! node ./node_modules/silverfin-cli/bin/cli.js config --refresh-token "${FIRM_ID}" 2>&1 | tee /tmp/refresh-"${FIRM_ID}".log; then
+              # silverfin-cli's refreshFirm always ends an HTTP failure with a generic "try
+              # running the authentication process again" line - tail -1 would report only that,
+              # dropping the actual "Response Status: 401 (...)" / "Error description: ..." lines
+              # printed just before it. Prefer those; fall back to the last non-empty line for any
+              # other failure shape (e.g. a network error with no HTTP response at all).
+              # `|| true` on both: under this shell's `-e`/`pipefail`, a `grep` with no match
+              # exits 1 and that status survives the pipe into `paste`/`tail`, which would abort
+              # the whole step right here on any non-HTTP failure (network error, DNS, etc.) -
+              # before the fallback below ever runs, and before failed_firms/refresh_completed
+              # are ever written. Confirmed empirically: `set -eo pipefail; X=$(grep nomatch f |
+              # cmd)` exits the script without reaching the next line.
+              ERROR_LINE=$(grep -E 'Response Status|Error description' /tmp/refresh-"${FIRM_ID}".log | paste -sd' ' - || true)
+              if [[ -z "${ERROR_LINE}" ]]; then
+                ERROR_LINE=$(grep -v '^[[:space:]]*$' /tmp/refresh-"${FIRM_ID}".log | tail -1 || true)
+              fi
+              if [[ ${#ERROR_LINE} -gt ${MAX_ERROR_LINE_LEN} ]]; then
+                ERROR_LINE="${ERROR_LINE:0:${MAX_ERROR_LINE_LEN}}... (truncated, see the job log)"
+              fi
+              echo "::error::[Action] failed to refresh token for firm ${FIRM_ID}: ${ERROR_LINE}"
               FAILED_FIRMS="${FAILED_FIRMS:+${FAILED_FIRMS} }${FIRM_ID}"
+              # A single line, not one per firm: $GITHUB_ENV/env: mappings in a caller workflow
+              # can't reliably carry a raw embedded newline through, and downstream Slack alerts
+              # want one line anyway.
+              FAILED_SUMMARY="${FAILED_SUMMARY}${FAILED_SUMMARY:+; }firm ${FIRM_ID}: ${ERROR_LINE}"
             fi
+            rm -f /tmp/refresh-"${FIRM_ID}".log
           done <<< "${FIRM_IDS}"
+          if [[ ${#FAILED_SUMMARY} -gt ${MAX_SUMMARY_LEN} ]]; then
+            FAILED_SUMMARY="${FAILED_SUMMARY:0:${MAX_SUMMARY_LEN}}... (truncated, see the job log for the rest)"
+          fi
           # REFRESH_COMPLETED distinguishes "the loop ran and these firms failed" from "the step
           # aborted before writing anything", which would otherwise look identical downstream.
           {
             echo "REFRESH_FAILED_FIRMS=${FAILED_FIRMS}"
             echo "REFRESH_COMPLETED=true"
           } >> "$GITHUB_ENV"
+          # Mirrored as step outputs (not just $GITHUB_ENV) so a caller of this reusable workflow
+          # can name the failing firm in its own alert - env vars set here don't cross the
+          # workflow_call boundary, only declared outputs do. refresh_completed is set here, at
+          # the end of this step, so it is empty for every exit above (config not a single
+          # object, no firms found) as well as for a zero-step startup_failure/cancellation - but
+          # "true" whenever this loop itself finished, even if a later step (the CONFIG_JSON
+          # write-back, or its own validation) is what ultimately fails the job. A caller must not
+          # read empty failed_firms plus this being "true" as "the refresh step never ran".
+          {
+            echo "failed_firms=${FAILED_FIRMS}"
+            echo "failed_firms_summary=${FAILED_SUMMARY}"
+            echo "refresh_completed=true"
+          } >> "$GITHUB_OUTPUT"
       # `always()`: keeps the renewals that succeeded when another firm failed. Because it also runs
       # when an earlier step failed, the config must be shape-checked first - an empty or truncated
       # file here would overwrite every firm's tokens.
