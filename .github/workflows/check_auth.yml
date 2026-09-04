@@ -86,9 +86,15 @@ jobs:
               # dropping the actual "Response Status: 401 (...)" / "Error description: ..." lines
               # printed just before it. Prefer those; fall back to the last non-empty line for any
               # other failure shape (e.g. a network error with no HTTP response at all).
-              ERROR_LINE=$(grep -E 'Response Status|Error description' /tmp/refresh-"${FIRM_ID}".log | paste -sd' ' -)
+              # `|| true` on both: under this shell's `-e`/`pipefail`, a `grep` with no match
+              # exits 1 and that status survives the pipe into `paste`/`tail`, which would abort
+              # the whole step right here on any non-HTTP failure (network error, DNS, etc.) -
+              # before the fallback below ever runs, and before failed_firms/refresh_completed
+              # are ever written. Confirmed empirically: `set -eo pipefail; X=$(grep nomatch f |
+              # cmd)` exits the script without reaching the next line.
+              ERROR_LINE=$(grep -E 'Response Status|Error description' /tmp/refresh-"${FIRM_ID}".log | paste -sd' ' - || true)
               if [[ -z "${ERROR_LINE}" ]]; then
-                ERROR_LINE=$(grep -v '^[[:space:]]*$' /tmp/refresh-"${FIRM_ID}".log | tail -1)
+                ERROR_LINE=$(grep -v '^[[:space:]]*$' /tmp/refresh-"${FIRM_ID}".log | tail -1 || true)
               fi
               if [[ ${#ERROR_LINE} -gt ${MAX_ERROR_LINE_LEN} ]]; then
                 ERROR_LINE="${ERROR_LINE:0:${MAX_ERROR_LINE_LEN}}... (truncated, see the job log)"
