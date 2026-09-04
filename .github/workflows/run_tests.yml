@@ -23,6 +23,9 @@ jobs:
     needs: check-auth
     if: always() && needs.check-auth.result != 'success'
     runs-on: ubuntu-latest
+    # This job never calls the GitHub API - only secrets, needs outputs, and an external
+    # webhook - so it gets none of the default GITHUB_TOKEN permissions.
+    permissions: {}
     steps:
       # A job-level `if:` cannot read the `secrets` context, so "does this repo have a webhook"
       # has to be a runtime guard here - this repo (bso_github_actions) has no CONFIG_JSON or
@@ -56,9 +59,13 @@ jobs:
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           TEXT=$(printf '⚠️ check-auth failed in %s during a liquid-test run (%s) — firm(s): %s\n%s\n%s' \
             "${{ github.repository }}" "${{ github.event_name }}" "$FIRMS" "$DETAIL" "$RUN_URL")
+          # This job also runs after check-auth is cancelled (always() matches 'cancelled', not
+          # just 'failure'), so a hard curl failure here (webhook down, network blip) must not
+          # flip that run's conclusion from cancelled to failed - the alert is best-effort.
           curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
             -X POST "$SLACK" -H 'Content-Type: application/json' \
-            --data-binary "$(jq -n --arg text "$TEXT" '{text: $text}')"
+            --data-binary "$(jq -n --arg text "$TEXT" '{text: $text}')" \
+            || echo "::warning::failed to post the check-auth alert to Slack"
         env:
           SLACK: ${{ secrets.SLACK_CI_ALERTS_WEBHOOK_URL }}
           FAILED_FIRMS: ${{ needs.check-auth.outputs.failed_firms }}
