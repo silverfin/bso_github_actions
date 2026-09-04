@@ -1,3 +1,6 @@
+# Reader-only on CONFIG_JSON: it never refreshes tokens and never writes the secret back (avoids
+# becoming a concurrent writer of CONFIG_JSON, racing check_auth.yml's refresher). It relies on
+# the existing refresher to keep the secret fresh.
 name: add-shared-parts-review
 run-name: Add shared parts to the functional review firm
 # We run this action when a "add-shared-parts-review-firm" label is added to the PR
@@ -48,6 +51,12 @@ jobs:
           mkdir -p $HOME/.silverfin/
           touch $HOME/.silverfin/config.json
           echo '${{ secrets.CONFIG_JSON }}' > $HOME/.silverfin/config.json
+          # Blank every firm's refreshToken so an expired access token fails cleanly on a 401
+          # instead of silently rotating (and poisoning) the shared CONFIG_JSON secret this
+          # workflow never writes back to.
+          jq 'to_entries | map(if (.key|test("^[0-9]+$")) then .value.refreshToken = "" else . end) | from_entries' \
+            $HOME/.silverfin/config.json > $HOME/.silverfin/config.stripped.json
+          mv $HOME/.silverfin/config.stripped.json $HOME/.silverfin/config.json
           node ./node_modules/silverfin-cli/bin/cli.js config --set-firm="${{ vars.FIRM_ID_REVIEW }}"
           node ./node_modules/silverfin-cli/bin/cli.js config --get-firm
       - name: Add shared parts
@@ -67,15 +76,3 @@ jobs:
               repo: context.repo.repo,
               body: 'All Shared parts were added succesfully to the "Staging firm"'
             })
-      - name: Prepare CONFIG_JSON for secret
-        if: always()
-        run: |
-          CONFIG_JSON=$(cat $HOME/.silverfin/config.json | tr -d '\n')
-          echo "CONFIG_JSON=${CONFIG_JSON}" >> $GITHUB_ENV
-      - name: Store CONFIG_JSON as secret
-        uses: gliech/create-github-secret-action@v1
-        if: always()
-        with:
-          name: CONFIG_JSON
-          value: "${{ env.CONFIG_JSON }}"
-          pa_token: ${{ secrets.REPO_ACCESS_TOKEN }}
