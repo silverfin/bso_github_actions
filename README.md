@@ -41,6 +41,7 @@ The document will go over all the Github Actions that currently automate a coupl
     * [Remove Code Review Label (remove_code_review_label.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf2828559422d84087b81255dc8)
   * [Authentication](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf4f743db4b6854130af8693671)
     * [Check authentication (check_auth.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf73af65c6455e4bb6a62454b15)
+    * [Token refresh (refresh_token.yml in each market repo)](#token-refresh-refresh_tokenyml-in-each-market-repo)
   * [Testing](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf13d6dbd0df1e4450b3b22691c)
     * [Check YAML files (check_tests.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf931fa1547b4b419d940464f89)
     * [Run liquid tests (run_tests.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBfa4878bb5baac49cbb0c39d927)
@@ -98,9 +99,10 @@ _Trigger_:
 _Description_:
 Refreshes Silverfin API tokens to ensure authentication remains valid for subsequent operations.
 
-_Trigger_: 
+_Trigger_:
 
-* The authentication workflow is run before the `run-tests` workflow to make sure that we always have the correct authentication before communicating with the platform. 
+* Called by each market repo's own scheduled `refresh_token.yml` wrapper (a `*/10` cron). It is **not** called by `run_tests.yml` any more - see [Token refresh](#token-refresh-refresh_tokenyml-in-each-market-repo) for why the two were decoupled.
+* A `schedule:` trigger only fires from the repository that contains the workflow file, so the cron lives in each caller repo rather than here.
 
 
 _Steps:_
@@ -116,8 +118,35 @@ _Prerequisites_:
 * `SF_API_CLIENT_ID`: Silverfin API client ID
 * `SF_API_SECRET`: Silverfin API secret
 * `CONFIG_JSON`: Silverfin configuration file content
-* `REPO_ACCESS_TOKEN`: GitHub personal access token
+* `REPO_ACCESS_TOKEN`: GitHub personal access token (used for the `gh secret set` write-back; the implicit `GITHUB_TOKEN` cannot write secrets)
 
+
+#### Token refresh (`refresh_token.yml` in each market repo)
+
+_Why this exists_:
+
+`silverfin-cli` refreshes an access token transparently on **any** 401, for any command - and Silverfin rotates the refresh token server-side when it does. The rotated pair is only written to the runner's local `~/.silverfin/config.json`, never back to the secret, so `CONFIG_JSON` is left holding an already-consumed refresh token. The next explicit refresh then fails with `invalid_grant` and that firm needs a **manual re-authorization** before its CI works again. This happened in `be_market` on 2026-07-14 (firm 400583).
+
+The fix has two halves, and both are needed:
+
+1. **One scheduled writer.** A `refresh_token.yml` in the market repo, on a `*/10` cron, is the only thing that ever refreshes tokens or writes `CONFIG_JSON`.
+2. **Read-only consumers.** `run_tests.yml` and `push_to_review_firm.yml` load `CONFIG_JSON` with every firm's `refreshToken` blanked, so a stale access token fails its 401 cleanly instead of rotating anything.
+
+Live in `be_market` since 2026-07-24.
+
+_Adopter checklist_ (per market repo):
+
+* [ ] Add `.github/workflows/refresh_token.yml`: `on: schedule` (`*/10 * * * *`) + `workflow_dispatch`, calling `silverfin/bso_github_actions/.github/workflows/check_auth.yml@main` with `secrets: inherit`. Copy an existing market's file - `nl_market`, `uk_market`, `lu_market` and `be_market` all run the same one.
+* [ ] Set `permissions: contents: write` at the workflow level. This is **required, not cosmetic**: a caller-level `permissions:` block more restrictive than the callee's own top-level block makes the run fail with `startup_failure` before any job is created, with no job-level error to explain it (`gh api repos/<repo>/actions/runs/<id>/jobs` returning an empty `jobs` array is the signal). GitHub does not intersect permissions down to the caller's scope.
+* [ ] Use `secrets: inherit`, not a named list - `check_auth.yml`'s `workflow_call` trigger declares no `secrets:` block, and GitHub rejects an explicit map to a reusable workflow that has not declared matching names.
+* [ ] Provision the secrets: `SF_API_CLIENT_ID`, `SF_API_SECRET`, `CONFIG_JSON`, `REPO_ACCESS_TOKEN`, and `SLACK_CI_ALERTS_WEBHOOK_URL` for the failure alert. The Slack secret reuses the shared CI-alerts Workflow Builder trigger - one Slack workflow serves every repo, so do not create a new one and never hit *Regenerate URL* (it invalidates the URL for every repo already using it). The trigger takes a single `text` variable; the alert interpolates `github.repository` so one channel still identifies the market.
+* [ ] **Merge the cron before anything stops refreshing.** If the market starts consuming `CONFIG_JSON` read-only without a live cron, every firm's access token lapses within its 2h TTL and all liquid tests fail. The interim state (cron live *and* an older coupled refresher) is safe: `check_auth.yml`'s own job declares `concurrency: { group: refresh-tokens }`, and concurrency groups are repository-scoped, so the two serialize.
+* [ ] Verify post-merge: a `schedule`-triggered run appears green within ~10-20 minutes (`gh run list --workflow refresh_token.yml`), and `gh secret list` shows `CONFIG_JSON` with a fresh timestamp. `schedule` and `workflow_dispatch` only register from the default branch, so this cannot be tested from a PR branch.
+
+_Known limitations_ (both tracked, neither a token-safety issue):
+
+* `check_auth.yml`'s refresh loop is not fault-isolated per firm: under `bash -e`, one firm's failed refresh aborts the step and skips the write-back, so no firm's refreshed token is persisted for that tick. Transient failures self-heal on the next tick; a genuinely dead refresh token needs the manual re-authorization the Slack alert surfaces.
+* Cadence is nominal only. GitHub's `schedule` queue is best-effort - measured gaps between consecutive `*/10` runs range from ~20 to ~85 minutes, worst overnight - which is why the cadence is `*/10` against a 2h TTL rather than something looser.
 
 
 ### Testing
@@ -147,7 +176,7 @@ _Trigger_:
 
 _Steps:_
 
-* Calls `check_auth.yml` to refresh tokens
+* Loads `CONFIG_JSON` read-only, blanking every firm's `refreshToken` so the job can never rotate or poison the shared token (it does **not** refresh tokens - the caller repo's [`refresh_token.yml`](#token-refresh-refresh_tokenyml-in-each-market-repo) cron does that, and is a prerequisite)
 * Identifies changed liquid/config files
 * Determines which templates need testing
 * Runs liquid tests using silverfin-cli `run-test` command

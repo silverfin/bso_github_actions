@@ -1,3 +1,24 @@
+# Read-only consumer of CONFIG_JSON. This workflow never refreshes a Silverfin token and never
+# writes the CONFIG_JSON secret back: every firm's refreshToken is blanked before the CLI runs, so
+# an expired access token fails its 401 cleanly instead of silverfin-cli's auto-refresh-on-401
+# silently rotating the shared token server-side and orphaning the rotated pair on the ephemeral
+# runner (which is what poisons CONFIG_JSON and forces a manual re-authorization).
+#
+# Each caller repo refreshes its own tokens with a scheduled refresh_token.yml (*/10 cron calling
+# check_auth.yml), which is that repo's SOLE writer of CONFIG_JSON. That wrapper is a prerequisite
+# for this workflow: without it nothing refreshes the caller's tokens and every firm's access token
+# lapses within its 2h TTL. See the README's "Token refresh (refresh_token.yml in each market
+# repo)" section for the adopter checklist.
+#
+# Validated in be_market (forked inline there in be_market#3047, live since 2026-07-24); the same
+# strip mechanism is used by push_to_review_firm.yml (#29).
+#
+# Known limitation (CLI-side, tracked separately): if a firm's access token has already expired
+# when this job runs, blanking its refreshToken does not fail just that one template -
+# silverfin-cli still attempts a refresh with the blanked token, fails, and exits the process,
+# which loses the verdict for every handle batched in the same `run-test --status` call. That is a
+# CI-reliability failure (a re-runnable false negative), never a token-poisoning one, since this
+# job has no write-back path at all.
 name: run-liquid-tests
 run-name: Run liquid tests of updated reconciliations and reconciliations that use updated shared parts
 on:
@@ -11,10 +32,6 @@ on:
       - "main"
 
 jobs:
-  check-auth:
-    uses: ./.github/workflows/check_auth.yml
-    secrets: inherit
-
   check-changed-templates:
     runs-on: ubuntu-latest
     outputs:
@@ -98,7 +115,7 @@ jobs:
       # run never completed). Genuine test failures are never retried.
       MAX_TEST_ATTEMPTS: 3
     if: ${{ needs.check-changed-templates.outputs.changed_templates != '[]' }}
-    needs: [check-auth, check-changed-templates]
+    needs: [check-changed-templates]
     steps:
       - name: Checkout Repository - Fetch all history for all tags and branches
         uses: actions/checkout@v6
@@ -108,11 +125,21 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 22
-      - name: Load Silverfin config file from secrets
+      - name: Load Silverfin config file from secrets (read-only, no-poison)
+        env:
+          # Passed via env, not interpolated into the script text: CONFIG_JSON is a secret blob of
+          # JSON that could contain a single quote or backtick, which would otherwise break out of
+          # a quoted `echo '...'` literal and let the secret's own content run as shell commands.
+          CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
         run: |
-          mkdir -p $HOME/.silverfin/
-          touch $HOME/.silverfin/config.json
-          echo '${{ secrets.CONFIG_JSON }}' > $HOME/.silverfin/config.json
+          mkdir -p "$HOME/.silverfin/"
+          printf '%s' "${CONFIG_JSON}" > "$HOME/.silverfin/config.json"
+          # Blank every firm's refreshToken so an expired access token fails cleanly on a 401
+          # instead of silently rotating (and poisoning) the shared CONFIG_JSON secret this job
+          # never writes back to. The caller's refresh_token.yml cron is its sole writer.
+          jq 'to_entries | map(if (.key|test("^[0-9]+$")) then .value.refreshToken = "" else . end) | from_entries' \
+            "$HOME/.silverfin/config.json" > "$HOME/.silverfin/config.stripped.json"
+          mv "$HOME/.silverfin/config.stripped.json" "$HOME/.silverfin/config.json"
       - name: Add silverfin-cli package latest version
         run: |
           npm install https://github.com/silverfin/silverfin-cli.git
