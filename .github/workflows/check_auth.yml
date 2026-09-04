@@ -10,7 +10,7 @@ on:
         description: "Single line, semicolon-separated: 'firm <id>: <CLI error>; firm <id>: <CLI error>'."
         value: ${{ jobs.refresh-tokens.outputs.failed_firms_summary }}
       refresh_completed:
-        description: "\"true\" once the refresh loop has run to completion (whether or not any firm failed). Empty on a zero-step failure (startup_failure, or cancelled while queued) - and also empty if a later step (the CONFIG_JSON write-back, or its own validation) fails, even though every firm's own refresh succeeded. A caller must check this before treating empty failed_firms as \"nothing failed\"."
+        description: "\"true\" once the refresh step's own loop has run to completion (whether or not any firm failed) - this stays \"true\" even if a *later* step (the CONFIG_JSON write-back, or its own validation) is what fails the job. Empty only if the refresh step itself never ran or exited early: a zero-step failure (startup_failure, or cancelled while queued), or an early validation failure inside that step (CONFIG_JSON not a single JSON object, or no firms found in it). A caller must check this before treating empty failed_firms as \"nothing failed\"."
         value: ${{ jobs.refresh-tokens.outputs.refresh_completed }}
 
 permissions:
