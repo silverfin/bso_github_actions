@@ -149,7 +149,30 @@ jobs:
           done
           CONFIG_JSON=$(tr -d '\n' < "$HOME/.silverfin/config.json")
           echo "::add-mask::$CONFIG_JSON"
-          echo "$CONFIG_JSON" | gh secret set CONFIG_JSON
+          # Retry on a transient GitHub API error (5xx) rather than losing this run's renewals
+          # outright - a write failure here is otherwise indistinguishable from the refresh loop
+          # itself failing, and forces the exact re-authorization dance R2 exists to avoid. A
+          # permanent failure (bad token scope, rejected input) is never going to succeed on
+          # retry, so it fails immediately instead of burning attempts and backoff on it.
+          MAX_ATTEMPTS=3
+          ATTEMPT=1
+          while true; do
+            if ERR=$(echo "$CONFIG_JSON" | gh secret set CONFIG_JSON 2>&1); then
+              break
+            fi
+            if ! grep -qE 'HTTP 5[0-9]{2}' <<< "${ERR}"; then
+              echo "::error::[Action] failed to write CONFIG_JSON (non-transient failure): ${ERR}"
+              exit 1
+            fi
+            if (( ATTEMPT >= MAX_ATTEMPTS )); then
+              echo "::error::[Action] failed to write CONFIG_JSON after ${MAX_ATTEMPTS} attempts: ${ERR}"
+              exit 1
+            fi
+            SLEEP=$(( 2 ** ATTEMPT ))
+            echo "::warning::[Action] gh secret set CONFIG_JSON failed with a transient error (attempt ${ATTEMPT}/${MAX_ATTEMPTS}), retrying in ${SLEEP}s"
+            sleep "${SLEEP}"
+            ATTEMPT=$((ATTEMPT+1))
+          done
         env:
           GH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
       # Last, so an incomplete pass goes red without costing the write-back. A per-firm failure
