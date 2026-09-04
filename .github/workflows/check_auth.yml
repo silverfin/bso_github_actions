@@ -41,8 +41,10 @@ jobs:
           # Enumerated into a variable rather than straight into the `for` word list: a jq failure
           # inside `$(...)` there leaves zero loop items and still exits 0, which would report every
           # firm as refreshed. An assignment lets `bash -e` catch it.
-          if [[ ! -s "$HOME/.silverfin/config.json" ]] || ! jq -e 'type == "object"' "$HOME/.silverfin/config.json" > /dev/null 2>&1; then
-            echo "::error::[Action] the CONFIG_JSON secret is empty, or not a JSON object"
+          # Slurped: without it jq validates a stream of several top-level values one by one and
+          # reports the last, and the write-back would concatenate them into invalid JSON.
+          if ! jq -e -s 'length == 1 and (.[0] | type == "object")' "$HOME/.silverfin/config.json" > /dev/null 2>&1; then
+            echo "::error::[Action] the CONFIG_JSON secret is empty, or not a single JSON object"
             exit 1
           fi
           FIRM_IDS=$(jq -r 'del(.defaultFirmIDs, .host) | keys[] | select(test("^[0-9]+$"))' "$HOME/.silverfin/config.json")
