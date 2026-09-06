@@ -139,16 +139,19 @@ jobs:
               if SEEDED_FLAGS=$(jq -r 'to_entries | map(select((.key|test("^[0-9]+$")) and (.value|type == "object")) | "\(.key)=\(.value.autoRenew)") | join(" ")' "$HOME/.silverfin/config.json"); then
                 echo "[Action] autoRenew flag present for firm(s): ${SEEDED_FLAGS}"
               fi
-              # The seeded ID set, not a boolean: the write-back needs to know *which* firms to
-              # assert on, and an empty value there also means "seeding never ran" - that step is
-              # `if: always()`, so it is reached even when this one aborts.
+              # The set to assert on, not "the firms this run changed": every object-shaped firm
+              # carrying the flag once seeding is done. Narrowing this to the firms that were
+              # *missing* the flag beforehand would empty it on every run after the first - the
+              # steady state - so the round trip would be checked once and never again. An empty
+              # value here also means "seeding never ran", since the write-back is `if: always()`
+              # and is reached even when this step aborts.
               # `&& [[ -n ... ]]`, not just the exit status: jq exits 0 and prints an empty string
               # when no numeric key holds an object (every firm record a scalar), and an empty value
               # here skips the write-back's assertion entirely - a green run that checked nothing,
               # which is the one outcome worse than failing.
-              if SEEDED_FIRMS=$(jq -r 'to_entries | map(select((.key|test("^[0-9]+$")) and (.value|type == "object")) | .key) | join(" ")' "$HOME/.silverfin/config.json") \
-                 && [[ -n "${SEEDED_FIRMS}" ]]; then
-                echo "AUTO_RENEW_SEEDED_FIRMS=${SEEDED_FIRMS}" >> "$GITHUB_ENV"
+              if CHECK_FIRMS=$(jq -r 'to_entries | map(select((.key|test("^[0-9]+$")) and (.value|type == "object")) | .key) | join(" ")' "$HOME/.silverfin/config.json") \
+                 && [[ -n "${CHECK_FIRMS}" ]]; then
+                echo "AUTO_RENEW_CHECK_FIRMS=${CHECK_FIRMS}" >> "$GITHUB_ENV"
               else
                 echo "::warning::[Action] no firm was seeded with an autoRenew flag, so the round-trip is not asserted this run - check whether any firm record in CONFIG_JSON is a JSON object"
               fi
@@ -238,9 +241,9 @@ jobs:
           # unseeded config as a CLI regression. The set is every object-shaped firm present when
           # seeding ran; scalar records are excluded, since the seed leaves those alone and must
           # not fail the run over them.
-          if [[ -n "${AUTO_RENEW_SEEDED_FIRMS}" ]]; then
+          if [[ -n "${AUTO_RENEW_CHECK_FIRMS}" ]]; then
             AUTO_RENEW_LOST=""
-            for FIRM_ID in ${AUTO_RENEW_SEEDED_FIRMS}; do
+            for FIRM_ID in ${AUTO_RENEW_CHECK_FIRMS}; do
               # A present-but-null autoRenew is a dropped flag too, so check the type rather than
               # `has`. `type == "object" and ...` short-circuits, which keeps a firm record the CLI
               # replaced with a scalar from turning this into a raw jq error.

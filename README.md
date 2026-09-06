@@ -102,7 +102,9 @@ _Inputs:_
 
 * `seed_no_auto_renew` (boolean, optional, default `false`) - when `true`, ensures every firm in the
   calling repository's `CONFIG_JSON` carries an `autoRenew` flag, and fails the job if the CLI does
-  not preserve it through a refresh. **The flag is written into the caller's own `CONFIG_JSON`
+  not preserve it through a refresh. Only top-level numeric firm IDs whose value is a JSON object
+  are seeded or asserted on; a firm record that is a scalar is left exactly as it is and is not
+  included in the round-trip check, since there is nothing on it to set a flag on. **The flag is written into the caller's own `CONFIG_JSON`
   secret, so a single enabled run affects every workflow in that repository from then on, and this
   workflow has no way to remove it again.** Nothing reads the flag yet, so enabling it changes no
   renewal behaviour today - the only new effect is the round-trip check itself, which can fail the
