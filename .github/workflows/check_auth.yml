@@ -142,12 +142,15 @@ jobs:
               # The seeded ID set, not a boolean: the write-back needs to know *which* firms to
               # assert on, and an empty value there also means "seeding never ran" - that step is
               # `if: always()`, so it is reached even when this one aborts.
-              if SEEDED_FIRMS=$(jq -r 'to_entries | map(select((.key|test("^[0-9]+$")) and (.value|type == "object")) | .key) | join(" ")' "$HOME/.silverfin/config.json"); then
+              # `&& [[ -n ... ]]`, not just the exit status: jq exits 0 and prints an empty string
+              # when no numeric key holds an object (every firm record a scalar), and an empty value
+              # here skips the write-back's assertion entirely - a green run that checked nothing,
+              # which is the one outcome worse than failing.
+              if SEEDED_FIRMS=$(jq -r 'to_entries | map(select((.key|test("^[0-9]+$")) and (.value|type == "object")) | .key) | join(" ")' "$HOME/.silverfin/config.json") \
+                 && [[ -n "${SEEDED_FIRMS}" ]]; then
                 echo "AUTO_RENEW_SEEDED_FIRMS=${SEEDED_FIRMS}" >> "$GITHUB_ENV"
               else
-                # Without this the write-back's assertion is skipped for an empty list and the run
-                # goes green having checked nothing - the one outcome worse than failing.
-                echo "::warning::[Action] could not record which firms were seeded, so the autoRenew round-trip is not asserted this run"
+                echo "::warning::[Action] no firm was seeded with an autoRenew flag, so the round-trip is not asserted this run - check whether any firm record in CONFIG_JSON is a JSON object"
               fi
             else
               rm -f "$HOME/.silverfin/config.seeded.json"
@@ -246,16 +249,18 @@ jobs:
               fi
             done
             if [[ -n "${AUTO_RENEW_LOST}" ]]; then
-              # Capped like every other operator-facing firm list in this workflow.
+              # The full list is logged and exported; only the annotation is capped. Truncating the
+              # exported value would cut mid-ID and break `auto_renew_lost`'s own contract of
+              # space-separated firm IDs, and "see the job log" has to point at something - so the
+              # log gets the untruncated list.
+              echo "[Action] autoRenew flag not preserved for firm(s): ${AUTO_RENEW_LOST}"
               MAX_FIRM_LIST_LEN=200
-              if [[ ${#AUTO_RENEW_LOST} -gt ${MAX_FIRM_LIST_LEN} ]]; then
-                AUTO_RENEW_LOST="${AUTO_RENEW_LOST:0:${MAX_FIRM_LIST_LEN}}... (truncated, see the job log)"
+              AUTO_RENEW_LOST_MSG="${AUTO_RENEW_LOST}"
+              if [[ ${#AUTO_RENEW_LOST_MSG} -gt ${MAX_FIRM_LIST_LEN} ]]; then
+                AUTO_RENEW_LOST_MSG="${AUTO_RENEW_LOST_MSG:0:${MAX_FIRM_LIST_LEN}}... (truncated, see the job log)"
               fi
-              echo "::warning::[Action] autoRenew flag not preserved for firm(s): ${AUTO_RENEW_LOST} - still writing CONFIG_JSON to keep this run's renewals"
+              echo "::warning::[Action] autoRenew flag not preserved for firm(s): ${AUTO_RENEW_LOST_MSG} - still writing CONFIG_JSON to keep this run's renewals"
               echo "AUTO_RENEW_LOST=${AUTO_RENEW_LOST}" >> "$GITHUB_ENV"
-              # Also an output: without it a caller sees refresh_completed=true and empty
-              # failed_firms, and reports this as a write-back failure - which it is not.
-              echo "auto_renew_lost=${AUTO_RENEW_LOST}" >> "$GITHUB_OUTPUT"
             else
               echo "[Action] autoRenew flag survived the refresh for all firms"
             fi
@@ -286,6 +291,12 @@ jobs:
             sleep "${SLEEP}"
             ATTEMPT=$((ATTEMPT+1))
           done
+          # Published only now, after the write actually succeeded. Set before the retry loop it
+          # would survive a permanent write failure, and a caller reading it would announce "every
+          # token refreshed and CONFIG_JSON was written" for the run that just lost its renewals.
+          if [[ -n "${AUTO_RENEW_LOST}" ]]; then
+            echo "auto_renew_lost=${AUTO_RENEW_LOST}" >> "$GITHUB_OUTPUT"
+          fi
         env:
           GH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
       # Last, so an incomplete pass goes red without costing the write-back. A per-firm failure

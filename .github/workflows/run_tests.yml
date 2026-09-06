@@ -52,6 +52,11 @@ jobs:
           elif [[ -n "${FAILED_FIRMS}" ]]; then
             FIRMS="${FAILED_FIRMS}"
             DETAIL="${FAILED_SUMMARY}"
+            # Appended, not a separate branch: first match wins, so a run that hit both failures
+            # would otherwise never mention the dropped flag outside the job log.
+            if [[ -n "${AUTO_RENEW_LOST}" ]]; then
+              DETAIL="${DETAIL} | also: the CLI did not preserve the autoRenew flag for firm(s): ${AUTO_RENEW_LOST}"
+            fi
           elif [[ -n "${AUTO_RENEW_LOST}" ]]; then
             # Checked before the catch-all below, which would otherwise blame the write-back for a
             # run where the write-back succeeded. Only ever set for a caller that opted into

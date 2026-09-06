@@ -105,7 +105,8 @@ _Inputs:_
   not preserve it through a refresh. **The flag is written into the caller's own `CONFIG_JSON`
   secret, so a single enabled run affects every workflow in that repository from then on, and this
   workflow has no way to remove it again.** Nothing reads the flag yet, so enabling it changes no
-  behaviour today; it exists so the flag can be proven durable before anything depends on it.
+  renewal behaviour today - the only new effect is the round-trip check itself, which can fail the
+  job. It exists so the flag can be proven durable before anything depends on it.
 
 _Trigger_: 
 
