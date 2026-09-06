@@ -49,6 +49,11 @@ jobs:
           if [[ "${REFRESH_COMPLETED}" != "true" ]]; then
             FIRMS="unknown"
             DETAIL="the refresh loop did not finish - check the job log (a zero-step startup_failure/cancellation, or an early abort inside check_auth.yml's own refresh step, e.g. an invalid CONFIG_JSON or no firms in it)"
+            # Reachable together: an abort part-way through the loop leaves the seed's $GITHUB_ENV
+            # written, so the `if: always()` write-back still detects and publishes a flag loss.
+            if [[ -n "${AUTO_RENEW_LOST}" ]]; then
+              DETAIL="${DETAIL} | also: the CLI did not preserve the autoRenew flag for firm(s): ${AUTO_RENEW_LOST}"
+            fi
           elif [[ -n "${FAILED_FIRMS}" ]]; then
             FIRMS="${FAILED_FIRMS}"
             DETAIL="${FAILED_SUMMARY}"
