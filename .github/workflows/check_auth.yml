@@ -2,6 +2,11 @@ name: Check authentication
 run-name: Check authentication
 on:
   workflow_call:
+    inputs:
+      seed_no_auto_renew:
+        description: "Ensure every firm in CONFIG_JSON carries an `autoRenew` flag, and refuse to write the secret back if the CLI drops it. Opt-in: default false so callers that have not adopted the flag are unaffected."
+        type: boolean
+        default: false
     outputs:
       failed_firms:
         description: "Space-separated firm IDs whose token refresh failed this run, if any."
@@ -52,6 +57,8 @@ jobs:
       # they are not secrets, and the alert has to name the firm that was not refreshed.
       - name: Refresh tokens
         id: refresh
+        env:
+          SEED_NO_AUTO_RENEW: ${{ inputs.seed_no_auto_renew }}
         run: |
           set -o pipefail
           # Enumerated into a variable rather than straight into the `for` word list: a jq failure
@@ -71,6 +78,23 @@ jobs:
           # The ID set, not a count: a config that lost one firm and gained another numeric-looking
           # key would pass a count check.
           echo "EXPECTED_FIRM_IDS=$(tr '\n' ' ' <<< "${FIRM_IDS}")" >> "$GITHUB_ENV"
+          # Seeded here rather than in a step of its own so it reuses the shape check and the firm
+          # enumeration above, and so the refresh loop below rewrites the file with the flag already
+          # in it - which is what makes the assertion in the write-back step a real round-trip test
+          # of the CLI rather than a check that this step's own jq worked.
+          #
+          # The flag belongs to the credential, not the invocation: reusable workflows don't inherit
+          # a caller's env, so an env var would silently miss every shared workflow. It is inert
+          # until a CLI that reads it is installed.
+          #
+          # `// false` adds it only where it is absent - an operator who deliberately set a firm to
+          # `true` keeps that, and re-running this is a no-op.
+          if [[ "${SEED_NO_AUTO_RENEW}" == "true" ]]; then
+            jq 'to_entries | map(if (.key|test("^[0-9]+$")) then .value.autoRenew = (.value.autoRenew // false) else . end) | from_entries' \
+              "$HOME/.silverfin/config.json" > "$HOME/.silverfin/config.seeded.json"
+            mv "$HOME/.silverfin/config.seeded.json" "$HOME/.silverfin/config.json"
+            echo "[Action] autoRenew flag present for firm(s): $(jq -r 'to_entries | map(select(.key|test("^[0-9]+$")) | "\(.key)=\(.value.autoRenew)") | join(" ")' "$HOME/.silverfin/config.json")"
+          fi
           # Caps keep failed_firms_summary a single Slack-sized line even with many failures -
           # GitHub's own job-output limit is 1MB, but an unbounded summary would still make a
           # firm-refresh incident unreadable, or push a pathological run over that limit.
@@ -147,6 +171,18 @@ jobs:
               exit 1
             fi
           done
+          # The flag is only useful if it survives every CLI write. The secret is write-only, so
+          # this guard is the only available proof that it did - and as a guard rather than a
+          # one-off check it keeps holding for every later run.
+          if [[ "${SEED_NO_AUTO_RENEW}" == "true" ]]; then
+            for FIRM_ID in ${EXPECTED_FIRM_IDS}; do
+              if ! jq -e --arg firm "${FIRM_ID}" '.[$firm] | has("autoRenew")' "$HOME/.silverfin/config.json" > /dev/null; then
+                echo "::error::[Action] firm ${FIRM_ID} lost its autoRenew flag, refusing to write CONFIG_JSON"
+                exit 1
+              fi
+            done
+            echo "[Action] autoRenew flag survived the refresh for all firms"
+          fi
           CONFIG_JSON=$(tr -d '\n' < "$HOME/.silverfin/config.json")
           echo "::add-mask::$CONFIG_JSON"
           # Retry on a transient GitHub API error (5xx) rather than losing this run's renewals
@@ -175,6 +211,7 @@ jobs:
           done
         env:
           GH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+          SEED_NO_AUTO_RENEW: ${{ inputs.seed_no_auto_renew }}
       # Last, so an incomplete pass goes red without costing the write-back. A per-firm failure
       # means "not refreshed this pass", not necessarily a credential fault.
       - name: Fail if any firm was not refreshed
