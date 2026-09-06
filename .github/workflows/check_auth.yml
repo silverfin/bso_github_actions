@@ -92,45 +92,60 @@ jobs:
           # the `|| true` on the grep pipelines below exists to prevent. Refreshing tokens is this
           # step's job; a config it cannot seed still has tokens worth refreshing.
           #
-          # `// false` adds the flag only where it is absent, so an operator who deliberately set a
-          # firm to `true` keeps that and re-running is a no-op. Non-object firm records are skipped
-          # rather than repaired: assigning into one is a jq error, and the shape check above only
-          # guarantees the top level is an object.
+          # One rule throughout: a firm carries the flag only when `autoRenew` is a boolean.
+          # Absent, null, and a stray `"true"` string all count as missing, are all seeded, and are
+          # all asserted the same way - so the arrival line, the seed and the write-back check can
+          # never disagree with each other about what "has the flag" means.
+          #
+          # Non-object firm records are skipped rather than repaired: assigning into one is a jq
+          # error, and the shape check above only guarantees the *top level* is an object. The IDs
+          # that were seeded are recorded so the write-back asserts exactly that set - asserting
+          # every enumerated firm would fail the run over a scalar record the seed deliberately
+          # left alone.
+          # Caps keep failed_firms_summary a single Slack-sized line even with many failures -
+          # GitHub's own job-output limit is 1MB, but an unbounded summary would still make a
+          # firm-refresh incident unreadable, or push a pathological run over that limit.
+          MAX_ERROR_LINE_LEN=200
+          MAX_SUMMARY_LEN=4000
           if [[ "${SEED_NO_AUTO_RENEW}" == "true" ]]; then
-            # Read the incoming state *before* seeding. The line printed after seeding cannot tell
-            # "the flag came back from the secret" from "it was missing and this step just re-added
-            # it", because `// false` fills the key either way - and whether the secret retains the
-            # flag is the one thing this input exists to establish. Expect this to fire for every
-            # firm on the first seeded run, and never again; if it keeps firing, the write-back is
-            # not persisting the flag and the pilot's no-renew change would silently do nothing.
+            # Read the incoming state *before* seeding. The line printed afterwards cannot tell "the
+            # flag came back from the secret" from "it was missing and this step just re-added it",
+            # and whether the secret retains the flag is the one thing this input exists to
+            # establish.
             if ARRIVED_WITHOUT=$(jq -r 'to_entries | map(select((.key|test("^[0-9]+$")) and (.value|type == "object") and ((.value.autoRenew|type) != "boolean")) | .key) | join(" ")' "$HOME/.silverfin/config.json"); then
               if [[ -n "${ARRIVED_WITHOUT}" ]]; then
-                echo "::warning::[Action] CONFIG_JSON arrived without an autoRenew flag for firm(s): ${ARRIVED_WITHOUT} - seeding it now"
+                if [[ ${#ARRIVED_WITHOUT} -gt ${MAX_ERROR_LINE_LEN} ]]; then
+                  ARRIVED_WITHOUT="${ARRIVED_WITHOUT:0:${MAX_ERROR_LINE_LEN}}... (truncated, see the job log)"
+                fi
+                # Expected once, on this repository's first seeded run. A recurrence is the real
+                # signal: the write-back is not persisting the flag, and the pilot's no-renew
+                # change would silently do nothing.
+                echo "::warning::[Action] CONFIG_JSON arrived without a boolean autoRenew flag for firm(s): ${ARRIVED_WITHOUT} - seeding it now. Expected on the first seeded run for this repository; if it recurs, the secret is not retaining the flag."
               else
-                echo "[Action] CONFIG_JSON arrived with an autoRenew flag for every firm"
+                echo "[Action] CONFIG_JSON arrived with an autoRenew flag for every object-shaped firm"
               fi
+            else
+              echo "::warning::[Action] could not read the incoming autoRenew state, continuing with the seed"
             fi
-            if jq 'to_entries | map(if (.key|test("^[0-9]+$")) and (.value|type == "object") then .value.autoRenew = (.value.autoRenew // false) else . end) | from_entries' \
+            if jq 'to_entries | map(if (.key|test("^[0-9]+$")) and (.value|type == "object") and ((.value.autoRenew|type) != "boolean") then .value.autoRenew = false else . end) | from_entries' \
                  "$HOME/.silverfin/config.json" > "$HOME/.silverfin/config.seeded.json" \
                && mv "$HOME/.silverfin/config.seeded.json" "$HOME/.silverfin/config.json"; then
-              # Recorded so the write-back can tell "the CLI dropped the flag" from "seeding never
-              # ran" - that step is `if: always()`, so it is reached even when this one aborts.
-              echo "AUTO_RENEW_SEEDED=true" >> "$GITHUB_ENV"
-              # Assigned rather than inlined into the echo: inside `echo "$(jq ...)"` a jq failure is
+              # Assigned rather than inlined into an echo: inside `echo "$(jq ...)"` a jq failure is
               # swallowed and prints an empty firm list as though nothing were wrong.
               if SEEDED_FLAGS=$(jq -r 'to_entries | map(select((.key|test("^[0-9]+$")) and (.value|type == "object")) | "\(.key)=\(.value.autoRenew)") | join(" ")' "$HOME/.silverfin/config.json"); then
                 echo "[Action] autoRenew flag present for firm(s): ${SEEDED_FLAGS}"
+              fi
+              # The seeded ID set, not a boolean: the write-back needs to know *which* firms to
+              # assert on, and an empty value there also means "seeding never ran" - that step is
+              # `if: always()`, so it is reached even when this one aborts.
+              if SEEDED_FIRMS=$(jq -r 'to_entries | map(select((.key|test("^[0-9]+$")) and (.value|type == "object")) | .key) | join(" ")' "$HOME/.silverfin/config.json"); then
+                echo "AUTO_RENEW_SEEDED_FIRMS=${SEEDED_FIRMS}" >> "$GITHUB_ENV"
               fi
             else
               rm -f "$HOME/.silverfin/config.seeded.json"
               echo "::warning::[Action] could not seed the autoRenew flag, continuing with the refresh"
             fi
           fi
-          # Caps keep failed_firms_summary a single Slack-sized line even with many failures -
-          # GitHub's own job-output limit is 1MB, but an unbounded summary would still make a
-          # firm-refresh incident unreadable, or push a pathological run over that limit.
-          MAX_ERROR_LINE_LEN=200
-          MAX_SUMMARY_LEN=4000
           FAILED_FIRMS=""
           FAILED_SUMMARY=""
           while IFS= read -r FIRM_ID; do
@@ -208,10 +223,11 @@ jobs:
           #
           # Gated on the seed having actually run, not on the input: this step is `if: always()`, so
           # an abort between the firm enumeration and the seed block would otherwise report an
-          # unseeded config as a CLI regression.
-          if [[ "${AUTO_RENEW_SEEDED}" == "true" ]]; then
+          # unseeded config as a CLI regression. Only the firms the seed actually touched are
+          # asserted - a scalar firm record it skipped must not fail the run.
+          if [[ -n "${AUTO_RENEW_SEEDED_FIRMS}" ]]; then
             AUTO_RENEW_LOST=""
-            for FIRM_ID in ${EXPECTED_FIRM_IDS}; do
+            for FIRM_ID in ${AUTO_RENEW_SEEDED_FIRMS}; do
               # A present-but-null autoRenew is a dropped flag too, so check the type rather than
               # `has`. `type == "object" and ...` short-circuits, which keeps a firm record the CLI
               # replaced with a scalar from turning this into a raw jq error.
