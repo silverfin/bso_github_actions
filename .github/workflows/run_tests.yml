@@ -49,12 +49,18 @@ jobs:
           if [[ "${REFRESH_COMPLETED}" != "true" ]]; then
             FIRMS="unknown"
             DETAIL="the refresh loop did not finish - check the job log (a zero-step startup_failure/cancellation, or an early abort inside check_auth.yml's own refresh step, e.g. an invalid CONFIG_JSON or no firms in it)"
-          elif [[ -z "${FAILED_FIRMS}" ]]; then
-            FIRMS="none"
-            DETAIL="no firm failed its own token refresh - a later step (the CONFIG_JSON write-back, or its own firm-set validation) failed instead; check the job log"
-          else
+          elif [[ -n "${FAILED_FIRMS}" ]]; then
             FIRMS="${FAILED_FIRMS}"
             DETAIL="${FAILED_SUMMARY}"
+          elif [[ -n "${AUTO_RENEW_LOST}" ]]; then
+            # Checked before the catch-all below, which would otherwise blame the write-back for a
+            # run where the write-back succeeded. Only ever set for a caller that opted into
+            # seed_no_auto_renew, so this branch is unreachable for the others.
+            FIRMS="${AUTO_RENEW_LOST}"
+            DETAIL="every token refreshed and CONFIG_JSON was written, but the CLI did not preserve the autoRenew flag for these firms - the no-renew protection is not in effect for them"
+          else
+            FIRMS="none"
+            DETAIL="no firm failed its own token refresh - a later step (the CONFIG_JSON write-back, or its own firm-set validation) failed instead; check the job log"
           fi
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           TEXT=$(printf '⚠️ check-auth failed in %s during a liquid-test run (%s) — firm(s): %s\n%s\n%s' \
@@ -71,6 +77,7 @@ jobs:
           FAILED_FIRMS: ${{ needs.check-auth.outputs.failed_firms }}
           FAILED_SUMMARY: ${{ needs.check-auth.outputs.failed_firms_summary }}
           REFRESH_COMPLETED: ${{ needs.check-auth.outputs.refresh_completed }}
+          AUTO_RENEW_LOST: ${{ needs.check-auth.outputs.auto_renew_lost }}
 
   check-changed-templates:
     runs-on: ubuntu-latest

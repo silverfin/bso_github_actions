@@ -14,6 +14,9 @@ on:
       failed_firms_summary:
         description: "Single line, semicolon-separated: 'firm <id>: <CLI error>; firm <id>: <CLI error>'."
         value: ${{ jobs.refresh-tokens.outputs.failed_firms_summary }}
+      auto_renew_lost:
+        description: "Space-separated firm IDs that were seeded with an `autoRenew` flag but came back from the CLI without a usable one. Only ever set when the caller passed seed_no_auto_renew. Non-empty means the refresh and the CONFIG_JSON write-back both succeeded, but the no-renew protection is not in effect for those firms - a distinct failure from either of the two below, and one a caller should not report as a write-back problem."
+        value: ${{ jobs.refresh-tokens.outputs.auto_renew_lost }}
       refresh_completed:
         description: "\"true\" once the refresh step's own loop has run to completion (whether or not any firm failed) - this stays \"true\" even if a *later* step (the CONFIG_JSON write-back, or its own validation) is what fails the job. Empty only if the refresh step itself never ran or exited early: a zero-step failure (startup_failure, or cancelled while queued), or an early validation failure inside that step (CONFIG_JSON not a single JSON object, or no firms found in it). A caller must check this before treating empty failed_firms as \"nothing failed\"."
         value: ${{ jobs.refresh-tokens.outputs.refresh_completed }}
@@ -26,6 +29,7 @@ jobs:
     outputs:
       failed_firms: ${{ steps.refresh.outputs.failed_firms }}
       failed_firms_summary: ${{ steps.refresh.outputs.failed_firms_summary }}
+      auto_renew_lost: ${{ steps.write-back.outputs.auto_renew_lost }}
       refresh_completed: ${{ steps.refresh.outputs.refresh_completed }}
     # There's missing feature within GitHub Actions where there's a max of 2 concurrent jobs that can be enqueued, if you exceed it, it will auto-cancel the job unfortunately and you need to manually re-run the "failed" job. A big thread for GitHub to add a feature for this is already open here: https://github.com/orgs/community/discussions/12835
     concurrency:
@@ -140,6 +144,10 @@ jobs:
               # `if: always()`, so it is reached even when this one aborts.
               if SEEDED_FIRMS=$(jq -r 'to_entries | map(select((.key|test("^[0-9]+$")) and (.value|type == "object")) | .key) | join(" ")' "$HOME/.silverfin/config.json"); then
                 echo "AUTO_RENEW_SEEDED_FIRMS=${SEEDED_FIRMS}" >> "$GITHUB_ENV"
+              else
+                # Without this the write-back's assertion is skipped for an empty list and the run
+                # goes green having checked nothing - the one outcome worse than failing.
+                echo "::warning::[Action] could not record which firms were seeded, so the autoRenew round-trip is not asserted this run"
               fi
             else
               rm -f "$HOME/.silverfin/config.seeded.json"
@@ -204,6 +212,7 @@ jobs:
       # when an earlier step failed, the config must be shape-checked first - an empty or truncated
       # file here would overwrite every firm's tokens.
       - name: Prepare and store updated CONFIG_JSON as secret
+        id: write-back
         if: always()
         run: |
           if [[ -z "${EXPECTED_FIRM_IDS}" ]]; then
@@ -223,8 +232,9 @@ jobs:
           #
           # Gated on the seed having actually run, not on the input: this step is `if: always()`, so
           # an abort between the firm enumeration and the seed block would otherwise report an
-          # unseeded config as a CLI regression. Only the firms the seed actually touched are
-          # asserted - a scalar firm record it skipped must not fail the run.
+          # unseeded config as a CLI regression. The set is every object-shaped firm present when
+          # seeding ran; scalar records are excluded, since the seed leaves those alone and must
+          # not fail the run over them.
           if [[ -n "${AUTO_RENEW_SEEDED_FIRMS}" ]]; then
             AUTO_RENEW_LOST=""
             for FIRM_ID in ${AUTO_RENEW_SEEDED_FIRMS}; do
@@ -236,8 +246,16 @@ jobs:
               fi
             done
             if [[ -n "${AUTO_RENEW_LOST}" ]]; then
+              # Capped like every other operator-facing firm list in this workflow.
+              MAX_FIRM_LIST_LEN=200
+              if [[ ${#AUTO_RENEW_LOST} -gt ${MAX_FIRM_LIST_LEN} ]]; then
+                AUTO_RENEW_LOST="${AUTO_RENEW_LOST:0:${MAX_FIRM_LIST_LEN}}... (truncated, see the job log)"
+              fi
               echo "::warning::[Action] autoRenew flag not preserved for firm(s): ${AUTO_RENEW_LOST} - still writing CONFIG_JSON to keep this run's renewals"
               echo "AUTO_RENEW_LOST=${AUTO_RENEW_LOST}" >> "$GITHUB_ENV"
+              # Also an output: without it a caller sees refresh_completed=true and empty
+              # failed_firms, and reports this as a write-back failure - which it is not.
+              echo "auto_renew_lost=${AUTO_RENEW_LOST}" >> "$GITHUB_OUTPUT"
             else
               echo "[Action] autoRenew flag survived the refresh for all firms"
             fi
@@ -275,16 +293,22 @@ jobs:
       - name: Fail if any firm was not refreshed
         if: always()
         run: |
+          # Collected, not exited on in turn: these are independent failures, and exiting at the
+          # first one hides the rest from a log that is the only record of what went wrong.
+          FAILURES=""
           if [[ "${REFRESH_COMPLETED}" != "true" ]]; then
             echo "::error::[Action] the refresh step did not complete"
-            exit 1
+            FAILURES=1
           fi
           if [[ -n "${REFRESH_FAILED_FIRMS}" ]]; then
             echo "::error::[Action] token refresh incomplete for firm(s): ${REFRESH_FAILED_FIRMS}"
-            exit 1
+            FAILURES=1
           fi
           if [[ -n "${AUTO_RENEW_LOST}" ]]; then
             echo "::error::[Action] the CLI did not preserve the autoRenew flag for firm(s): ${AUTO_RENEW_LOST}"
+            FAILURES=1
+          fi
+          if [[ -n "${FAILURES}" ]]; then
             exit 1
           fi
           echo "[Action] all firms refreshed"
