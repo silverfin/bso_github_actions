@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       seed_no_auto_renew:
-        description: "Ensure every firm in CONFIG_JSON carries an `autoRenew` flag, and refuse to write the secret back if the CLI drops it. Opt-in: default false so callers that have not adopted the flag are unaffected."
+        description: "Ensure every firm in this caller's CONFIG_JSON carries an `autoRenew` flag, and fail the job if the CLI drops it. Default false, so a caller that does not pass this sees no change. Note the flag is persisted into the caller's own CONFIG_JSON secret, so one enabled run affects every workflow in *that* repository from then on - it is not scoped to this run, and this workflow has no un-seed path."
         type: boolean
         default: false
     outputs:
@@ -87,13 +87,31 @@ jobs:
           # a caller's env, so an env var would silently miss every shared workflow. It is inert
           # until a CLI that reads it is installed.
           #
-          # `// false` adds it only where it is absent - an operator who deliberately set a firm to
-          # `true` keeps that, and re-running this is a no-op.
+          # Non-fatal throughout. This runs before failed_firms/refresh_completed are written, so an
+          # abort here would leave the caller's alert with no data at all - the same failure class
+          # the `|| true` on the grep pipelines below exists to prevent. Refreshing tokens is this
+          # step's job; a config it cannot seed still has tokens worth refreshing.
+          #
+          # `// false` adds the flag only where it is absent, so an operator who deliberately set a
+          # firm to `true` keeps that and re-running is a no-op. Non-object firm records are skipped
+          # rather than repaired: assigning into one is a jq error, and the shape check above only
+          # guarantees the top level is an object.
           if [[ "${SEED_NO_AUTO_RENEW}" == "true" ]]; then
-            jq 'to_entries | map(if (.key|test("^[0-9]+$")) then .value.autoRenew = (.value.autoRenew // false) else . end) | from_entries' \
-              "$HOME/.silverfin/config.json" > "$HOME/.silverfin/config.seeded.json"
-            mv "$HOME/.silverfin/config.seeded.json" "$HOME/.silverfin/config.json"
-            echo "[Action] autoRenew flag present for firm(s): $(jq -r 'to_entries | map(select(.key|test("^[0-9]+$")) | "\(.key)=\(.value.autoRenew)") | join(" ")' "$HOME/.silverfin/config.json")"
+            if jq 'to_entries | map(if (.key|test("^[0-9]+$")) and (.value|type == "object") then .value.autoRenew = (.value.autoRenew // false) else . end) | from_entries' \
+                 "$HOME/.silverfin/config.json" > "$HOME/.silverfin/config.seeded.json" \
+               && mv "$HOME/.silverfin/config.seeded.json" "$HOME/.silverfin/config.json"; then
+              # Recorded so the write-back can tell "the CLI dropped the flag" from "seeding never
+              # ran" - that step is `if: always()`, so it is reached even when this one aborts.
+              echo "AUTO_RENEW_SEEDED=true" >> "$GITHUB_ENV"
+              # Assigned rather than inlined into the echo: inside `echo "$(jq ...)"` a jq failure is
+              # swallowed and prints an empty firm list as though nothing were wrong.
+              if SEEDED_FLAGS=$(jq -r 'to_entries | map(select((.key|test("^[0-9]+$")) and (.value|type == "object")) | "\(.key)=\(.value.autoRenew)") | join(" ")' "$HOME/.silverfin/config.json"); then
+                echo "[Action] autoRenew flag present for firm(s): ${SEEDED_FLAGS}"
+              fi
+            else
+              rm -f "$HOME/.silverfin/config.seeded.json"
+              echo "::warning::[Action] could not seed the autoRenew flag, continuing with the refresh"
+            fi
           fi
           # Caps keep failed_firms_summary a single Slack-sized line even with many failures -
           # GitHub's own job-output limit is 1MB, but an unbounded summary would still make a
@@ -171,17 +189,29 @@ jobs:
               exit 1
             fi
           done
-          # The flag is only useful if it survives every CLI write. The secret is write-only, so
-          # this guard is the only available proof that it did - and as a guard rather than a
-          # one-off check it keeps holding for every later run.
-          if [[ "${SEED_NO_AUTO_RENEW}" == "true" ]]; then
+          # A dropped flag must never cost this run's renewals: the CLI has already rotated the
+          # tokens server-side, so this file is the only copy of them. Record it, write anyway, and
+          # let the last step go red - the same order that step's own comment describes.
+          #
+          # Gated on the seed having actually run, not on the input: this step is `if: always()`, so
+          # an abort between the firm enumeration and the seed block would otherwise report an
+          # unseeded config as a CLI regression.
+          if [[ "${AUTO_RENEW_SEEDED}" == "true" ]]; then
+            AUTO_RENEW_LOST=""
             for FIRM_ID in ${EXPECTED_FIRM_IDS}; do
-              if ! jq -e --arg firm "${FIRM_ID}" '.[$firm] | has("autoRenew")' "$HOME/.silverfin/config.json" > /dev/null; then
-                echo "::error::[Action] firm ${FIRM_ID} lost its autoRenew flag, refusing to write CONFIG_JSON"
-                exit 1
+              # A present-but-null autoRenew is a dropped flag too, so check the type rather than
+              # `has`. `type == "object" and ...` short-circuits, which keeps a firm record the CLI
+              # replaced with a scalar from turning this into a raw jq error.
+              if ! jq -e --arg firm "${FIRM_ID}" '.[$firm] | type == "object" and (.autoRenew | type == "boolean")' "$HOME/.silverfin/config.json" > /dev/null 2>&1; then
+                AUTO_RENEW_LOST="${AUTO_RENEW_LOST:+${AUTO_RENEW_LOST} }${FIRM_ID}"
               fi
             done
-            echo "[Action] autoRenew flag survived the refresh for all firms"
+            if [[ -n "${AUTO_RENEW_LOST}" ]]; then
+              echo "::warning::[Action] autoRenew flag not preserved for firm(s): ${AUTO_RENEW_LOST} - still writing CONFIG_JSON to keep this run's renewals"
+              echo "AUTO_RENEW_LOST=${AUTO_RENEW_LOST}" >> "$GITHUB_ENV"
+            else
+              echo "[Action] autoRenew flag survived the refresh for all firms"
+            fi
           fi
           CONFIG_JSON=$(tr -d '\n' < "$HOME/.silverfin/config.json")
           echo "::add-mask::$CONFIG_JSON"
@@ -211,7 +241,6 @@ jobs:
           done
         env:
           GH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
-          SEED_NO_AUTO_RENEW: ${{ inputs.seed_no_auto_renew }}
       # Last, so an incomplete pass goes red without costing the write-back. A per-firm failure
       # means "not refreshed this pass", not necessarily a credential fault.
       - name: Fail if any firm was not refreshed
@@ -223,6 +252,10 @@ jobs:
           fi
           if [[ -n "${REFRESH_FAILED_FIRMS}" ]]; then
             echo "::error::[Action] token refresh incomplete for firm(s): ${REFRESH_FAILED_FIRMS}"
+            exit 1
+          fi
+          if [[ -n "${AUTO_RENEW_LOST}" ]]; then
+            echo "::error::[Action] the CLI did not preserve the autoRenew flag for firm(s): ${AUTO_RENEW_LOST}"
             exit 1
           fi
           echo "[Action] all firms refreshed"
