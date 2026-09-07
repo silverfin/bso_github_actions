@@ -159,18 +159,23 @@ jobs:
       SF_API_CLIENT_ID: ${{ secrets.SF_API_CLIENT_ID }}
       SF_API_SECRET: ${{ secrets.SF_API_SECRET }}
     steps:
-      # First step, deliberately: a local `./`-path action reference only resolves once the
-      # repo is checked out on the runner - unlike a fully-qualified owner/repo/path@ref
-      # reference (which the caller in be_market's run_tests.yml uses instead), a bare `./`
-      # path finds nothing before this.
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      # Full owner/repo/path@ref, not a local `./` path: this workflow lives in
+      # bso_github_actions, but a reusable workflow's job runs in the CALLING repo's context
+      # (be_market here) - `actions/checkout` above checks out be_market, not this repo, so a
+      # `./`-path reference to an action defined in this same file's own repo never resolves,
+      # no matter where checkout runs. Confirmed the hard way: moving checkout earlier alone
+      # still fails with "Can't find action.yml" - only a fully-qualified remote reference
+      # works here, same as be_market's own run_tests.yml already does for this action.
+      # Pinned to this PR's own tip since action.yml hasn't changed since - bump alongside any
+      # future action.yml edit.
       - name: Refresh CONFIG_JSON
         id: refresh
-        uses: ./.github/actions/refresh-config-json
+        uses: silverfin/bso_github_actions/.github/actions/refresh-config-json@097340a6dd5c65e3fd013b697e091bd392f887fa
         with:
           sf_api_client_id: ${{ secrets.SF_API_CLIENT_ID }}
           sf_api_secret: ${{ secrets.SF_API_SECRET }}
