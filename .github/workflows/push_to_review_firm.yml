@@ -6,12 +6,20 @@
 # product manager's review firm id.
 #
 # This file is currently only called by be_market, so the pilot behaviour below is
-# be_market-only in effect even though it lives in the shared repo. It runs its own
-# per-run `check-auth` before pushing, same as run_tests.yml: a Jira Automation button
-# click can fire long after the last cron tick, and the old reader-only design just
-# failed cleanly on a stale access token rather than refreshing first. check_auth.yml's
-# own concurrency group already serializes this against every other caller, so this
-# adds one more participant, not a new race.
+# be_market-only in effect even though it lives in the shared repo. It refreshes
+# CONFIG_JSON itself before pushing: a Jira Automation button click can fire long after
+# the last cron tick, and the old reader-only design just failed cleanly on a stale
+# access token rather than refreshing first.
+#
+# The refresh runs as the `push` job's own first steps (the refresh-config-json
+# composite action), not as a separate `check-auth` job. That's deliberate, not a
+# simplification: a value one job writes to a secret is not visible to a later job in
+# the *same* run - confirmed empirically 2026-09-07, a downstream job's `secrets.*`
+# reflects the value at the moment the run was queued, not a sibling job's write
+# earlier in that run. `needs:` only orders jobs, it doesn't refresh what they see. So
+# `push` reads the local file the refresh step just wrote, never `secrets.CONFIG_JSON`
+# again after that. check_auth.yml itself is untouched by this - still correct for its
+# own callers, which have no same-run consumer to hand off to (the cron).
 name: push-to-review-firm
 run-name: Push templates to a review firm (${{ inputs.dev_ticket_keys }})
 on:
@@ -44,7 +52,10 @@ on:
         description: "Silverfin API OAuth client secret."
         required: true
       CONFIG_JSON:
-        description: "silverfin-cli credentials file content (per-firm OAuth tokens). Refreshed and written back by this workflow's own check-auth job before use."
+        description: "silverfin-cli credentials file content (per-firm OAuth tokens). Refreshed and written back by the push job's own refresh step before use."
+        required: true
+      REPO_ACCESS_TOKEN:
+        description: "PAT with permission to write this repository's CONFIG_JSON secret (used by the refresh step's gh secret set)."
         required: true
       SLACK_CI_ALERTS_WEBHOOK_URL:
         description: "Optional. Slack webhook to alert on a check-auth failure ahead of the push. Silently skipped if not supplied."
@@ -59,18 +70,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  check-auth:
-    uses: ./.github/workflows/check_auth.yml
-    with:
-      seed_no_auto_renew: true
-    secrets: inherit
-
-  # Same shape as run_tests.yml's alert job - `always() && result != 'success'` catches the
-  # zero-step failure `if: failure()` would miss, and this repo has no SLACK_CI_ALERTS_WEBHOOK_URL
-  # of its own, so the runtime guard is required, not optional.
+  # Same message shapes as before, but the trigger now looks at the refresh outputs
+  # directly (`push`'s own outputs, sourced from the refresh-config-json action) rather
+  # than the whole job's result - `push` also runs the actual template push, and a
+  # generic "job failed" condition would misfire on an ordinary push failure that has
+  # nothing to do with auth. `always()` plus checking `refresh_completed`/`failed_firms`/
+  # `auto_renew_lost` directly still catches a zero-step startup_failure/cancellation
+  # (those outputs come back empty in that case too), it just doesn't also fire on an
+  # unrelated push error.
   alert-on-check-auth-failure:
-    needs: check-auth
-    if: always() && needs.check-auth.result != 'success'
+    needs: push
+    if: |
+      always() &&
+      (needs.push.outputs.refresh_completed != 'true' ||
+       needs.push.outputs.failed_firms != '' ||
+       needs.push.outputs.auto_renew_lost != '')
     runs-on: ubuntu-latest
     permissions: {}
     steps:
@@ -82,7 +96,7 @@ jobs:
           fi
           if [[ "${REFRESH_COMPLETED}" != "true" ]]; then
             FIRMS="unknown"
-            DETAIL="the refresh loop did not finish - check the job log (a zero-step startup_failure/cancellation, or an early abort inside check_auth.yml's own refresh step, e.g. an invalid CONFIG_JSON or no firms in it)"
+            DETAIL="the refresh loop did not finish - check the job log (a zero-step startup_failure/cancellation, or an early abort inside the refresh step, e.g. an invalid CONFIG_JSON or no firms in it)"
             if [[ -n "${AUTO_RENEW_LOST}" ]]; then
               DETAIL="${DETAIL} | also: the CLI did not preserve the autoRenew flag for firm(s): ${AUTO_RENEW_LOST}"
             fi
@@ -92,12 +106,9 @@ jobs:
             if [[ -n "${AUTO_RENEW_LOST}" ]]; then
               DETAIL="${DETAIL} | also: the CLI did not preserve the autoRenew flag for firm(s): ${AUTO_RENEW_LOST}"
             fi
-          elif [[ -n "${AUTO_RENEW_LOST}" ]]; then
+          else
             FIRMS="${AUTO_RENEW_LOST}"
             DETAIL="every token refreshed and CONFIG_JSON was written, but the CLI did not preserve the autoRenew flag for these firms - the no-renew protection is not in effect for them"
-          else
-            FIRMS="none"
-            DETAIL="no firm failed its own token refresh - a later step (the CONFIG_JSON write-back, or its own firm-set validation) failed instead; check the job log"
           fi
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           TEXT=$(printf '⚠️ check-auth failed in %s before a push-to-review-firm run (dev tickets: %s) — firm(s): %s\n%s\n%s' \
@@ -108,16 +119,25 @@ jobs:
             || echo "::warning::failed to post the check-auth alert to Slack"
         env:
           SLACK: ${{ secrets.SLACK_CI_ALERTS_WEBHOOK_URL }}
-          FAILED_FIRMS: ${{ needs.check-auth.outputs.failed_firms }}
-          FAILED_SUMMARY: ${{ needs.check-auth.outputs.failed_firms_summary }}
-          REFRESH_COMPLETED: ${{ needs.check-auth.outputs.refresh_completed }}
-          AUTO_RENEW_LOST: ${{ needs.check-auth.outputs.auto_renew_lost }}
+          FAILED_FIRMS: ${{ needs.push.outputs.failed_firms }}
+          FAILED_SUMMARY: ${{ needs.push.outputs.failed_firms_summary }}
+          REFRESH_COMPLETED: ${{ needs.push.outputs.refresh_completed }}
+          AUTO_RENEW_LOST: ${{ needs.push.outputs.auto_renew_lost }}
           DEV_KEYS: ${{ inputs.dev_ticket_keys }}
 
   push:
-    needs: check-auth
     runs-on: ubuntu-latest
+    # Refresh jobs are short (well under a minute), so serializing this job against
+    # check_auth.yml's other callers (the cron, run_tests.yml) here is cheap - unlike
+    # test-templates in run_tests.yml, which can run up to two hours and would block
+    # the cron for the group's whole duration if it carried this same group.
+    concurrency:
+      group: refresh-tokens
     outputs:
+      failed_firms: ${{ steps.refresh.outputs.failed_firms }}
+      failed_firms_summary: ${{ steps.refresh.outputs.failed_firms_summary }}
+      auto_renew_lost: ${{ steps.refresh.outputs.auto_renew_lost }}
+      refresh_completed: ${{ steps.refresh.outputs.refresh_completed }}
       firm_id: ${{ steps.firm.outputs.firm_id }}
       pr_numbers: ${{ steps.prs.outputs.pr_numbers }}
       results_md: ${{ steps.push.outputs.results_md }}
@@ -127,6 +147,16 @@ jobs:
       SF_API_CLIENT_ID: ${{ secrets.SF_API_CLIENT_ID }}
       SF_API_SECRET: ${{ secrets.SF_API_SECRET }}
     steps:
+      - name: Refresh CONFIG_JSON
+        id: refresh
+        uses: ./.github/actions/refresh-config-json
+        with:
+          sf_api_client_id: ${{ secrets.SF_API_CLIENT_ID }}
+          sf_api_secret: ${{ secrets.SF_API_SECRET }}
+          config_json: ${{ secrets.CONFIG_JSON }}
+          repo_access_token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          seed_no_auto_renew: "true"
+
       - name: Resolve the review firm id
         id: firm
         env:
@@ -151,12 +181,12 @@ jobs:
 
       - name: Check the review firm is authorized in CONFIG_JSON
         env:
-          CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
           FIRM_ID: ${{ steps.firm.outputs.firm_id }}
           DEV_KEYS: ${{ inputs.dev_ticket_keys }}
         run: |
-          echo "::add-mask::${CONFIG_JSON}"
-          IS_AUTHORIZED=$(printf '%s' "${CONFIG_JSON}" | jq -r --arg f "${FIRM_ID}" 'del(.defaultFirmIDs, .host) | has($f)' 2>/dev/null || echo "false")
+          # Reads the local file the refresh step already wrote, not secrets.CONFIG_JSON again -
+          # it already reflects this run's own refresh, which the secret itself would not.
+          IS_AUTHORIZED=$(jq -r --arg f "${FIRM_ID}" 'del(.defaultFirmIDs, .host) | has($f)' "$HOME/.silverfin/config.json" 2>/dev/null || echo "false")
           if [ "${IS_AUTHORIZED}" != "true" ]; then
             echo "::error::Review firm ${FIRM_ID} is not authorized for this repository (no OAuth tokens for it in CONFIG_JSON). Ask the developer who implemented ${DEV_KEYS} to authorize firm ${FIRM_ID} with the Silverfin CLI ('silverfin authorize') and add it to the repository's CONFIG_JSON secret."
             exit 1
@@ -223,12 +253,16 @@ jobs:
           VERSION=$(node ./node_modules/silverfin-cli/bin/cli.js -V)
           echo "silverfin-cli version: ${VERSION}"
 
-      - name: Load Silverfin credentials and set firm
+      - name: Set the active firm
         env:
           FIRM_ID: ${{ steps.firm.outputs.firm_id }}
         run: |
-          mkdir -p "$HOME/.silverfin"
-          echo '${{ secrets.CONFIG_JSON }}' > "$HOME/.silverfin/config.json"
+          # Credentials file already exists - the refresh step wrote it. The autoRenew
+          # interceptor gate reads only that flag, never the refreshToken's own value, so this
+          # job never legitimately needs a working refresh token on disk for its own runtime.
+          jq 'to_entries | map(if (.key|test("^[0-9]+$")) then .value.refreshToken = "" else . end) | from_entries' \
+            "$HOME/.silverfin/config.json" > "$HOME/.silverfin/config.stripped.json"
+          mv "$HOME/.silverfin/config.stripped.json" "$HOME/.silverfin/config.json"
           node ./node_modules/silverfin-cli/bin/cli.js config --set-firm="${FIRM_ID}"
           node ./node_modules/silverfin-cli/bin/cli.js config --get-firm
 

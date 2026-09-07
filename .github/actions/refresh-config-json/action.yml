@@ -1,0 +1,232 @@
+name: Refresh CONFIG_JSON
+description: >-
+  Refreshes every firm's token pair in CONFIG_JSON and writes the result back to the caller's
+  secret. Same logic as check_auth.yml's refresh-tokens job, packaged as a composite action so a
+  job can run it as its own first step and use the local $HOME/.silverfin/config.json it writes
+  directly - a reusable *workflow* can only ever be its own separate job, and a value written to a
+  secret by one job is not visible to a later job in the same run (confirmed empirically
+  2026-09-07: a downstream job's `secrets.*` reflects the value at the moment the run was queued,
+  not a sibling job's write earlier in that same run). check_auth.yml itself is untouched by this
+  - it still exists for callers with no same-run consumer (the cron), and this action deliberately
+  duplicates rather than shares its steps so nothing here can regress that file's own callers.
+inputs:
+  sf_api_client_id:
+    description: "Silverfin API OAuth client id."
+    required: true
+  sf_api_secret:
+    description: "Silverfin API OAuth client secret."
+    required: true
+  config_json:
+    description: "The caller's current CONFIG_JSON secret content."
+    required: true
+  repo_access_token:
+    description: "PAT with permission to write the caller's CONFIG_JSON secret (gh secret set)."
+    required: true
+  seed_no_auto_renew:
+    description: "Seed every firm with an `autoRenew: false` flag if it doesn't already carry one."
+    required: false
+    default: "false"
+outputs:
+  failed_firms:
+    description: "Space-separated firm IDs whose token refresh failed this run, if any."
+    value: ${{ steps.refresh.outputs.failed_firms }}
+  failed_firms_summary:
+    description: "Single line, semicolon-separated: 'firm <id>: <CLI error>; firm <id>: <CLI error>'."
+    value: ${{ steps.refresh.outputs.failed_firms_summary }}
+  auto_renew_lost:
+    description: "Space-separated firm IDs seeded with autoRenew but that came back without a usable one."
+    value: ${{ steps.write-back.outputs.auto_renew_lost }}
+  refresh_completed:
+    description: "\"true\" once the refresh loop ran to completion, whether or not any firm failed."
+    value: ${{ steps.refresh.outputs.refresh_completed }}
+runs:
+  using: composite
+  steps:
+    - name: Setup Node
+      uses: actions/setup-node@v6
+      with:
+        node-version: 22
+    - name: Add silverfin-cli package latest version
+      shell: bash
+      run: |
+        npm install https://github.com/silverfin/silverfin-cli.git
+        VERSION=$(./node_modules/silverfin-cli/bin/cli.js -V)
+        echo "[Action] CLI version: ${VERSION}"
+    - name: Create Silverfin config file
+      shell: bash
+      env:
+        CONFIG_JSON: ${{ inputs.config_json }}
+      run: |
+        mkdir -p "$HOME/.silverfin/"
+        printf '%s' "${CONFIG_JSON}" > "$HOME/.silverfin/config.json"
+    # A failing firm must not abort the loop: under `bash -e` the first failure skipped the
+    # write-back below, discarding renewals already made and starving later firms of refreshes.
+    # Record failures and fail the action in a later step instead. Firm IDs are logged on purpose -
+    # they are not secrets, and a caller's alert has to name the firm that was not refreshed.
+    - name: Refresh tokens
+      id: refresh
+      shell: bash
+      env:
+        SEED_NO_AUTO_RENEW: ${{ inputs.seed_no_auto_renew }}
+        SF_API_CLIENT_ID: ${{ inputs.sf_api_client_id }}
+        SF_API_SECRET: ${{ inputs.sf_api_secret }}
+      run: |
+        set -o pipefail
+        if ! jq -e -s 'length == 1 and (.[0] | type == "object")' "$HOME/.silverfin/config.json" > /dev/null 2>&1; then
+          echo "::error::[Action] the CONFIG_JSON secret is empty, or not a single JSON object"
+          exit 1
+        fi
+        FIRM_IDS=$(jq -r 'del(.defaultFirmIDs, .host) | keys[] | select(test("^[0-9]+$"))' "$HOME/.silverfin/config.json")
+        if [[ -z "${FIRM_IDS}" ]]; then
+          echo "::error::[Action] no firms in the config, refusing to continue"
+          exit 1
+        fi
+        echo "EXPECTED_FIRM_IDS=$(tr '\n' ' ' <<< "${FIRM_IDS}")" >> "$GITHUB_ENV"
+        MAX_ERROR_LINE_LEN=200
+        MAX_SUMMARY_LEN=4000
+        if [[ "${SEED_NO_AUTO_RENEW}" == "true" ]]; then
+          if ARRIVED_WITHOUT=$(jq -r 'to_entries | map(select((.key|test("^[0-9]+$")) and (.value|type == "object") and ((.value.autoRenew|type) != "boolean")) | .key) | join(" ")' "$HOME/.silverfin/config.json"); then
+            if [[ -n "${ARRIVED_WITHOUT}" ]]; then
+              if [[ ${#ARRIVED_WITHOUT} -gt ${MAX_ERROR_LINE_LEN} ]]; then
+                ARRIVED_WITHOUT="${ARRIVED_WITHOUT:0:${MAX_ERROR_LINE_LEN}}... (truncated, see the job log)"
+              fi
+              echo "::warning::[Action] CONFIG_JSON arrived without a boolean autoRenew flag for firm(s): ${ARRIVED_WITHOUT} - seeding it now."
+            else
+              echo "[Action] CONFIG_JSON arrived with an autoRenew flag for every object-shaped firm"
+            fi
+          else
+            echo "::warning::[Action] could not read the incoming autoRenew state, continuing with the seed"
+          fi
+          if jq 'to_entries | map(if (.key|test("^[0-9]+$")) and (.value|type == "object") and ((.value.autoRenew|type) != "boolean") then .value.autoRenew = false else . end) | from_entries' \
+               "$HOME/.silverfin/config.json" > "$HOME/.silverfin/config.seeded.json" \
+             && mv "$HOME/.silverfin/config.seeded.json" "$HOME/.silverfin/config.json"; then
+            if SEEDED_FLAGS=$(jq -r 'to_entries | map(select((.key|test("^[0-9]+$")) and (.value|type == "object")) | "\(.key)=\(.value.autoRenew)") | join(" ")' "$HOME/.silverfin/config.json"); then
+              echo "[Action] autoRenew flag present for firm(s): ${SEEDED_FLAGS}"
+            fi
+            if CHECK_FIRMS=$(jq -r 'to_entries | map(select((.key|test("^[0-9]+$")) and (.value|type == "object")) | .key) | join(" ")' "$HOME/.silverfin/config.json") \
+               && [[ -n "${CHECK_FIRMS}" ]]; then
+              echo "AUTO_RENEW_CHECK_FIRMS=${CHECK_FIRMS}" >> "$GITHUB_ENV"
+            else
+              echo "::warning::[Action] no firm was seeded with an autoRenew flag, so the round-trip is not asserted this run"
+            fi
+          else
+            rm -f "$HOME/.silverfin/config.seeded.json"
+            echo "::warning::[Action] could not seed the autoRenew flag, continuing with the refresh"
+          fi
+        fi
+        FAILED_FIRMS=""
+        FAILED_SUMMARY=""
+        while IFS= read -r FIRM_ID; do
+          echo "[Action] refreshing token for firm ${FIRM_ID}"
+          if ! node ./node_modules/silverfin-cli/bin/cli.js config --refresh-token "${FIRM_ID}" 2>&1 | tee /tmp/refresh-"${FIRM_ID}".log; then
+            ERROR_LINE=$(grep -E 'Response Status|Error description' /tmp/refresh-"${FIRM_ID}".log | paste -sd' ' - || true)
+            if [[ -z "${ERROR_LINE}" ]]; then
+              ERROR_LINE=$(grep -v '^[[:space:]]*$' /tmp/refresh-"${FIRM_ID}".log | tail -1 || true)
+            fi
+            if [[ ${#ERROR_LINE} -gt ${MAX_ERROR_LINE_LEN} ]]; then
+              ERROR_LINE="${ERROR_LINE:0:${MAX_ERROR_LINE_LEN}}... (truncated, see the job log)"
+            fi
+            echo "::error::[Action] failed to refresh token for firm ${FIRM_ID}: ${ERROR_LINE}"
+            FAILED_FIRMS="${FAILED_FIRMS:+${FAILED_FIRMS} }${FIRM_ID}"
+            FAILED_SUMMARY="${FAILED_SUMMARY}${FAILED_SUMMARY:+; }firm ${FIRM_ID}: ${ERROR_LINE}"
+          fi
+          rm -f /tmp/refresh-"${FIRM_ID}".log
+        done <<< "${FIRM_IDS}"
+        if [[ ${#FAILED_SUMMARY} -gt ${MAX_SUMMARY_LEN} ]]; then
+          FAILED_SUMMARY="${FAILED_SUMMARY:0:${MAX_SUMMARY_LEN}}... (truncated, see the job log for the rest)"
+        fi
+        {
+          echo "REFRESH_FAILED_FIRMS=${FAILED_FIRMS}"
+          echo "REFRESH_COMPLETED=true"
+        } >> "$GITHUB_ENV"
+        {
+          echo "failed_firms=${FAILED_FIRMS}"
+          echo "failed_firms_summary=${FAILED_SUMMARY}"
+          echo "refresh_completed=true"
+        } >> "$GITHUB_OUTPUT"
+    # `always()`: keeps the renewals that succeeded when another firm failed. Because it also runs
+    # when an earlier step failed, the config must be shape-checked first - an empty or truncated
+    # file here would overwrite every firm's tokens.
+    - name: Prepare and store updated CONFIG_JSON as secret
+      id: write-back
+      if: always()
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.repo_access_token }}
+      run: |
+        if [[ -z "${EXPECTED_FIRM_IDS}" ]]; then
+          echo "::error::[Action] refresh never ran, refusing to write CONFIG_JSON"
+          exit 1
+        fi
+        FOUND_FIRM_IDS=$(jq -r 'del(.defaultFirmIDs, .host) | keys[] | select(test("^[0-9]+$"))' "$HOME/.silverfin/config.json" | tr '\n' ' ')
+        for FIRM_ID in ${EXPECTED_FIRM_IDS}; do
+          if [[ " ${FOUND_FIRM_IDS} " != *" ${FIRM_ID} "* ]]; then
+            echo "::error::[Action] firm ${FIRM_ID} is missing from the config, refusing to write CONFIG_JSON"
+            exit 1
+          fi
+        done
+        if [[ -n "${AUTO_RENEW_CHECK_FIRMS}" ]]; then
+          AUTO_RENEW_LOST=""
+          for FIRM_ID in ${AUTO_RENEW_CHECK_FIRMS}; do
+            if ! jq -e --arg firm "${FIRM_ID}" '.[$firm] | type == "object" and (.autoRenew | type == "boolean")' "$HOME/.silverfin/config.json" > /dev/null 2>&1; then
+              AUTO_RENEW_LOST="${AUTO_RENEW_LOST:+${AUTO_RENEW_LOST} }${FIRM_ID}"
+            fi
+          done
+          if [[ -n "${AUTO_RENEW_LOST}" ]]; then
+            echo "[Action] autoRenew flag not preserved for firm(s): ${AUTO_RENEW_LOST}"
+            MAX_FIRM_LIST_LEN=200
+            AUTO_RENEW_LOST_MSG="${AUTO_RENEW_LOST}"
+            if [[ ${#AUTO_RENEW_LOST_MSG} -gt ${MAX_FIRM_LIST_LEN} ]]; then
+              AUTO_RENEW_LOST_MSG="${AUTO_RENEW_LOST_MSG:0:${MAX_FIRM_LIST_LEN}}... (truncated, see the job log)"
+            fi
+            echo "::warning::[Action] autoRenew flag not preserved for firm(s): ${AUTO_RENEW_LOST_MSG} - still writing CONFIG_JSON to keep this run's renewals"
+            echo "AUTO_RENEW_LOST=${AUTO_RENEW_LOST}" >> "$GITHUB_ENV"
+          else
+            echo "[Action] autoRenew flag survived the refresh for all firms"
+          fi
+        fi
+        CONFIG_JSON=$(tr -d '\n' < "$HOME/.silverfin/config.json")
+        echo "::add-mask::$CONFIG_JSON"
+        MAX_ATTEMPTS=3
+        ATTEMPT=1
+        while true; do
+          if ERR=$(echo "$CONFIG_JSON" | gh secret set CONFIG_JSON 2>&1); then
+            break
+          fi
+          if ! grep -qE 'HTTP 5[0-9]{2}' <<< "${ERR}"; then
+            echo "::error::[Action] failed to write CONFIG_JSON (non-transient failure): ${ERR}"
+            exit 1
+          fi
+          if (( ATTEMPT >= MAX_ATTEMPTS )); then
+            echo "::error::[Action] failed to write CONFIG_JSON after ${MAX_ATTEMPTS} attempts: ${ERR}"
+            exit 1
+          fi
+          SLEEP=$(( 2 ** ATTEMPT ))
+          echo "::warning::[Action] gh secret set CONFIG_JSON failed with a transient error (attempt ${ATTEMPT}/${MAX_ATTEMPTS}), retrying in ${SLEEP}s"
+          sleep "${SLEEP}"
+          ATTEMPT=$((ATTEMPT+1))
+        done
+        if [[ -n "${AUTO_RENEW_LOST}" ]]; then
+          echo "auto_renew_lost=${AUTO_RENEW_LOST}" >> "$GITHUB_OUTPUT"
+        fi
+    - name: Fail if any firm was not refreshed
+      if: always()
+      shell: bash
+      run: |
+        FAILURES=""
+        if [[ "${REFRESH_COMPLETED}" != "true" ]]; then
+          echo "::error::[Action] the refresh step did not complete"
+          FAILURES=1
+        fi
+        if [[ -n "${REFRESH_FAILED_FIRMS}" ]]; then
+          echo "::error::[Action] token refresh incomplete for firm(s): ${REFRESH_FAILED_FIRMS}"
+          FAILURES=1
+        fi
+        if [[ -n "${AUTO_RENEW_LOST}" ]]; then
+          echo "::error::[Action] the CLI did not preserve the autoRenew flag for firm(s): ${AUTO_RENEW_LOST}"
+          FAILURES=1
+        fi
+        if [[ -n "${FAILURES}" ]]; then
+          exit 1
+        fi
+        echo "[Action] all firms refreshed"
