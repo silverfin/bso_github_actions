@@ -153,6 +153,7 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.repo_access_token }}
+        GH_REPO: ${{ github.repository }}
       run: |
         if [[ -z "${EXPECTED_FIRM_IDS}" ]]; then
           echo "::error::[Action] refresh never ran, refusing to write CONFIG_JSON"
