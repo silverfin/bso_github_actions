@@ -175,7 +175,7 @@ jobs:
       # future action.yml edit.
       - name: Refresh CONFIG_JSON
         id: refresh
-        uses: silverfin/bso_github_actions/.github/actions/refresh-config-json@24b4b17c3f884a4266db984f3adfbd83775ae2da
+        uses: silverfin/bso_github_actions/.github/actions/refresh-config-json@4727d2b496bfac01000169ec2d7243c9c79c3332
         with:
           sf_api_client_id: ${{ secrets.SF_API_CLIENT_ID }}
           sf_api_secret: ${{ secrets.SF_API_SECRET }}
