@@ -5,9 +5,13 @@
 # button) and/or `workflow_dispatch`, passing the development ticket key(s) and the
 # product manager's review firm id.
 #
-# Reader-only on CONFIG_JSON: it never refreshes tokens and never writes the secret
-# back (avoids becoming a concurrent writer of CONFIG_JSON). It relies on the
-# existing refresher to keep the secret fresh — see docs/github_actions_authentication.md.
+# This file is currently only called by be_market, so the pilot behaviour below is
+# be_market-only in effect even though it lives in the shared repo. It runs its own
+# per-run `check-auth` before pushing, same as run_tests.yml: a Jira Automation button
+# click can fire long after the last cron tick, and the old reader-only design just
+# failed cleanly on a stale access token rather than refreshing first. check_auth.yml's
+# own concurrency group already serializes this against every other caller, so this
+# adds one more participant, not a new race.
 name: push-to-review-firm
 run-name: Push templates to a review firm (${{ inputs.dev_ticket_keys }})
 on:
@@ -40,7 +44,7 @@ on:
         description: "Silverfin API OAuth client secret."
         required: true
       CONFIG_JSON:
-        description: "silverfin-cli credentials file content (per-firm OAuth tokens). Read only — this workflow never writes it back."
+        description: "silverfin-cli credentials file content (per-firm OAuth tokens). Refreshed and written back by this workflow's own check-auth job before use."
         required: true
 
 permissions:
@@ -52,7 +56,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  check-auth:
+    uses: ./.github/workflows/check_auth.yml
+    with:
+      seed_no_auto_renew: true
+    secrets: inherit
+
   push:
+    needs: check-auth
     runs-on: ubuntu-latest
     outputs:
       firm_id: ${{ steps.firm.outputs.firm_id }}
@@ -151,9 +162,12 @@ jobs:
         with:
           node-version: 20
 
+      # Pinned to the same unmerged branch as run_tests.yml's pilot job (silverfin-cli#273) so a
+      # stale access token exits cleanly via the autoRenew interceptor instead of the CLI's own
+      # auto-refresh-on-401. Revert to unpinned once #273 merges.
       - name: Install silverfin-cli
         run: |
-          npm install https://github.com/silverfin/silverfin-cli.git
+          npm install https://github.com/silverfin/silverfin-cli.git#ci-auth-no-auto-renew
           VERSION=$(node ./node_modules/silverfin-cli/bin/cli.js -V)
           echo "silverfin-cli version: ${VERSION}"
 
@@ -163,12 +177,6 @@ jobs:
         run: |
           mkdir -p "$HOME/.silverfin"
           echo '${{ secrets.CONFIG_JSON }}' > "$HOME/.silverfin/config.json"
-          # Blank every firm's refreshToken so an expired access token fails cleanly on a 401
-          # instead of silently rotating (and poisoning) the shared CONFIG_JSON secret this
-          # workflow never writes back to.
-          jq 'to_entries | map(if (.key|test("^[0-9]+$")) then .value.refreshToken = "" else . end) | from_entries' \
-            "$HOME/.silverfin/config.json" > "$HOME/.silverfin/config.stripped.json"
-          mv "$HOME/.silverfin/config.stripped.json" "$HOME/.silverfin/config.json"
           node ./node_modules/silverfin-cli/bin/cli.js config --set-firm="${FIRM_ID}"
           node ./node_modules/silverfin-cli/bin/cli.js config --get-firm
 
