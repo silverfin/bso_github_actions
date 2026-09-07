@@ -171,12 +171,16 @@ runs:
         GH_TOKEN: ${{ inputs.repo_access_token }}
         GH_REPO: ${{ github.repository }}
       run: |
-        if [[ -z "${EXPECTED_FIRM_IDS}" ]]; then
-          # Not write_back_failed: the refresh step itself never completed (empty
-          # refresh_completed already signals this), so no write-back was ever attempted. A
-          # caller checks WRITE_BACK_FAILED before REFRESH_COMPLETED - setting it here would
-          # misreport a refresh failure as "every firm refreshed, but the write failed".
-          echo "::error::[Action] refresh never ran, refusing to write CONFIG_JSON"
+        if [[ "${REFRESH_COMPLETED}" != "true" ]]; then
+          # Covers both an early abort (before EXPECTED_FIRM_IDS is even set - the CONFIG_JSON
+          # shape check, or no firms found) and a *mid-loop* abort (EXPECTED_FIRM_IDS already set,
+          # but the per-firm loop or the autoRenew-seeding step died before reaching the end and
+          # writing REFRESH_COMPLETED/REFRESH_FAILED_FIRMS) - checking EXPECTED_FIRM_IDS alone
+          # missed the second case, since it's set well before the loop finishes. Not
+          # write_back_failed: the refresh step itself never completed, so no write-back was ever
+          # attempted. A caller checks WRITE_BACK_FAILED before REFRESH_COMPLETED - setting it here
+          # would misreport a refresh failure as "every firm refreshed, but the write failed".
+          echo "::error::[Action] refresh did not complete, refusing to write CONFIG_JSON"
           exit 1
         fi
         if [[ -n "${REFRESH_FAILED_FIRMS}" ]]; then
