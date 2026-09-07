@@ -46,6 +46,9 @@ on:
       CONFIG_JSON:
         description: "silverfin-cli credentials file content (per-firm OAuth tokens). Refreshed and written back by this workflow's own check-auth job before use."
         required: true
+      SLACK_CI_ALERTS_WEBHOOK_URL:
+        description: "Optional. Slack webhook to alert on a check-auth failure ahead of the push. Silently skipped if not supplied."
+        required: false
 
 permissions:
   contents: read
@@ -61,6 +64,55 @@ jobs:
     with:
       seed_no_auto_renew: true
     secrets: inherit
+
+  # Same shape as run_tests.yml's alert job - `always() && result != 'success'` catches the
+  # zero-step failure `if: failure()` would miss, and this repo has no SLACK_CI_ALERTS_WEBHOOK_URL
+  # of its own, so the runtime guard is required, not optional.
+  alert-on-check-auth-failure:
+    needs: check-auth
+    if: always() && needs.check-auth.result != 'success'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Alert Slack on check-auth failure
+        run: |
+          if [[ -z "${SLACK}" ]]; then
+            echo "No SLACK_CI_ALERTS_WEBHOOK_URL secret in this repository, skipping alert"
+            exit 0
+          fi
+          if [[ "${REFRESH_COMPLETED}" != "true" ]]; then
+            FIRMS="unknown"
+            DETAIL="the refresh loop did not finish - check the job log (a zero-step startup_failure/cancellation, or an early abort inside check_auth.yml's own refresh step, e.g. an invalid CONFIG_JSON or no firms in it)"
+            if [[ -n "${AUTO_RENEW_LOST}" ]]; then
+              DETAIL="${DETAIL} | also: the CLI did not preserve the autoRenew flag for firm(s): ${AUTO_RENEW_LOST}"
+            fi
+          elif [[ -n "${FAILED_FIRMS}" ]]; then
+            FIRMS="${FAILED_FIRMS}"
+            DETAIL="${FAILED_SUMMARY}"
+            if [[ -n "${AUTO_RENEW_LOST}" ]]; then
+              DETAIL="${DETAIL} | also: the CLI did not preserve the autoRenew flag for firm(s): ${AUTO_RENEW_LOST}"
+            fi
+          elif [[ -n "${AUTO_RENEW_LOST}" ]]; then
+            FIRMS="${AUTO_RENEW_LOST}"
+            DETAIL="every token refreshed and CONFIG_JSON was written, but the CLI did not preserve the autoRenew flag for these firms - the no-renew protection is not in effect for them"
+          else
+            FIRMS="none"
+            DETAIL="no firm failed its own token refresh - a later step (the CONFIG_JSON write-back, or its own firm-set validation) failed instead; check the job log"
+          fi
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TEXT=$(printf '⚠️ check-auth failed in %s before a push-to-review-firm run (dev tickets: %s) — firm(s): %s\n%s\n%s' \
+            "${{ github.repository }}" "${DEV_KEYS:-unknown}" "$FIRMS" "$DETAIL" "$RUN_URL")
+          curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
+            -X POST "$SLACK" -H 'Content-Type: application/json' \
+            --data-binary "$(jq -n --arg text "$TEXT" '{text: $text}')" \
+            || echo "::warning::failed to post the check-auth alert to Slack"
+        env:
+          SLACK: ${{ secrets.SLACK_CI_ALERTS_WEBHOOK_URL }}
+          FAILED_FIRMS: ${{ needs.check-auth.outputs.failed_firms }}
+          FAILED_SUMMARY: ${{ needs.check-auth.outputs.failed_firms_summary }}
+          REFRESH_COMPLETED: ${{ needs.check-auth.outputs.refresh_completed }}
+          AUTO_RENEW_LOST: ${{ needs.check-auth.outputs.auto_renew_lost }}
+          DEV_KEYS: ${{ inputs.dev_ticket_keys }}
 
   push:
     needs: check-auth
