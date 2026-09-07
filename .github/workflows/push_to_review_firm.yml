@@ -84,7 +84,8 @@ jobs:
       always() &&
       (needs.push.outputs.refresh_completed != 'true' ||
        needs.push.outputs.failed_firms != '' ||
-       needs.push.outputs.auto_renew_lost != '')
+       needs.push.outputs.auto_renew_lost != '' ||
+       needs.push.outputs.write_back_failed == 'true')
     runs-on: ubuntu-latest
     permissions: {}
     steps:
@@ -94,7 +95,14 @@ jobs:
             echo "No SLACK_CI_ALERTS_WEBHOOK_URL secret in this repository, skipping alert"
             exit 0
           fi
-          if [[ "${REFRESH_COMPLETED}" != "true" ]]; then
+          # Checked first: refresh_completed/failed_firms/auto_renew_lost are all set to their
+          # pre-write-back (healthy) values when the write-back itself is what failed, so this
+          # would otherwise fall through to the "everything succeeded" branch below and never
+          # alert on a genuine secret-persistence failure.
+          if [[ "${WRITE_BACK_FAILED}" == "true" ]]; then
+            FIRMS="none"
+            DETAIL="every firm refreshed, but writing CONFIG_JSON back to the secret failed - check the job log"
+          elif [[ "${REFRESH_COMPLETED}" != "true" ]]; then
             FIRMS="unknown"
             DETAIL="the refresh loop did not finish - check the job log (a zero-step startup_failure/cancellation, or an early abort inside the refresh step, e.g. an invalid CONFIG_JSON or no firms in it)"
             if [[ -n "${AUTO_RENEW_LOST}" ]]; then
@@ -123,21 +131,25 @@ jobs:
           FAILED_SUMMARY: ${{ needs.push.outputs.failed_firms_summary }}
           REFRESH_COMPLETED: ${{ needs.push.outputs.refresh_completed }}
           AUTO_RENEW_LOST: ${{ needs.push.outputs.auto_renew_lost }}
+          WRITE_BACK_FAILED: ${{ needs.push.outputs.write_back_failed }}
           DEV_KEYS: ${{ inputs.dev_ticket_keys }}
 
   push:
     runs-on: ubuntu-latest
-    # Refresh jobs are short (well under a minute), so serializing this job against
-    # check_auth.yml's other callers (the cron, run_tests.yml) here is cheap - unlike
-    # test-templates in run_tests.yml, which can run up to two hours and would block
-    # the cron for the group's whole duration if it carried this same group.
-    concurrency:
-      group: refresh-tokens
+    # No `concurrency: group: refresh-tokens` here, even though the first step refreshes
+    # CONFIG_JSON: that group applies for the job's whole duration, not just the refresh, and
+    # this job's own duration isn't reliably short - it also checks out the repo, installs the
+    # CLI, and runs the full multi-PR template-push loop below. Serializing all of that against
+    # the cron would block it for however long a push run takes, same reasoning as test-templates
+    # in run_tests.yml. Accepted trade: this job's own refresh can race a concurrent cron/other-
+    # caller refresh with no GitHub-level serialization - bounded and loud (a clean exit 2 via the
+    # autoRenew interceptor), never silent.
     outputs:
       failed_firms: ${{ steps.refresh.outputs.failed_firms }}
       failed_firms_summary: ${{ steps.refresh.outputs.failed_firms_summary }}
       auto_renew_lost: ${{ steps.refresh.outputs.auto_renew_lost }}
       refresh_completed: ${{ steps.refresh.outputs.refresh_completed }}
+      write_back_failed: ${{ steps.refresh.outputs.write_back_failed }}
       firm_id: ${{ steps.firm.outputs.firm_id }}
       pr_numbers: ${{ steps.prs.outputs.pr_numbers }}
       results_md: ${{ steps.push.outputs.results_md }}
@@ -147,6 +159,15 @@ jobs:
       SF_API_CLIENT_ID: ${{ secrets.SF_API_CLIENT_ID }}
       SF_API_SECRET: ${{ secrets.SF_API_SECRET }}
     steps:
+      # First step, deliberately: a local `./`-path action reference only resolves once the
+      # repo is checked out on the runner - unlike a fully-qualified owner/repo/path@ref
+      # reference (which the caller in be_market's run_tests.yml uses instead), a bare `./`
+      # path finds nothing before this.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Refresh CONFIG_JSON
         id: refresh
         uses: ./.github/actions/refresh-config-json
@@ -234,22 +255,18 @@ jobs:
             core.setOutput("pr_numbers", JSON.stringify(matched.map(m => m.number)));
             core.setOutput("pr_head_refs", JSON.stringify(matched.map(m => m.head_ref)));
 
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # Pinned to the same unmerged branch as run_tests.yml's pilot job (silverfin-cli#273) so a
-      # stale access token exits cleanly via the autoRenew interceptor instead of the CLI's own
-      # auto-refresh-on-401. Revert to unpinned once #273 merges.
+      # Pinned to a SHA, not the branch name: silverfin-cli#273 is open and unmerged, so the
+      # branch ref is mutable - a later push or a force-push would change what this secret-writing
+      # job installs with no workflow diff to review. Same reasoning as run_tests.yml's own pin.
+      # Revert to unpinned once #273 merges.
       - name: Install silverfin-cli
         run: |
-          npm install https://github.com/silverfin/silverfin-cli.git#ci-auth-no-auto-renew
+          npm install https://github.com/silverfin/silverfin-cli.git#b072a6027f447437993728645a39bed2a0f6f5c9
           VERSION=$(node ./node_modules/silverfin-cli/bin/cli.js -V)
           echo "silverfin-cli version: ${VERSION}"
 
@@ -443,23 +460,66 @@ jobs:
           DEV_TICKET_KEYS: ${{ inputs.dev_ticket_keys }}
           FR_TICKET_KEY: ${{ inputs.fr_ticket_key }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          AUTH_FAILED: ${{ needs.push.outputs.refresh_completed != 'true' || needs.push.outputs.failed_firms != '' || needs.push.outputs.write_back_failed == 'true' }}
         with:
           script: |
+            const { owner, repo } = context.repo;
+            const marker = "<!-- silverfin-push-to-review-firm -->";
+            const runUrl = process.env.RUN_URL;
+            const devKeys = process.env.DEV_TICKET_KEYS || "";
+            const frKey = process.env.FR_TICKET_KEY || "";
+
             let prNumbers = [];
             try { prNumbers = JSON.parse(process.env.PR_NUMBERS || "[]"); } catch { prNumbers = []; }
+
+            // Auth failed before PR resolution ever ran (push's own first step), so prNumbers is
+            // empty for a reason that has nothing to do with whether the dev tickets have open
+            // PRs - resolve them directly here so the PM/developer gets a comment at all instead
+            // of a silent red workflow (a Slack alert also fires, but only if configured).
+            if ((!Array.isArray(prNumbers) || prNumbers.length === 0) && process.env.AUTH_FAILED === "true") {
+              const keys = devKeys.split(",").map(s => s.trim()).filter(Boolean);
+              if (keys.length > 0) {
+                const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: "open", per_page: 100 });
+                prNumbers = open
+                  .filter(pr => keys.some(k => pr.head.ref === k || pr.head.ref.startsWith(k + "-")))
+                  .map(pr => pr.number);
+              }
+              if (prNumbers.length === 0) {
+                core.info("Auth failed and no open PR matched the dev ticket keys either - nothing to comment on.");
+                return;
+              }
+              const body = [
+                `## Push to review firm`,
+                "",
+                `⚠️ The push did not run — CONFIG_JSON authentication failed before any template was pushed. See the [workflow run](${runUrl}) and the Slack alert (if configured) for details.`,
+                "",
+                frKey ? `- Functional review ticket: \`${frKey}\`` : null,
+                devKeys ? `- Development ticket(s): \`${devKeys}\`` : null,
+                `- Workflow run: ${runUrl}`,
+                "",
+                marker,
+              ].filter(Boolean).join("\n");
+              for (const num of prNumbers) {
+                const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: num, per_page: 100 });
+                const existing = comments.find(c => c.user && c.user.type === "Bot" && c.body && c.body.includes(marker));
+                if (existing) {
+                  await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+                } else {
+                  await github.rest.issues.createComment({ owner, repo, issue_number: num, body });
+                }
+                core.info(`Posted auth-failure comment on PR #${num}`);
+              }
+              return;
+            }
+
             if (!Array.isArray(prNumbers) || prNumbers.length === 0) {
               core.info("No PRs to comment on (the push job did not get past PR resolution — see the run log).");
               return;
             }
-            const { owner, repo } = context.repo;
-            const marker = "<!-- silverfin-push-to-review-firm -->";
             const firmId = process.env.FIRM_ID || "(unknown)";
             const anyFailed = process.env.ANY_FAILED === "1";
             const nothingToPush = process.env.NOTHING_TO_PUSH === "true";
             const resultsMd = process.env.RESULTS_MD || "";
-            const devKeys = process.env.DEV_TICKET_KEYS || "";
-            const frKey = process.env.FR_TICKET_KEY || "";
-            const runUrl = process.env.RUN_URL;
 
             let overall;
             if (nothingToPush) {

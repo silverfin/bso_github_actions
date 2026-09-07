@@ -39,6 +39,9 @@ outputs:
   refresh_completed:
     description: "\"true\" once the refresh loop ran to completion, whether or not any firm failed."
     value: ${{ steps.refresh.outputs.refresh_completed }}
+  write_back_failed:
+    description: "\"true\" if the CONFIG_JSON write-back itself failed (exhausted retries on a transient error, or a non-transient error) - refresh_completed/failed_firms/auto_renew_lost are all set to their pre-write-back values in this case and do not reflect it, so a caller's alert condition must check this separately or a genuine secret-persistence failure goes unalerted."
+    value: ${{ steps.write-back.outputs.write_back_failed }}
 runs:
   using: composite
   steps:
@@ -157,12 +160,14 @@ runs:
       run: |
         if [[ -z "${EXPECTED_FIRM_IDS}" ]]; then
           echo "::error::[Action] refresh never ran, refusing to write CONFIG_JSON"
+          echo "write_back_failed=true" >> "$GITHUB_OUTPUT"
           exit 1
         fi
         FOUND_FIRM_IDS=$(jq -r 'del(.defaultFirmIDs, .host) | keys[] | select(test("^[0-9]+$"))' "$HOME/.silverfin/config.json" | tr '\n' ' ')
         for FIRM_ID in ${EXPECTED_FIRM_IDS}; do
           if [[ " ${FOUND_FIRM_IDS} " != *" ${FIRM_ID} "* ]]; then
             echo "::error::[Action] firm ${FIRM_ID} is missing from the config, refusing to write CONFIG_JSON"
+            echo "write_back_failed=true" >> "$GITHUB_OUTPUT"
             exit 1
           fi
         done
@@ -196,10 +201,12 @@ runs:
           fi
           if ! grep -qE 'HTTP 5[0-9]{2}' <<< "${ERR}"; then
             echo "::error::[Action] failed to write CONFIG_JSON (non-transient failure): ${ERR}"
+            echo "write_back_failed=true" >> "$GITHUB_OUTPUT"
             exit 1
           fi
           if (( ATTEMPT >= MAX_ATTEMPTS )); then
             echo "::error::[Action] failed to write CONFIG_JSON after ${MAX_ATTEMPTS} attempts: ${ERR}"
+            echo "write_back_failed=true" >> "$GITHUB_OUTPUT"
             exit 1
           fi
           SLEEP=$(( 2 ** ATTEMPT ))
