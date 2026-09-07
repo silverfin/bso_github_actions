@@ -49,10 +49,15 @@ runs:
       uses: actions/setup-node@v6
       with:
         node-version: 22
-    - name: Add silverfin-cli package latest version
+    # Pinned to the same reviewed commit push_to_review_firm.yml and run_tests.yml pin their own
+    # CLI install to: this step runs with real Silverfin API credentials and a secret-writable
+    # PAT, so an unpinned install would let a later push to silverfin-cli's default branch alter
+    # credential-handling code with no workflow diff to review. Revert to unpinned once
+    # silverfin-cli#273 merges, same as those two files.
+    - name: Add silverfin-cli package (pinned)
       shell: bash
       run: |
-        npm install https://github.com/silverfin/silverfin-cli.git
+        npm install https://github.com/silverfin/silverfin-cli.git#b072a6027f447437993728645a39bed2a0f6f5c9
         VERSION=$(./node_modules/silverfin-cli/bin/cli.js -V)
         echo "[Action] CLI version: ${VERSION}"
     - name: Create Silverfin config file

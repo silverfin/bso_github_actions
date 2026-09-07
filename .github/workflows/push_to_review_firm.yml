@@ -465,7 +465,7 @@ jobs:
           DEV_TICKET_KEYS: ${{ inputs.dev_ticket_keys }}
           FR_TICKET_KEY: ${{ inputs.fr_ticket_key }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          AUTH_FAILED: ${{ needs.push.outputs.refresh_completed != 'true' || needs.push.outputs.failed_firms != '' || needs.push.outputs.write_back_failed == 'true' }}
+          AUTH_FAILED: ${{ needs.push.outputs.refresh_completed != 'true' || needs.push.outputs.failed_firms != '' || needs.push.outputs.auto_renew_lost != '' || needs.push.outputs.write_back_failed == 'true' }}
         with:
           script: |
             const { owner, repo } = context.repo;
@@ -486,7 +486,10 @@ jobs:
               if (keys.length > 0) {
                 const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: "open", per_page: 100 });
                 prNumbers = open
-                  .filter(pr => keys.some(k => pr.head.ref === k || pr.head.ref.startsWith(k + "-")))
+                  .filter(pr =>
+                    (!pr.head.repo || pr.head.repo.full_name === `${owner}/${repo}`) &&
+                    keys.some(k => pr.head.ref === k || pr.head.ref.startsWith(k + "-"))
+                  )
                   .map(pr => pr.number);
               }
               if (prNumbers.length === 0) {
@@ -496,7 +499,7 @@ jobs:
               const body = [
                 `## Push to review firm`,
                 "",
-                `⚠️ The push did not run — CONFIG_JSON authentication failed before any template was pushed. See the [workflow run](${runUrl}) and the Slack alert (if configured) for details.`,
+                `⚠️ The push did not run — CONFIG_JSON credential refresh or its autoRenew safety check failed before any template was pushed. See the [workflow run](${runUrl}) and the Slack alert (if configured) for details.`,
                 "",
                 frKey ? `- Functional review ticket: \`${frKey}\`` : null,
                 devKeys ? `- Development ticket(s): \`${devKeys}\`` : null,
