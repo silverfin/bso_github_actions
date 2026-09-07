@@ -158,9 +158,11 @@ runs:
           echo "failed_firms_summary=${FAILED_SUMMARY}"
           echo "refresh_completed=true"
         } >> "$GITHUB_OUTPUT"
-    # `always()`: keeps the renewals that succeeded when another firm failed. Because it also runs
-    # when an earlier step failed, the config must be shape-checked first - an empty or truncated
-    # file here would overwrite every firm's tokens.
+    # `always()`: runs even when the refresh step above failed a firm, so it can see
+    # REFRESH_FAILED_FIRMS and refuse to write rather than being skipped silently. It does NOT mean
+    # "write anyway" - see the REFRESH_FAILED_FIRMS check below for why a partial success no longer
+    # gets written back here (unlike check_auth.yml's own always-write, which is safe because it
+    # has no concurrent sibling writers to race against).
     - name: Prepare and store updated CONFIG_JSON as secret
       id: write-back
       if: always()
@@ -169,12 +171,30 @@ runs:
         GH_TOKEN: ${{ inputs.repo_access_token }}
         GH_REPO: ${{ github.repository }}
       run: |
-        if [[ -z "${EXPECTED_FIRM_IDS}" ]]; then
-          # Not write_back_failed: the refresh step itself never completed (empty
-          # refresh_completed already signals this), so no write-back was ever attempted. A
-          # caller checks WRITE_BACK_FAILED before REFRESH_COMPLETED - setting it here would
-          # misreport a refresh failure as "every firm refreshed, but the write failed".
-          echo "::error::[Action] refresh never ran, refusing to write CONFIG_JSON"
+        if [[ "${REFRESH_COMPLETED}" != "true" ]]; then
+          # Covers both an early abort (before EXPECTED_FIRM_IDS is even set - the CONFIG_JSON
+          # shape check, or no firms found) and a *mid-loop* abort (EXPECTED_FIRM_IDS already set,
+          # but the per-firm loop or the autoRenew-seeding step died before reaching the end and
+          # writing REFRESH_COMPLETED/REFRESH_FAILED_FIRMS) - checking EXPECTED_FIRM_IDS alone
+          # missed the second case, since it's set well before the loop finishes. Not
+          # write_back_failed: the refresh step itself never completed, so no write-back was ever
+          # attempted. A caller checks WRITE_BACK_FAILED before REFRESH_COMPLETED - setting it here
+          # would misreport a refresh failure as "every firm refreshed, but the write failed".
+          echo "::error::[Action] refresh did not complete, refusing to write CONFIG_JSON"
+          exit 1
+        fi
+        if [[ -n "${REFRESH_FAILED_FIRMS}" ]]; then
+          # Concurrent jobs each read their own start-of-run snapshot and each independently
+          # refresh every firm - no concurrency group can cover this (composite actions can't join
+          # one). A firm that failed here almost always means a sibling job already spent this same
+          # refresh token and won; this job's local copy of that firm is now stale, not just
+          # unrefreshed. Writing the rest of this file back anyway would carry that stale entry
+          # along and can overwrite the sibling's good pair if this write lands second - confirmed
+          # 2026-09-07, firm 6056 went permanently dead this way. Skipping the whole write and
+          # deferring to a later successful run (every consumer run attempts a full refresh, so one
+          # is never far away) is the only safe option without a way to re-read the secret's
+          # current value mid-job.
+          echo "::error::[Action] firm(s) ${REFRESH_FAILED_FIRMS} failed to refresh - refusing to write CONFIG_JSON so this job's stale copy of them can't overwrite a fresher pair a concurrent job may have already written"
           exit 1
         fi
         FOUND_FIRM_IDS=$(jq -r 'del(.defaultFirmIDs, .host) | keys[] | select(test("^[0-9]+$"))' "$HOME/.silverfin/config.json" | tr '\n' ' ')
