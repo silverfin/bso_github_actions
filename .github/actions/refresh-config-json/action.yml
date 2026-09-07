@@ -164,8 +164,11 @@ runs:
         GH_REPO: ${{ github.repository }}
       run: |
         if [[ -z "${EXPECTED_FIRM_IDS}" ]]; then
+          # Not write_back_failed: the refresh step itself never completed (empty
+          # refresh_completed already signals this), so no write-back was ever attempted. A
+          # caller checks WRITE_BACK_FAILED before REFRESH_COMPLETED - setting it here would
+          # misreport a refresh failure as "every firm refreshed, but the write failed".
           echo "::error::[Action] refresh never ran, refusing to write CONFIG_JSON"
-          echo "write_back_failed=true" >> "$GITHUB_OUTPUT"
           exit 1
         fi
         FOUND_FIRM_IDS=$(jq -r 'del(.defaultFirmIDs, .host) | keys[] | select(test("^[0-9]+$"))' "$HOME/.silverfin/config.json" | tr '\n' ' ')
