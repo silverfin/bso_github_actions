@@ -91,6 +91,22 @@ JSON
   echo '# AT Fixture' > "$root/account_templates/AT_fixture/README.md"
 }
 
+# Regression case: a changed path with a space AND a shell metacharacter
+# (e.g. an account template named "Foo Bar & Baz", a real shape in
+# be_market) must survive extract_template_dirs whole - the dir extraction
+# uses [^/]+ and never word-splits, so this locks that invariant in. The
+# actual space-mangling bug this guards against lives in the workflow's own
+# changed-files extraction step (tr ' ' '\n'), not in this function - but
+# nothing previously exercised a space-containing path through this
+# function to prove it was never at risk here too.
+test_extract_template_dirs_with_spaces_and_metacharacters() {
+  local input
+  input=$(printf '%s\n' "account_templates/Foo Bar & Baz/main.liquid")
+  local actual
+  actual=$(extract_template_dirs <<< "$input")
+  assert_eq "extract_template_dirs preserves spaces/metacharacters in dir names" "account_templates/Foo Bar & Baz" "$actual"
+}
+
 test_resolve_fanout_consumers() {
   setup_shared_part_consumers_fixture
   local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
@@ -305,6 +321,45 @@ test_cli_fails_when_readme_missing() {
   assert_eq "CLI fails when a required README is missing from the diff" "1" "$rc"
 }
 
+# Regression case: main()'s structural-validation loop used to match any
+# CHANGED path ending in "README.md" (a substring/suffix match), which also
+# hits nested liquid-test docs like reconciliation_texts/<x>/tests/README.md
+# - a completely different, unrelated file that happens to share a
+# basename with the real template-root README. This test's nested README
+# is deliberately invalid (missing all four required headings): if main()
+# still matched it, the CLI would fail with "missing required section"
+# errors for a file that was never supposed to be validated at all. The
+# template-root README is included in the diff too, valid, so the only way
+# this test can pass is if the nested one is correctly ignored.
+test_cli_ignores_nested_tests_readme_for_structural_validation() {
+  local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
+  rm -rf "$root"
+  mkdir -p "$root/reconciliation_texts/some_fixture/tests"
+
+  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/reconciliation_texts/some_fixture/README.md"
+  cat > "$root/reconciliation_texts/some_fixture/tests/README.md" << 'MD'
+# Liquid Testing
+
+## 274 APT-8 - some scenario
+MD
+
+  local changed changed_file rc out
+  changed=$(printf '%s\n' \
+    "reconciliation_texts/some_fixture/main.liquid" \
+    "reconciliation_texts/some_fixture/README.md" \
+    "reconciliation_texts/some_fixture/tests/README.md")
+  changed_file="$SCRIPT_DIR/fixtures/changed-files-nested-readme.txt"
+  echo "$changed" > "$changed_file"
+  out=$(bash "$SCRIPT_DIR/../check-template-docs.sh" "$changed_file" "$root" 2>&1) && rc=0 || rc=$?
+  assert_eq "CLI ignores nested tests/README.md for structural validation: exit 0" "0" "$rc"
+  if [[ "$out" == *"missing required section"* ]]; then
+    echo "FAIL: nested tests/README.md should not be structurally validated, got: $out"
+    failures=$((failures + 1))
+  else
+    echo "PASS: nested tests/README.md is not structurally validated"
+  fi
+}
+
 test_cli_github_output_all_valid() {
   setup_shared_part_consumers_fixture
   local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
@@ -408,7 +463,33 @@ MD
   fi
 }
 
+# Regression case: main() previously had no arity guard, so calling the CLI
+# with fewer than 2 args died with a bare "$1: unbound variable" under
+# `set -u` instead of a legible usage message. Cover both 0 and 1 args.
+test_cli_usage_message_on_missing_args() {
+  local out rc
+
+  out=$(bash "$SCRIPT_DIR/../check-template-docs.sh" 2>&1) && rc=0 || rc=$?
+  assert_eq "CLI with 0 args: nonzero exit" "1" "$rc"
+  if [[ "$out" == *"Usage:"* ]]; then
+    echo "PASS: CLI with 0 args prints a Usage message"
+  else
+    echo "FAIL: CLI with 0 args should print a Usage message, got: $out"
+    failures=$((failures + 1))
+  fi
+
+  out=$(bash "$SCRIPT_DIR/../check-template-docs.sh" "/tmp/some-changed-files.txt" 2>&1) && rc=0 || rc=$?
+  assert_eq "CLI with 1 arg: nonzero exit" "1" "$rc"
+  if [[ "$out" == *"Usage:"* ]]; then
+    echo "PASS: CLI with 1 arg prints a Usage message"
+  else
+    echo "FAIL: CLI with 1 arg should print a Usage message, got: $out"
+    failures=$((failures + 1))
+  fi
+}
+
 test_extract_template_dirs
+test_extract_template_dirs_with_spaces_and_metacharacters
 test_extract_shared_part_dirs
 test_extract_dirs_with_no_matches_at_all
 test_resolve_fanout_consumers
@@ -427,7 +508,9 @@ test_validate_readme_structure_wrong_heading_level
 test_validate_readme_structure_pii_leak
 test_cli_passes_when_nothing_missing_and_all_valid
 test_cli_fails_when_readme_missing
+test_cli_ignores_nested_tests_readme_for_structural_validation
 test_cli_github_output_all_valid
+test_cli_usage_message_on_missing_args
 
 if [[ $failures -gt 0 ]]; then
   echo "$failures test(s) failed"

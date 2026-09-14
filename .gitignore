@@ -2,3 +2,5 @@
 /stats
 .env
 .DS_Store
+/scripts/test/fixtures/shared-part-consumers/
+/scripts/test/fixtures/changed-files*.txt

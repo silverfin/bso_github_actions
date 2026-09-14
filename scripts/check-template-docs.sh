@@ -199,6 +199,11 @@ validate_readme_structure() {
 
 # CLI entrypoint - only runs when this file is executed directly, not when sourced.
 main() {
+  if [[ $# -lt 2 ]]; then
+    echo "Usage: $0 <changed_files_path> <repo_root>" >&2
+    return 1
+  fi
+
   local changed_files_path="$1"
   local repo_root="$2"
 
@@ -211,7 +216,13 @@ main() {
 
   local invalid=()
   while IFS= read -r changed; do
-    [[ "$changed" == *"README.md" ]] || continue
+    # Anchored to the exact shape compute_expected_readmes can produce -
+    # reconciliation_texts/<x>/README.md or account_templates/<x>/README.md
+    # at the template ROOT only. A plain suffix match (*"README.md") would
+    # also hit e.g. reconciliation_texts/<x>/tests/README.md (liquid-test
+    # scenario docs, unrelated to this check) and falsely flag them as
+    # invalid template READMEs for missing the four required headings.
+    [[ "$changed" =~ ^(reconciliation_texts|account_templates)/[^/]+/README\.md$ ]] || continue
     local full_path="$repo_root/$changed"
     [[ -f "$full_path" ]] || continue
     local errors
