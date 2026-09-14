@@ -85,3 +85,40 @@ resolve_fanout_consumers() {
   (( ${#results[@]} )) && printf '%s\n' "${results[@]}" | sort -u
   return 0
 }
+
+# $1 = path to file of changed files (newline-separated), or process substitution.
+# $2 = repo_root.
+compute_expected_readmes() {
+  local changed_files_path="$1"
+  local repo_root="$2"
+  local changed
+  changed=$(cat "$changed_files_path")
+
+  local template_dirs shared_part_dirs
+  template_dirs=$(extract_template_dirs <<< "$changed")
+  shared_part_dirs=$(extract_shared_part_dirs <<< "$changed")
+
+  local results=()
+  while IFS= read -r dir; do
+    [[ -z "$dir" ]] && continue
+    results+=("$dir/README.md")
+  done <<< "$template_dirs"
+
+  while IFS= read -r sp_dir; do
+    [[ -z "$sp_dir" ]] && continue
+    while IFS= read -r consumer_dir; do
+      [[ -z "$consumer_dir" ]] && continue
+      results+=("$consumer_dir/README.md")
+    done < <(resolve_fanout_consumers "$sp_dir" "$repo_root")
+  done <<< "$shared_part_dirs"
+
+  (( ${#results[@]} )) && printf '%s\n' "${results[@]}" | sort -u
+  return 0
+}
+
+# $1 = path to file of expected README paths. $2 = path to file of changed files.
+find_missing() {
+  local expected_path="$1"
+  local changed_path="$2"
+  comm -23 <(sort -u "$expected_path") <(sort -u "$changed_path")
+}

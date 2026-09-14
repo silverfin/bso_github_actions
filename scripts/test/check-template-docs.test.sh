@@ -184,6 +184,41 @@ JSON
   assert_eq "resolve_fanout_consumers (pre-migration type aliases: reconciliation, reconciliation_text, account_detail_template, account_template)" "$expected" "$actual"
 }
 
+test_compute_expected_readmes() {
+  setup_shared_part_consumers_fixture
+  local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
+  local changed
+  changed=$(printf '%s\n' \
+    "shared_parts/be_legal_fixture/be_legal_fixture.liquid" \
+    "reconciliation_texts/vol_1_fixture/main.liquid")
+  local actual
+  actual=$(compute_expected_readmes <(echo "$changed") "$root" 2>/dev/null)
+  local expected
+  expected=$(printf '%s\n' \
+    "account_templates/AT_fixture/README.md" \
+    "reconciliation_texts/vol_1_fixture/README.md")
+  assert_eq "compute_expected_readmes" "$expected" "$actual"
+}
+
+test_compute_expected_readmes_empty_input() {
+  setup_shared_part_consumers_fixture
+  local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
+  local changed
+  changed=$(printf '%s\n' "docs/README.md" ".github/workflows/foo.yml")
+  local actual rc
+  actual=$(compute_expected_readmes <(echo "$changed") "$root" 2>/dev/null) && rc=0 || rc=$?
+  assert_eq "compute_expected_readmes (empty input): exit 0" "0" "$rc"
+  assert_eq "compute_expected_readmes (empty input): empty output" "" "$actual"
+}
+
+test_find_missing() {
+  local expected changed actual
+  expected=$(printf '%s\n' "account_templates/AT_fixture/README.md" "reconciliation_texts/vol_1_fixture/README.md")
+  changed=$(printf '%s\n' "reconciliation_texts/vol_1_fixture/README.md" "reconciliation_texts/vol_1_fixture/main.liquid")
+  actual=$(find_missing <(echo "$expected") <(echo "$changed"))
+  assert_eq "find_missing" "account_templates/AT_fixture/README.md" "$actual"
+}
+
 test_extract_template_dirs
 test_extract_shared_part_dirs
 test_extract_dirs_with_no_matches_at_all
@@ -191,6 +226,9 @@ test_resolve_fanout_consumers
 test_resolve_fanout_consumers_empty_result
 test_resolve_fanout_consumers_malformed_config
 test_resolve_fanout_consumers_legacy_type_aliases
+test_compute_expected_readmes
+test_compute_expected_readmes_empty_input
+test_find_missing
 
 if [[ $failures -gt 0 ]]; then
   echo "$failures test(s) failed"
