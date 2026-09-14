@@ -152,3 +152,76 @@ find_page_by_handle() {
     return 0
   fi
 }
+
+SYNC_CALLOUT='<callout icon="🤖">This page is generated from the repo and will be overwritten on the next merge. Leave feedback as a comment - comments survive the sync.</callout>
+
+'
+
+# $1 = readme_path, $2 = template_dir, $3 = repo_root, $4 = data_source_id,
+# $5 = market, $6 = commit_sha.
+sync_readme() {
+  local readme_path="$1" template_dir="$2" repo_root="$3"
+  local data_source_id="$4" market="$5" commit_sha="$6"
+
+  local handle
+  handle=$(resolve_handle "$template_dir" "$repo_root") || { echo "FAILED: could not resolve handle"; return 0; }
+
+  local existing_page_id
+  existing_page_id=$(find_page_by_handle "$data_source_id" "$handle") || { echo "FAILED: lookup error"; return 0; }
+
+  if [[ "$existing_page_id" == "DUPLICATE" ]]; then
+    echo "DUPLICATE"
+    return 0
+  fi
+
+  local markdown_body readme_content
+  if ! readme_content=$(cat "$readme_path"); then
+    echo "FAILED: could not read $readme_path"
+    return 0
+  fi
+  markdown_body="$SYNC_CALLOUT$readme_content"
+
+  local page_id result
+  if [[ -z "$existing_page_id" ]]; then
+    local name
+    name=$(resolve_name "$template_dir" "$repo_root") || { echo "FAILED: could not resolve name"; return 0; }
+    local create_body
+    if ! create_body=$(jq -n \
+      --arg ds "$data_source_id" --arg name "$name" \
+      --arg handle "$handle" --arg market "$market" --arg md "$markdown_body" \
+      '{parent: {data_source_id: $ds}, properties: {Name: {title: [{text: {content: $name}}]}, Handle: {rich_text: [{text: {content: $handle}}]}, Market: {select: {name: $market}}}, markdown: $md}'); then
+      echo "FAILED: could not build create request body"
+      return 0
+    fi
+    local response
+    response=$(notion_request POST "/v1/pages" "$create_body") || { echo "FAILED: create request failed"; return 0; }
+    if ! page_id=$(echo "$response" | jq -r '.id'); then
+      echo "FAILED: could not parse create response"
+      return 0
+    fi
+    result="CREATED"
+  else
+    page_id="$existing_page_id"
+    local update_body
+    if ! update_body=$(jq -n --arg md "$markdown_body" '{type: "replace_content", replace_content: {new_str: $md}}'); then
+      echo "FAILED: could not build update request body"
+      return 0
+    fi
+    notion_request PATCH "/v1/pages/$page_id/markdown" "$update_body" > /dev/null || { echo "FAILED: update request failed"; return 0; }
+    result="UPDATED"
+  fi
+
+  local today short_sha
+  today=$(date -u +%Y-%m-%d)
+  short_sha="${commit_sha:0:7}"
+  local stamp_body
+  if ! stamp_body=$(jq -n \
+    --arg date "$today" --arg sha "$short_sha" --arg path "$template_dir" \
+    '{properties: {"Last synced": {date: {start: $date}}, "Source commit": {rich_text: [{text: {content: $sha}}]}, "Repo path": {rich_text: [{text: {content: $path}}]}}}'); then
+    echo "FAILED: could not build metadata stamp body"
+    return 0
+  fi
+  notion_request PATCH "/v1/pages/$page_id" "$stamp_body" > /dev/null || { echo "FAILED: metadata stamp failed"; return 0; }
+
+  echo "$result"
+}

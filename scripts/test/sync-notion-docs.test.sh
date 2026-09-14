@@ -254,6 +254,49 @@ test_find_page_by_handle_malformed_response
 # above is protecting against): if it did, we would never reach this line.
 echo "PASS: test script continued past the malformed jq response"
 
+test_sync_readme_creates_when_missing() {
+  setup_stub_curl
+  setup_resolve_fixture
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  echo "# Vol 1 fixture content" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  printf '200\t-\t{"results":[]}\n200\t-\t{"id":"new-page-1"}\n200\t-\t{"id":"new-page-1"}\n' > "$STUB_CURL_RESPONSES"
+  local out
+  out=$(NOTION_TOKEN="fake-token" sync_readme \
+    "$root/reconciliation_texts/vol_1_fixture/README.md" \
+    "reconciliation_texts/vol_1_fixture" "$root" "ds-abc" "BE" "abcdef1234567")
+  assert_eq "sync_readme creates when no existing page" "CREATED" "$out"
+}
+
+test_sync_readme_updates_when_present() {
+  setup_stub_curl
+  setup_resolve_fixture
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  echo "# Vol 1 fixture content" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  printf '200\t-\t{"results":[{"id":"page-existing"}]}\n200\t-\t{"id":"page-existing"}\n200\t-\t{"id":"page-existing"}\n' > "$STUB_CURL_RESPONSES"
+  local out
+  out=$(NOTION_TOKEN="fake-token" sync_readme \
+    "$root/reconciliation_texts/vol_1_fixture/README.md" \
+    "reconciliation_texts/vol_1_fixture" "$root" "ds-abc" "BE" "abcdef1234567")
+  assert_eq "sync_readme updates when a page already exists" "UPDATED" "$out"
+}
+
+test_sync_readme_skips_on_duplicate() {
+  setup_stub_curl
+  setup_resolve_fixture
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  echo "# Vol 1 fixture content" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  printf '200\t-\t{"results":[{"id":"page-1"},{"id":"page-2"}]}\n' > "$STUB_CURL_RESPONSES"
+  local out
+  out=$(NOTION_TOKEN="fake-token" sync_readme \
+    "$root/reconciliation_texts/vol_1_fixture/README.md" \
+    "reconciliation_texts/vol_1_fixture" "$root" "ds-abc" "BE" "abcdef1234567" 2>/dev/null)
+  assert_eq "sync_readme skips on duplicate Handle" "DUPLICATE" "$out"
+}
+
+test_sync_readme_creates_when_missing
+test_sync_readme_updates_when_present
+test_sync_readme_skips_on_duplicate
+
 if [[ $failures -gt 0 ]]; then
   echo "$failures test(s) failed"
   exit 1
