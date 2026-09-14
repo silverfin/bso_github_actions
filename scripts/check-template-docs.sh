@@ -139,3 +139,50 @@ find_missing() {
 
   comm -23 <(sort -u "$expected_path") <(sort -u "$changed_path")
 }
+
+REQUIRED_HEADINGS=(
+  "## Metadata"
+  "## Functional overview"
+  "## Scenarios & edge cases"
+  "## FAQ / support answers"
+)
+
+# $1 = path to a README.md. Prints one ERROR: line per problem to stdout,
+# nothing on success. Returns 0 if valid, 1 otherwise.
+validate_readme_structure() {
+  local readme_path="$1"
+  local ok=0
+
+  if [[ ! -s "$readme_path" ]]; then
+    echo "ERROR: file is empty or missing"
+    return 1
+  fi
+
+  for heading in "${REQUIRED_HEADINGS[@]}"; do
+    if ! grep -qF "$heading" "$readme_path"; then
+      echo "ERROR: missing required section: $heading"
+      ok=1
+    fi
+  done
+
+  # Unresolved skeleton placeholders: backtick-quoted {word} left as-is,
+  # e.g. `{handle}`, `{situation}`. A filled-in README should have none.
+  if grep -qE '`\{[a-zA-Z_ /]+\}`' "$readme_path"; then
+    echo "ERROR: unresolved placeholder(s) still present - the skeleton was not filled in:"
+    grep -nE '`\{[a-zA-Z_ /]+\}`' "$readme_path" | sed 's/^/  /'
+    ok=1
+  fi
+
+  # PII backstop: BE-shaped VAT/company numbers and email addresses.
+  # This is a mechanical net under the skill's own PII rule, not a
+  # replacement for it - false positives are expected and acceptable.
+  local pii_matches
+  pii_matches=$(grep -nE '(BE[0-9]{10}|BE0[0-9]{3}\.[0-9]{3}\.[0-9]{3}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})' "$readme_path" || true)
+  if [[ -n "$pii_matches" ]]; then
+    echo "ERROR: possible PII (VAT/company number or email) found - generalize per the skill's PII rule:"
+    echo "$pii_matches" | sed 's/^/  /'
+    ok=1
+  fi
+
+  return $ok
+}

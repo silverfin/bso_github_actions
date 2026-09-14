@@ -234,6 +234,49 @@ test_find_missing_unreadable_input() {
   rm -f "$stderr_out"
 }
 
+test_validate_readme_structure_valid() {
+  local out rc
+  out=$(validate_readme_structure "$SCRIPT_DIR/fixtures/readmes/valid.README.md") && rc=0 || rc=$?
+  assert_eq "valid README: no errors" "" "$out"
+  assert_eq "valid README: exit 0" "0" "$rc"
+}
+
+test_validate_readme_structure_missing_heading() {
+  local out rc
+  out=$(validate_readme_structure "$SCRIPT_DIR/fixtures/readmes/missing-heading.README.md") && rc=0 || rc=$?
+  assert_eq "missing heading: exit 1" "1" "$rc"
+  if [[ "$out" != *"## FAQ / support answers"* ]]; then
+    echo "FAIL: missing-heading output should name the missing heading, got: $out"
+    failures=$((failures + 1))
+  else
+    echo "PASS: missing-heading output names the missing heading"
+  fi
+}
+
+test_validate_readme_structure_unresolved_placeholder() {
+  local out rc
+  out=$(validate_readme_structure "$SCRIPT_DIR/fixtures/readmes/unresolved-placeholder.README.md") && rc=0 || rc=$?
+  assert_eq "unresolved placeholder: exit 1" "1" "$rc"
+  if [[ "$out" != *"unresolved placeholder"* ]]; then
+    echo "FAIL: unresolved-placeholder output should mention it, got: $out"
+    failures=$((failures + 1))
+  else
+    echo "PASS: unresolved-placeholder output mentions it"
+  fi
+}
+
+test_validate_readme_structure_pii_leak() {
+  local out rc
+  out=$(validate_readme_structure "$SCRIPT_DIR/fixtures/readmes/pii-leak.README.md") && rc=0 || rc=$?
+  assert_eq "pii leak: exit 1" "1" "$rc"
+  if [[ "$out" != *"possible PII"* ]]; then
+    echo "FAIL: pii-leak output should flag possible PII, got: $out"
+    failures=$((failures + 1))
+  else
+    echo "PASS: pii-leak output flags possible PII"
+  fi
+}
+
 test_extract_template_dirs
 test_extract_shared_part_dirs
 test_extract_dirs_with_no_matches_at_all
@@ -245,6 +288,10 @@ test_compute_expected_readmes
 test_compute_expected_readmes_empty_input
 test_find_missing
 test_find_missing_unreadable_input
+test_validate_readme_structure_valid
+test_validate_readme_structure_missing_heading
+test_validate_readme_structure_unresolved_placeholder
+test_validate_readme_structure_pii_leak
 
 if [[ $failures -gt 0 ]]; then
   echo "$failures test(s) failed"
