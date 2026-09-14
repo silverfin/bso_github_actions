@@ -44,7 +44,16 @@ assert_error() {
   local desc="$1" template_dir="$2" repo_root="$3" expected_msg="$4"
   local tempfile output exit_code
   tempfile=$(mktemp)
-  trap "rm -f $tempfile" RETURN
+  # Single-quoted so the expansion is deferred to when the trap fires, not
+  # frozen into the trap text at set time (SC2064) - and it now also cleans up
+  # the .exit sidecar written below, which the double-quoted version leaked.
+  # Self-clearing (`trap - RETURN` first): a RETURN trap set inside a function
+  # stays armed afterwards and would otherwise fire a second time when the
+  # *calling* test function returns, at which point $tempfile is out of scope
+  # and, under set -u, an unbound-variable abort. The old double-quoted form
+  # hid that: it had the path baked in, so the stray second fire was a silent
+  # no-op rm of an already-deleted file.
+  trap 'trap - RETURN; rm -f "$tempfile" "$tempfile.exit"' RETURN
 
   # Run in a subshell that doesn't inherit set -e to properly capture exit codes
   (
@@ -174,7 +183,7 @@ curl_call_block() {
 test_notion_request_succeeds_first_try() {
   setup_stub_curl
   printf '200\t-\t{"ok":true}\n' > "$STUB_CURL_RESPONSES"
-  NOTION_TOKEN="fake-token" local out
+  local out
   out=$(NOTION_TOKEN="fake-token" notion_request GET "/v1/pages/abc")
   assert_eq "notion_request success body" '{"ok":true}' "$out"
   assert_eq "notion_request success: exactly 1 call" "1" "$(wc -l < "$STUB_CURL_LOG" | tr -d ' ')"
@@ -493,8 +502,191 @@ JSON
     "AT_fixture" "$(grep '^failed_handles=' "$github_output" || true)"
 }
 
+# --- CLI exit-0 safety contract -------------------------------------------
+# main() is a post-merge job with nothing left to block: it must always exit 0
+# and report problems through stderr/$GITHUB_OUTPUT, never by failing the job.
+# Each of the four tests below covers a hole where it previously did fail hard
+# (or, for the unconfigured market, "succeeded" while doing the wrong thing).
+
+# Writes the standard single-market config used by the tests below and echoes
+# its path. $1 = the market key to write (default BE).
+write_cli_test_config() {
+  local market="${1:-BE}"
+  local test_config="$SCRIPT_DIR/fixtures/notion-sync/notion-config.json"
+  jq -n --arg m "$market" \
+    '{($m): {reconciliation_texts: "ds-rt", account_templates: "ds-at"}}' > "$test_config"
+  printf '%s' "$test_config"
+}
+
+test_cli_missing_changed_readmes_file() {
+  setup_stub_curl
+  setup_resolve_fixture
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  local test_config github_output missing_list out rc
+  test_config=$(write_cli_test_config BE)
+  github_output="$root/github_output.txt"
+  : > "$github_output"
+  missing_list="$root/no-such-changed-readmes.txt"
+  rm -f "$missing_list"
+
+  out=$(NOTION_TOKEN="fake-token" GITHUB_OUTPUT="$github_output" \
+    bash "$SCRIPT_DIR/../sync-notion-docs.sh" \
+    "$missing_list" "$root" "BE" "abcdef1234567" "$test_config" 2>&1) && rc=0 || rc=$?
+
+  assert_eq "CLI with a missing changed-readmes list: still exits 0" "0" "$rc"
+  assert_contains "CLI with a missing changed-readmes list: names the missing file" \
+    "no-such-changed-readmes.txt" "$out"
+  assert_contains "CLI with a missing changed-readmes list: clear stderr message" \
+    "does not exist or is not readable" "$out"
+  assert_eq "CLI with a missing changed-readmes list: makes no curl calls" \
+    "0" "$(curl_call_count)"
+}
+
+test_cli_malformed_config() {
+  setup_stub_curl
+  setup_resolve_fixture
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  local test_config="$root/notion-config.json"
+  echo '{ this is not json' > "$test_config"
+
+  local changed_file github_output out rc
+  changed_file="$root/changed-readmes.txt"
+  printf '%s\n' "reconciliation_texts/vol_1_fixture/README.md" > "$changed_file"
+  echo "# Vol 1" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  github_output="$root/github_output.txt"
+  : > "$github_output"
+
+  out=$(NOTION_TOKEN="fake-token" GITHUB_OUTPUT="$github_output" \
+    bash "$SCRIPT_DIR/../sync-notion-docs.sh" \
+    "$changed_file" "$root" "BE" "abcdef1234567" "$test_config" 2>&1) && rc=0 || rc=$?
+
+  assert_eq "CLI with a malformed notion-config.json: still exits 0" "0" "$rc"
+  assert_contains "CLI with a malformed notion-config.json: clear stderr message" \
+    "could not read" "$out"
+  assert_eq "CLI with a malformed notion-config.json: makes no curl calls" \
+    "0" "$(curl_call_count)"
+}
+
+# A market key that is simply absent is NOT a jq error - `jq -r` prints the
+# literal string "null" and exits 0. Without the explicit guard, that "null"
+# was used as a data source id and the run made three real, authenticated
+# Notion calls per changed template before "succeeding".
+test_cli_market_not_in_config() {
+  setup_stub_curl
+  setup_resolve_fixture
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  local test_config
+  test_config=$(write_cli_test_config BE)
+  # Enough queued responses that an unguarded run would happily complete a
+  # full create+stamp cycle against the bogus "null" data source.
+  printf '200\t-\t{"results":[]}\n200\t-\t{"id":"new-page-1"}\n200\t-\t{"id":"new-page-1"}\n' > "$STUB_CURL_RESPONSES"
+
+  local changed_file github_output out rc
+  changed_file="$root/changed-readmes.txt"
+  printf '%s\n' "reconciliation_texts/vol_1_fixture/README.md" > "$changed_file"
+  echo "# Vol 1" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  github_output="$root/github_output.txt"
+  : > "$github_output"
+
+  out=$(NOTION_TOKEN="fake-token" GITHUB_OUTPUT="$github_output" \
+    bash "$SCRIPT_DIR/../sync-notion-docs.sh" \
+    "$changed_file" "$root" "NL" "abcdef1234567" "$test_config" 2>&1) && rc=0 || rc=$?
+
+  assert_eq "CLI with an unconfigured market: still exits 0" "0" "$rc"
+  assert_contains "CLI with an unconfigured market: names the market and the config" \
+    "market 'NL' has no entry in $test_config" "$out"
+  assert_eq "CLI with an unconfigured market: makes no curl calls at all" \
+    "0" "$(curl_call_count)"
+  assert_eq "CLI with an unconfigured market: writes no GITHUB_OUTPUT" \
+    "" "$(cat "$github_output")"
+  assert_not_contains "CLI with an unconfigured market: never blames the template" \
+    "vol_1_fixture:" "$out"
+}
+
+# The $GITHUB_OUTPUT appends run AFTER every sync has already happened, so an
+# unwritable path must not abort the run - that would both fail the job and
+# discard the outputs the Slack steps depend on.
+test_cli_unwritable_github_output() {
+  setup_stub_curl
+  setup_resolve_fixture
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  local test_config
+  test_config=$(write_cli_test_config BE)
+  # One clean create: lookup (no match), create, metadata stamp.
+  printf '200\t-\t{"results":[]}\n200\t-\t{"id":"new-page-1"}\n200\t-\t{"id":"new-page-1"}\n' > "$STUB_CURL_RESPONSES"
+
+  local changed_file out rc
+  changed_file="$root/changed-readmes.txt"
+  printf '%s\n' "reconciliation_texts/vol_1_fixture/README.md" > "$changed_file"
+  echo "# Vol 1" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+
+  # A directory can never be appended to, which is the simplest portable way
+  # to make the `>>` redirection fail (running as root makes a chmod 000 file
+  # writable again, so this shape is more reliable in CI too).
+  local github_output_dir="$root/github_output_dir"
+  rm -rf "$github_output_dir"
+  mkdir -p "$github_output_dir"
+
+  out=$(NOTION_TOKEN="fake-token" GITHUB_OUTPUT="$github_output_dir" \
+    bash "$SCRIPT_DIR/../sync-notion-docs.sh" \
+    "$changed_file" "$root" "BE" "abcdef1234567" "$test_config" 2>&1) && rc=0 || rc=$?
+
+  assert_eq "CLI with an unwritable GITHUB_OUTPUT: still exits 0" "0" "$rc"
+  assert_contains "CLI with an unwritable GITHUB_OUTPUT: warns instead of aborting" \
+    "WARN: could not write created_handles" "$out"
+  assert_contains "CLI with an unwritable GITHUB_OUTPUT: the sync work itself still ran" \
+    "reconciliation_texts/vol_1_fixture: CREATED" "$out"
+  assert_eq "CLI with an unwritable GITHUB_OUTPUT: all 3 calls were made before the failed append" \
+    "3" "$(curl_call_count)"
+  rm -rf "$github_output_dir"
+}
+
+# Account template "handles" are directory basenames, which contain spaces -
+# joining them on a plain space produced one unparseable run-together string
+# in $GITHUB_OUTPUT and in the Slack message built from it.
+test_cli_joins_multiple_handles_readably() {
+  setup_stub_curl
+  setup_resolve_fixture
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  local test_config
+  test_config=$(write_cli_test_config BE)
+
+  mkdir -p "$root/account_templates/Dubieuze debiteuren"
+  echo '{"id": {"542": 123}}' > "$root/account_templates/Dubieuze debiteuren/config.json"
+  echo "# AT one" > "$root/account_templates/Dubieuze debiteuren/README.md"
+  mkdir -p "$root/account_templates/Te ontvangen facturen"
+  echo '{"id": {"542": 124}}' > "$root/account_templates/Te ontvangen facturen/config.json"
+  echo "# AT two" > "$root/account_templates/Te ontvangen facturen/README.md"
+
+  # Both templates are duplicates -> both land in failed_handles.
+  printf '200\t-\t{"results":[{"id":"p1"},{"id":"p2"}]}\n200\t-\t{"results":[{"id":"p3"},{"id":"p4"}]}\n' \
+    > "$STUB_CURL_RESPONSES"
+
+  local changed_file github_output
+  changed_file="$root/changed-readmes.txt"
+  printf '%s\n' \
+    "account_templates/Dubieuze debiteuren/README.md" \
+    "account_templates/Te ontvangen facturen/README.md" > "$changed_file"
+  github_output="$root/github_output.txt"
+  : > "$github_output"
+
+  NOTION_TOKEN="fake-token" GITHUB_OUTPUT="$github_output" \
+    bash "$SCRIPT_DIR/../sync-notion-docs.sh" \
+    "$changed_file" "$root" "BE" "abcdef1234567" "$test_config" > /dev/null 2>&1
+
+  assert_eq "CLI joins multiple space-containing handles with a visible separator" \
+    "failed_handles=Dubieuze debiteuren, Te ontvangen facturen" "$(cat "$github_output")"
+  rm -rf "$root/account_templates/Dubieuze debiteuren" \
+    "$root/account_templates/Te ontvangen facturen"
+}
+
 test_cli_reports_failed_handles_via_github_output
 test_cli_classifies_updated_and_failed_results
+test_cli_missing_changed_readmes_file
+test_cli_malformed_config
+test_cli_market_not_in_config
+test_cli_unwritable_github_output
+test_cli_joins_multiple_handles_readably
 
 if [[ $failures -gt 0 ]]; then
   echo "$failures test(s) failed"

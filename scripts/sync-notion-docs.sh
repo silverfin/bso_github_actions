@@ -67,9 +67,10 @@ NOTION_VERSION="2026-03-11"
 NOTION_MAX_ATTEMPTS=6
 
 # $1 = HTTP method, $2 = path (e.g. /v1/pages/abc), $3 = optional JSON body.
-# Retries on 429/529 honouring Retry-After (falls back to exponential
-# backoff if the header is absent), up to NOTION_MAX_ATTEMPTS. Any other
-# non-2xx is a hard failure - printed to stderr, returns 1.
+# Retries on 429/529 on a fixed exponential backoff (1s, 2s, 4s, ... doubling
+# per attempt) up to NOTION_MAX_ATTEMPTS. The response's Retry-After header is
+# deliberately NOT parsed - a documented simplification, not an oversight. Any
+# other non-2xx is a hard failure - printed to stderr, returns 1.
 notion_request() {
   local method="$1"
   local path="$2"
@@ -96,10 +97,30 @@ notion_request() {
     # ever sees a return value - same hazard class as the jq fix in
     # resolve_handle. Capturing curl's own exit status explicitly keeps the
     # failure inside this function's normal, reportable return-1 path.
-    if ! response=$(curl "${curl_args[@]}" 2>&1); then
-      echo "ERROR: Notion API $method $path: curl itself failed (network/DNS/TLS, no HTTP response): $response" >&2
+    #
+    # curl's stderr goes to its own file rather than being folded into stdout
+    # with 2>&1: on a successful call `-sS` is normally silent, but anything it
+    # did emit (a warning, a --show-error line on a retried transfer) would be
+    # prepended to the JSON body and break the caller's jq parse of what is
+    # otherwise a perfectly good 2xx response.
+    local err_file curl_err
+    if ! err_file=$(mktemp); then
+      echo "ERROR: Notion API $method $path: could not create a temp file for curl's stderr" >&2
       return 1
     fi
+    if ! response=$(curl "${curl_args[@]}" 2>"$err_file"); then
+      curl_err=$(cat "$err_file")
+      rm -f "$err_file"
+      echo "ERROR: Notion API $method $path: curl itself failed (network/DNS/TLS, no HTTP response): $curl_err" >&2
+      return 1
+    fi
+    # Kept out of the captured body, but not thrown away: surface it on this
+    # script's own stderr so an odd-but-successful call is still visible in the
+    # job log.
+    if [[ -s "$err_file" ]]; then
+      echo "WARN: Notion API $method $path: curl wrote to stderr on a successful call: $(cat "$err_file")" >&2
+    fi
+    rm -f "$err_file"
 
     status=$(echo "$response" | tail -n 1)
     response_body=$(echo "$response" | sed '$d')
@@ -138,8 +159,15 @@ notion_request() {
 find_page_by_handle() {
   local data_source_id="$1"
   local handle="$2"
+  # Guarded like the structurally identical `jq -n` body builds in
+  # sync_readme: unguarded, a jq failure here would trip `set -e` deep inside
+  # this function and report itself to the caller as whatever the surrounding
+  # context happens to blame, rather than as "could not build the query body".
   local body
-  body=$(jq -n --arg h "$handle" '{filter: {property: "Handle", rich_text: {equals: $h}}}')
+  if ! body=$(jq -n --arg h "$handle" '{filter: {property: "Handle", rich_text: {equals: $h}}}'); then
+    echo "ERROR: find_page_by_handle: could not build the query body for handle '$handle'" >&2
+    return 1
+  fi
 
   local response
   response=$(notion_request POST "/v1/data_sources/$data_source_id/query" "$body") || return 1
@@ -159,7 +187,15 @@ find_page_by_handle() {
     echo ""
     return 0
   elif [[ "$count" == "1" ]]; then
-    echo "$response" | jq -r '.results[0].id'
+    # -er, matching the create-response extraction in sync_readme: plain -r
+    # would print the literal string "null" (exit 0) for a result object that
+    # has no .id, and that "null" would then be handed back as a real page id.
+    local page_id
+    if ! page_id=$(echo "$response" | jq -er '.results[0].id'); then
+      echo "ERROR: find_page_by_handle: the page matching handle '$handle' has no id" >&2
+      return 1
+    fi
+    echo "$page_id"
     return 0
   else
     echo "WARN: Handle '$handle' matches $count pages in data source $data_source_id - skipping, needs manual dedup" >&2
@@ -260,6 +296,18 @@ sync_readme() {
   echo "$result"
 }
 
+# Joins its arguments with ", ". Account template handles are directory names
+# that themselves contain spaces ("Dubieuze debiteuren"), so the obvious
+# "${array[*]}" would run several of them together into one unparseable blob
+# in $GITHUB_OUTPUT and in the Slack message built from it.
+join_handles() {
+  local out="" item
+  for item in "$@"; do
+    out="${out:+$out, }$item"
+  done
+  printf '%s' "$out"
+}
+
 # CLI entrypoint. $1 = path to a newline-separated list of changed README
 # paths (relative to repo_root), $2 = repo_root, $3 = market (e.g. BE),
 # $4 = commit_sha, $5 = optional path to the market -> data-source-id config
@@ -288,6 +336,25 @@ main() {
     return 0
   fi
 
+  # A market that is simply absent from the config is NOT a jq error: `jq -r`
+  # prints the literal string "null" and exits 0. Unchecked, that "null" is
+  # then used as a data source id for every changed template - burning an
+  # authenticated Notion round-trip each, and surfacing as a Slack alert that
+  # blames every template instead of naming the one thing actually wrong.
+  if [[ -z "$rt_ds" || "$rt_ds" == "null" || -z "$at_ds" || "$at_ds" == "null" ]]; then
+    echo "ERROR: market '$market' has no entry in $config_path" >&2
+    return 0
+  fi
+
+  # Not a fatal condition for a post-merge job with nothing left to block:
+  # without this, the `done < "$changed_readmes_path"` redirection below fails
+  # under `set -e` and the run dies with exit 1, no output and no Slack signal
+  # at all - the single worst failure shape for this script.
+  if [[ ! -f "$changed_readmes_path" || ! -r "$changed_readmes_path" ]]; then
+    echo "ERROR: changed-README list '$changed_readmes_path' does not exist or is not readable" >&2
+    return 0
+  fi
+
   local failed=()
   local created=()
 
@@ -308,8 +375,14 @@ main() {
     local full_readme_path="$repo_root/$readme_path"
     [[ -f "$full_readme_path" ]] || continue
 
+    # The only command substitution in this file without an explicit guard.
+    # It is safe today only because every sync_readme path happens to return
+    # 0 - an invariant that lives in another function and is not verifiable
+    # here. Guarded, so a future non-zero return degrades to one reported
+    # failure instead of killing the whole run mid-list.
     local result
-    result=$(sync_readme "$full_readme_path" "$template_dir" "$repo_root" "$data_source_id" "$market" "$commit_sha")
+    result=$(sync_readme "$full_readme_path" "$template_dir" "$repo_root" "$data_source_id" "$market" "$commit_sha") \
+      || result="FAILED: unexpected error"
     echo "$template_dir: $result"
 
     if [[ "$result" == "DUPLICATE" || "$result" == FAILED:* ]]; then
@@ -319,12 +392,18 @@ main() {
     fi
   done < "$changed_readmes_path"
 
+  # Both appends are best-effort. They run AFTER every sync has already
+  # happened, so letting an unwritable $GITHUB_OUTPUT abort the run under
+  # `set -e` would throw away the very outputs the Slack steps read - and
+  # report the whole job as a crash even though all the real work succeeded.
   if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
     if [[ ${#failed[@]} -gt 0 ]]; then
-      echo "failed_handles=${failed[*]}" >> "$GITHUB_OUTPUT"
+      echo "failed_handles=$(join_handles "${failed[@]}")" >> "$GITHUB_OUTPUT" \
+        || echo "WARN: could not write failed_handles to GITHUB_OUTPUT ($GITHUB_OUTPUT)" >&2
     fi
     if [[ ${#created[@]} -gt 0 ]]; then
-      echo "created_handles=${created[*]}" >> "$GITHUB_OUTPUT"
+      echo "created_handles=$(join_handles "${created[@]}")" >> "$GITHUB_OUTPUT" \
+        || echo "WARN: could not write created_handles to GITHUB_OUTPUT ($GITHUB_OUTPUT)" >&2
     fi
   fi
 
