@@ -1,0 +1,44 @@
+# .github/workflows/check_template_docs.yml
+name: check-template-docs
+
+on:
+  workflow_call: {}
+
+jobs:
+  skip-check:
+    runs-on: ubuntu-latest
+    if: contains(github.event.pull_request.labels.*.name, 'no-readme-required')
+    steps:
+      - run: echo "no-readme-required label present, skipping"
+
+  check-template-docs:
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'no-readme-required') }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@24d32ffd492484c1d75e0c0b894501ddb9d30d62 # v47
+        with:
+          base_sha: 'main'
+          dir_names: false
+          json: false
+          files: |
+            **/**.{liquid,yml,yaml,json,md}
+
+      - name: Write changed files to a plain list
+        run: |
+          printf '%s\n' "${{ steps.changed-files.outputs.all_changed_files }}" \
+            | tr ' ' '\n' > /tmp/changed_files.txt
+
+      - name: Fetch check-template-docs.sh
+        run: |
+          curl -fsSL -o /tmp/check-template-docs.sh \
+            "https://raw.githubusercontent.com/silverfin/bso_github_actions/main/scripts/check-template-docs.sh"
+
+      - name: Check template docs
+        run: bash /tmp/check-template-docs.sh /tmp/changed_files.txt "${{ github.workspace }}"
