@@ -159,6 +159,37 @@ test_resolve_fanout_consumers_malformed_config() {
   rm -f "$stderr_out"
 }
 
+# Regression case: used_in itself is a scalar, not an array (e.g. bad data
+# from a hand-edit or a partial write). `.used_in[]?` alone swallows this
+# completely - the `?` suppresses jq's own "cannot iterate over string"
+# error, so it exits 0 with empty output and no warning at all, unlike
+# every other malformed-input case this function already handles.
+test_resolve_fanout_consumers_scalar_used_in() {
+  local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
+  rm -rf "$root"
+  mkdir -p "$root/shared_parts/scalar_used_in_fixture"
+
+  cat > "$root/shared_parts/scalar_used_in_fixture/config.json" << 'JSON'
+{
+  "name": "scalar_used_in_fixture",
+  "used_in": "bad"
+}
+JSON
+
+  local actual rc stderr_out
+  stderr_out=$(mktemp)
+  actual=$(resolve_fanout_consumers "shared_parts/scalar_used_in_fixture" "$root" 2>"$stderr_out") && rc=0 || rc=$?
+  assert_eq "resolve_fanout_consumers (scalar used_in): exit 0, non-blocking" "0" "$rc"
+  assert_eq "resolve_fanout_consumers (scalar used_in): empty output" "" "$actual"
+  if grep -q "WARN:.*unparseable config.json" "$stderr_out"; then
+    echo "PASS: resolve_fanout_consumers (scalar used_in) warns on stderr"
+  else
+    echo "FAIL: resolve_fanout_consumers (scalar used_in) should warn on stderr, got: $(cat "$stderr_out")"
+    failures=$((failures + 1))
+  fi
+  rm -f "$stderr_out"
+}
+
 test_resolve_fanout_consumers_legacy_type_aliases() {
   local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
   rm -rf "$root"
@@ -495,6 +526,7 @@ test_extract_dirs_with_no_matches_at_all
 test_resolve_fanout_consumers
 test_resolve_fanout_consumers_empty_result
 test_resolve_fanout_consumers_malformed_config
+test_resolve_fanout_consumers_scalar_used_in
 test_resolve_fanout_consumers_legacy_type_aliases
 test_compute_expected_readmes
 test_compute_expected_readmes_empty_input

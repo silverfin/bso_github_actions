@@ -47,8 +47,22 @@ resolve_fanout_consumers() {
   # silently - the while loop just sees zero lines, `results` stays
   # empty, and this function reports success indistinguishable from "no
   # consumers to fan out to". Command substitution's status IS checkable.
+  # A top-level `used_in` that's neither null/absent nor an array (e.g.
+  # "used_in": "bad") is a case `.used_in[]?` swallows completely: `?`
+  # suppresses jq's "cannot iterate over string" error, so it exits 0 with
+  # empty output - indistinguishable from "no consumers", with no WARN at
+  # all (worse than the malformed-JSON case above, which at least warns).
+  # Only the array branch iterates; anything else hits error(...), making
+  # it a real jq failure the exit-status check above can catch.
   local jq_output
-  if ! jq_output=$(jq -r '.used_in[]? | [.type, (.handle // "null")] | @tsv' "$config_path" 2>&1); then
+  if ! jq_output=$(jq -r '
+    if .used_in == null then empty
+    elif (.used_in | type) == "array" then
+      .used_in[] | [.type, (.handle // "null")] | @tsv
+    else
+      error("used_in must be an array")
+    end
+  ' "$config_path" 2>&1); then
     echo "WARN: $shared_part_dir has an unparseable config.json (jq failed: $jq_output), skipping fan-out" >&2
     return 0
   fi
