@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Without this, bash does NOT propagate errexit into command-substitution
+# subshells (pre-4.4 behavior, or simply without this shopt) - a command
+# deep inside a `x=$(fn ...)` call chain can fail and the subshell can
+# silently continue past it instead of aborting, which would undermine
+# every "guard fires, function returns cleanly" assumption this script
+# relies on throughout resolve_handle/notion_request/find_page_by_handle/
+# sync_readme.
+shopt -s inherit_errexit
 
 # $1 = template dir (e.g. reconciliation_texts/vol_1), $2 = repo_root.
 resolve_handle() {
@@ -181,10 +189,15 @@ sync_readme() {
   fi
   markdown_body="$SYNC_CALLOUT$readme_content"
 
+  # Name/Market are resolved unconditionally (not just on create) so the
+  # follow-up metadata-stamp PATCH below can refresh them on the update
+  # path too - the script owns these properties on every page it manages,
+  # not just the ones it creates.
+  local name
+  name=$(resolve_name "$template_dir" "$repo_root") || { echo "FAILED: could not resolve name"; return 0; }
+
   local page_id result
   if [[ -z "$existing_page_id" ]]; then
-    local name
-    name=$(resolve_name "$template_dir" "$repo_root") || { echo "FAILED: could not resolve name"; return 0; }
     local create_body
     if ! create_body=$(jq -n \
       --arg ds "$data_source_id" --arg name "$name" \
@@ -195,8 +208,14 @@ sync_readme() {
     fi
     local response
     response=$(notion_request POST "/v1/pages" "$create_body") || { echo "FAILED: create request failed"; return 0; }
-    if ! page_id=$(echo "$response" | jq -r '.id'); then
-      echo "FAILED: could not parse create response"
+    # jq -r alone would print the literal string "null" (exit 0) for a
+    # syntactically-valid 2xx body that simply lacks .id, letting a bogus
+    # page_id of "null" slip through to the stamp PATCH below (PATCH
+    # /v1/pages/null). -e makes jq exit non-zero on a null/false result so
+    # that case is caught here, same hazard class as the guards elsewhere
+    # in this file - a non-JSON response alone isn't the only failure mode.
+    if ! page_id=$(echo "$response" | jq -er '.id'); then
+      echo "FAILED: create response missing id"
       return 0
     fi
     result="CREATED"
@@ -211,13 +230,17 @@ sync_readme() {
     result="UPDATED"
   fi
 
-  local today short_sha
-  today=$(date -u +%Y-%m-%d)
-  short_sha="${commit_sha:0:7}"
+  local today
+  if ! today=$(date -u +%Y-%m-%d); then
+    echo "FAILED: could not compute today's date"
+    return 0
+  fi
+  local short_sha="${commit_sha:0:7}"
   local stamp_body
   if ! stamp_body=$(jq -n \
     --arg date "$today" --arg sha "$short_sha" --arg path "$template_dir" \
-    '{properties: {"Last synced": {date: {start: $date}}, "Source commit": {rich_text: [{text: {content: $sha}}]}, "Repo path": {rich_text: [{text: {content: $path}}]}}}'); then
+    --arg name "$name" --arg market "$market" \
+    '{properties: {"Last synced": {date: {start: $date}}, "Source commit": {rich_text: [{text: {content: $sha}}]}, "Repo path": {rich_text: [{text: {content: $path}}]}, Name: {title: [{text: {content: $name}}]}, Market: {select: {name: $market}}}}'); then
     echo "FAILED: could not build metadata stamp body"
     return 0
   fi

@@ -28,6 +28,18 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local desc="$1" needle="$2" haystack="$3"
+  if [[ "$haystack" != *"$needle"* ]]; then
+    echo "PASS: $desc"
+  else
+    echo "FAIL: $desc"
+    echo "  expected NOT to contain: $needle"
+    echo "  actual:   $haystack"
+    failures=$((failures + 1))
+  fi
+}
+
 assert_error() {
   local desc="$1" template_dir="$2" repo_root="$3" expected_msg="$4"
   local tempfile output exit_code
@@ -124,6 +136,31 @@ setup_stub_curl() {
   export STUB_CURL_LOG="$SCRIPT_DIR/fixtures/notion-sync/curl.log"
   export STUB_CURL_RESPONSES="$SCRIPT_DIR/fixtures/notion-sync/curl-responses.tsv"
   : > "$STUB_CURL_LOG"
+}
+
+# $STUB_CURL_LOG holds one call's full argv per entry, but a call whose
+# body is pretty-printed JSON (the default `jq -n` output, no -c) spans
+# multiple lines - so `wc -l` does not count calls, and a plain sed -n
+# 'Np' does not select call N. Every call's argv always starts with the
+# fixed `-sS -w ...` prefix (see notion_request's curl_args), which never
+# appears inside a JSON body value, so it's a reliable per-call delimiter.
+curl_call_count() {
+  grep -c -- '^-sS -w' "$STUB_CURL_LOG"
+}
+
+# $1 = 1-based call index. Prints that call's full argv block (spanning
+# multiple lines if its body is pretty-printed JSON).
+curl_call_block() {
+  local n="$1"
+  local starts start_line next_start
+  starts=$(grep -n -- '^-sS -w' "$STUB_CURL_LOG" | cut -d: -f1)
+  start_line=$(echo "$starts" | sed -n "${n}p")
+  next_start=$(echo "$starts" | sed -n "$((n + 1))p")
+  if [[ -z "$next_start" ]]; then
+    sed -n "${start_line},\$p" "$STUB_CURL_LOG"
+  else
+    sed -n "${start_line},$((next_start - 1))p" "$STUB_CURL_LOG"
+  fi
 }
 
 test_notion_request_succeeds_first_try() {
@@ -265,6 +302,26 @@ test_sync_readme_creates_when_missing() {
     "$root/reconciliation_texts/vol_1_fixture/README.md" \
     "reconciliation_texts/vol_1_fixture" "$root" "ds-abc" "BE" "abcdef1234567")
   assert_eq "sync_readme creates when no existing page" "CREATED" "$out"
+
+  # Proves the metadata-stamp PATCH actually fired: the stub queues 3
+  # responses (lookup, create, stamp) and only consumes one line per real
+  # curl call, so if the stamp block were ever deleted this would see 2
+  # calls, not 3, and fail.
+  assert_eq "sync_readme create path: makes exactly 3 calls (lookup, create, stamp)" \
+    "3" "$(curl_call_count)"
+
+  local create_call stamp_call
+  create_call=$(curl_call_block 2)
+  stamp_call=$(curl_call_block 3)
+  assert_contains "sync_readme create call: targets /v1/pages" "/v1/pages" "$create_call"
+  assert_contains "sync_readme stamp call: targets PATCH /v1/pages/<id>" "PATCH" "$stamp_call"
+  assert_contains "sync_readme stamp call: targets the new page id" "/v1/pages/new-page-1" "$stamp_call"
+  assert_not_contains "sync_readme create body: never writes Package" "Package" "$create_call"
+  assert_not_contains "sync_readme stamp body: never writes Package" "Package" "$stamp_call"
+  assert_contains "sync_readme stamp body: Repo path matches template_dir" \
+    "reconciliation_texts/vol_1_fixture" "$stamp_call"
+  assert_contains "sync_readme stamp body: Source commit truncated to 7 chars" "abcdef1" "$stamp_call"
+  assert_not_contains "sync_readme stamp body: Source commit not longer than 7 chars" "abcdef12" "$stamp_call"
 }
 
 test_sync_readme_updates_when_present() {
@@ -278,6 +335,22 @@ test_sync_readme_updates_when_present() {
     "$root/reconciliation_texts/vol_1_fixture/README.md" \
     "reconciliation_texts/vol_1_fixture" "$root" "ds-abc" "BE" "abcdef1234567")
   assert_eq "sync_readme updates when a page already exists" "UPDATED" "$out"
+
+  assert_eq "sync_readme update path: makes exactly 3 calls (lookup, update, stamp)" \
+    "3" "$(curl_call_count)"
+
+  local stamp_call
+  stamp_call=$(curl_call_block 3)
+  assert_not_contains "sync_readme update-path stamp body: never writes Package" "Package" "$stamp_call"
+  # Global Constraint says the script owns Name/Handle/Market on every page
+  # it manages, with no update-time carve-out - so a name_en or Market
+  # change must reach an already-existing page too, not just a newly
+  # created one. Verifies Name/Market ride along on the same stamp PATCH
+  # that already runs on the update path.
+  assert_contains "sync_readme update-path stamp body: refreshes Name" \
+    "Postponement of the general meeting" "$stamp_call"
+  assert_contains "sync_readme update-path stamp body: refreshes Market" '"Market"' "$stamp_call"
+  assert_contains "sync_readme update-path stamp body: Market value is BE" "BE" "$stamp_call"
 }
 
 test_sync_readme_skips_on_duplicate() {
@@ -293,9 +366,46 @@ test_sync_readme_skips_on_duplicate() {
   assert_eq "sync_readme skips on duplicate Handle" "DUPLICATE" "$out"
 }
 
+test_sync_readme_reports_failed_without_crashing() {
+  setup_stub_curl
+  setup_resolve_fixture
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  echo "# Vol 1 fixture content" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  printf '500\t-\t{"code":"error"}\n' > "$STUB_CURL_RESPONSES"
+  local out rc
+  out=$(NOTION_TOKEN="fake-token" sync_readme \
+    "$root/reconciliation_texts/vol_1_fixture/README.md" \
+    "reconciliation_texts/vol_1_fixture" "$root" "ds-abc" "BE" "abcdef1234567" 2>/dev/null) && rc=0 || rc=$?
+  assert_eq "sync_readme FAILED path: exits 0, doesn't crash the caller" "0" "$rc"
+  assert_contains "sync_readme FAILED path: result line starts with FAILED:" "FAILED:" "$out"
+}
+
+test_sync_readme_create_response_missing_id() {
+  setup_stub_curl
+  setup_resolve_fixture
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  echo "# Vol 1 fixture content" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  # The create response is syntactically valid JSON (unlike the malformed-
+  # response case already covered for find_page_by_handle) but simply has
+  # no .id - a plain `jq -r '.id'` would print the literal string "null"
+  # and exit 0 here, letting a bogus page_id of "null" slip through to the
+  # stamp PATCH (.../v1/pages/null) undetected. Guards against that.
+  printf '200\t-\t{"results":[]}\n200\t-\t{"object":"page"}\n' > "$STUB_CURL_RESPONSES"
+  local out rc
+  out=$(NOTION_TOKEN="fake-token" sync_readme \
+    "$root/reconciliation_texts/vol_1_fixture/README.md" \
+    "reconciliation_texts/vol_1_fixture" "$root" "ds-abc" "BE" "abcdef1234567" 2>/dev/null) && rc=0 || rc=$?
+  assert_eq "sync_readme create response missing id: exits 0, doesn't crash" "0" "$rc"
+  assert_contains "sync_readme create response missing id: reports FAILED" "FAILED:" "$out"
+  assert_eq "sync_readme create response missing id: never reaches the stamp PATCH" \
+    "2" "$(curl_call_count)"
+}
+
 test_sync_readme_creates_when_missing
 test_sync_readme_updates_when_present
 test_sync_readme_skips_on_duplicate
+test_sync_readme_reports_failed_without_crashing
+test_sync_readme_create_response_missing_id
 
 if [[ $failures -gt 0 ]]; then
   echo "$failures test(s) failed"
