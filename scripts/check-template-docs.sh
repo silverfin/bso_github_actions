@@ -61,5 +61,6 @@ resolve_fanout_consumers() {
     fi
   done < <(jq -r '.used_in[]? | [.type, (.handle // "null")] | @tsv' "$config_path")
 
-  printf '%s\n' "${results[@]}" | sort -u
+  (( ${#results[@]} )) && printf '%s\n' "${results[@]}" | sort -u
+  return 0
 }

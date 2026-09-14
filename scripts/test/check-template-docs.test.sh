@@ -103,10 +103,31 @@ test_resolve_fanout_consumers() {
   assert_eq "resolve_fanout_consumers (existing-README only, null handle skipped)" "$expected" "$actual"
 }
 
+test_resolve_fanout_consumers_empty_result() {
+  local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
+  rm -rf "$root"
+  mkdir -p "$root/shared_parts/only_null_handles"
+
+  cat > "$root/shared_parts/only_null_handles/config.json" << 'JSON'
+{
+  "name": "only_null_handles",
+  "used_in": [
+    {"type": "accountTemplate", "handle": null},
+    {"type": "accountTemplate", "handle": null}
+  ]
+}
+JSON
+
+  local actual
+  actual=$(resolve_fanout_consumers "shared_parts/only_null_handles" "$root" 2>/dev/null)
+  assert_eq "resolve_fanout_consumers (empty result, all null handles skipped)" "" "$actual"
+}
+
 test_extract_template_dirs
 test_extract_shared_part_dirs
 test_extract_dirs_with_no_matches_at_all
 test_resolve_fanout_consumers
+test_resolve_fanout_consumers_empty_result
 
 if [[ $failures -gt 0 ]]; then
   echo "$failures test(s) failed"
