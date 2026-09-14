@@ -1,0 +1,69 @@
+name: sync-notion-docs
+
+on:
+  workflow_call:
+    inputs:
+      market:
+        required: true
+        type: string
+    secrets:
+      NOTION_TOKEN:
+        required: true
+      SLACK_CI_ALERTS_WEBHOOK_URL:
+        required: false
+
+jobs:
+  sync-notion-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+
+      - name: Get changed README files in this push
+        id: changed-files
+        uses: tj-actions/changed-files@24d32ffd492484c1d75e0c0b894501ddb9d30d62 # v47
+        with:
+          base_sha: ${{ github.event.before }}
+          dir_names: false
+          json: false
+          files: |
+            reconciliation_texts/**/README.md
+            account_templates/**/README.md
+
+      - name: Write changed READMEs to a plain list
+        run: |
+          printf '%s\n' "${{ steps.changed-files.outputs.all_changed_files }}" \
+            | tr ' ' '\n' > /tmp/changed_readmes.txt
+
+      - name: Fetch sync-notion-docs.sh and notion-config.json
+        run: |
+          curl -fsSL -o /tmp/sync-notion-docs.sh \
+            "https://raw.githubusercontent.com/silverfin/bso_github_actions/main/scripts/sync-notion-docs.sh"
+          curl -fsSL -o /tmp/notion-config.json \
+            "https://raw.githubusercontent.com/silverfin/bso_github_actions/main/scripts/notion-config.json"
+
+      - name: Sync to Notion
+        id: sync
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+        run: |
+          bash /tmp/sync-notion-docs.sh /tmp/changed_readmes.txt "${{ github.workspace }}" \
+            "${{ inputs.market }}" "${{ github.sha }}" /tmp/notion-config.json
+
+      - name: Notify Slack about newly created pages
+        if: ${{ steps.sync.outputs.created_handles != '' }}
+        run: |
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg text "Notion sync CREATED new pages for: ${{ steps.sync.outputs.created_handles }} (market: ${{ inputs.market }}). If these are not genuinely new templates, check for a handle mismatch in config.json." '{text: $text}')" \
+            "${{ secrets.SLACK_CI_ALERTS_WEBHOOK_URL }}"
+        continue-on-error: true
+
+      - name: Alert Slack on failed handles
+        if: ${{ steps.sync.outputs.failed_handles != '' }}
+        run: |
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg text "Notion sync failed for: ${{ steps.sync.outputs.failed_handles }} (market: ${{ inputs.market }}, commit: ${{ github.sha }})" '{text: $text}')" \
+            "${{ secrets.SLACK_CI_ALERTS_WEBHOOK_URL }}"
+        continue-on-error: true
