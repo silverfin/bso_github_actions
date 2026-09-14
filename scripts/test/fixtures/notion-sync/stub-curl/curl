@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Fake curl for tests. Pops one response record per call from
+# $STUB_CURL_RESPONSES (tab-separated: status<TAB>retry_after<TAB>body).
+# Writes the full argv to $STUB_CURL_LOG (one call per line, space-joined).
+# Emulates real `curl -w '\n%{http_code}'`: body, then a final line with
+# just the status code.
+#
+# The retry_after column is currently unused - notion_request backs off on
+# its own fixed exponential schedule rather than parsing the header (see
+# Step 4's note). The column is kept so a future header-parsing version can
+# use it without changing every fixture.
+set -euo pipefail
+echo "$*" >> "$STUB_CURL_LOG"
+
+line=$(head -n 1 "$STUB_CURL_RESPONSES")
+# Pop the first line. Use tail+mv, not `sed -i` - BSD/macOS sed requires an
+# argument to -i and would silently behave differently from GNU sed here.
+tail -n +2 "$STUB_CURL_RESPONSES" > "${STUB_CURL_RESPONSES}.tmp"
+mv "${STUB_CURL_RESPONSES}.tmp" "$STUB_CURL_RESPONSES"
+
+status=$(echo "$line" | cut -f1)
+body=$(echo "$line" | cut -f3-)
+
+printf '%s\n%s' "$body" "$status"

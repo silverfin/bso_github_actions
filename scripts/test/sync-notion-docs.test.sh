@@ -105,6 +105,46 @@ test_resolve_handle
 test_resolve_name
 test_resolve_handle_errors
 
+setup_stub_curl() {
+  local stub_dir="$SCRIPT_DIR/fixtures/notion-sync/stub-curl"
+  mkdir -p "$stub_dir"
+  export PATH="$stub_dir:$PATH"
+  export STUB_CURL_LOG="$SCRIPT_DIR/fixtures/notion-sync/curl.log"
+  export STUB_CURL_RESPONSES="$SCRIPT_DIR/fixtures/notion-sync/curl-responses.tsv"
+  : > "$STUB_CURL_LOG"
+}
+
+test_notion_request_succeeds_first_try() {
+  setup_stub_curl
+  printf '200\t-\t{"ok":true}\n' > "$STUB_CURL_RESPONSES"
+  NOTION_TOKEN="fake-token" local out
+  out=$(NOTION_TOKEN="fake-token" notion_request GET "/v1/pages/abc")
+  assert_eq "notion_request success body" '{"ok":true}' "$out"
+  assert_eq "notion_request success: exactly 1 call" "1" "$(wc -l < "$STUB_CURL_LOG" | tr -d ' ')"
+}
+
+test_notion_request_retries_on_429() {
+  setup_stub_curl
+  printf '429\t0\t{"code":"rate_limited"}\n200\t-\t{"ok":true}\n' > "$STUB_CURL_RESPONSES"
+  local out
+  out=$(NOTION_TOKEN="fake-token" notion_request GET "/v1/pages/abc")
+  assert_eq "notion_request retries then succeeds" '{"ok":true}' "$out"
+  assert_eq "notion_request retries: exactly 2 calls" "2" "$(wc -l < "$STUB_CURL_LOG" | tr -d ' ')"
+}
+
+test_notion_request_fails_on_non_retryable_error() {
+  setup_stub_curl
+  printf '404\t-\t{"code":"object_not_found"}\n' > "$STUB_CURL_RESPONSES"
+  local out rc
+  out=$(NOTION_TOKEN="fake-token" notion_request GET "/v1/pages/missing" 2>&1) && rc=0 || rc=$?
+  assert_eq "notion_request 404: exit 1" "1" "$rc"
+  assert_eq "notion_request 404: exactly 1 call, no retry" "1" "$(wc -l < "$STUB_CURL_LOG" | tr -d ' ')"
+}
+
+test_notion_request_succeeds_first_try
+test_notion_request_retries_on_429
+test_notion_request_fails_on_non_retryable_error
+
 if [[ $failures -gt 0 ]]; then
   echo "$failures test(s) failed"
   exit 1

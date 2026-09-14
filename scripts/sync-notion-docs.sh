@@ -46,3 +46,58 @@ resolve_name() {
 
   basename "$template_dir" | tr '_' ' '
 }
+
+NOTION_API_BASE="https://api.notion.com"
+NOTION_VERSION="2026-03-11"
+NOTION_MAX_ATTEMPTS=6
+
+# $1 = HTTP method, $2 = path (e.g. /v1/pages/abc), $3 = optional JSON body.
+# Retries on 429/529 honouring Retry-After (falls back to exponential
+# backoff if the header is absent), up to NOTION_MAX_ATTEMPTS. Any other
+# non-2xx is a hard failure - printed to stderr, returns 1.
+notion_request() {
+  local method="$1"
+  local path="$2"
+  local body="${3:-}"
+  local attempt=1
+  local backoff=1
+
+  while (( attempt <= NOTION_MAX_ATTEMPTS )); do
+    local response status response_body
+    if [[ -n "$body" ]]; then
+      response=$(curl -sS -w '\n%{http_code}' \
+        -X "$method" "$NOTION_API_BASE$path" \
+        -H "Authorization: Bearer $NOTION_TOKEN" \
+        -H "Notion-Version: $NOTION_VERSION" \
+        -H "Content-Type: application/json" \
+        -d "$body")
+    else
+      response=$(curl -sS -w '\n%{http_code}' \
+        -X "$method" "$NOTION_API_BASE$path" \
+        -H "Authorization: Bearer $NOTION_TOKEN" \
+        -H "Notion-Version: $NOTION_VERSION")
+    fi
+
+    status=$(echo "$response" | tail -n 1)
+    response_body=$(echo "$response" | sed '$d')
+
+    if [[ "$status" =~ ^2[0-9][0-9]$ ]]; then
+      echo "$response_body"
+      return 0
+    fi
+
+    if [[ "$status" == "429" || "$status" == "529" ]]; then
+      echo "WARN: Notion API returned $status (attempt $attempt/$NOTION_MAX_ATTEMPTS), backing off ${backoff}s" >&2
+      sleep "$backoff"
+      backoff=$((backoff * 2))
+      attempt=$((attempt + 1))
+      continue
+    fi
+
+    echo "ERROR: Notion API $method $path failed with $status: $response_body" >&2
+    return 1
+  done
+
+  echo "ERROR: Notion API $method $path failed after $NOTION_MAX_ATTEMPTS attempts" >&2
+  return 1
+}
