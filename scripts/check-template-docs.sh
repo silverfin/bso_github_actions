@@ -29,7 +29,8 @@ extract_shared_part_dirs() {
 
 # $1 = shared part dir (e.g. shared_parts/be_legal), relative to $2 = repo_root.
 # Prints consumer dirs (relative to repo_root) whose README.md already
-# exists. Skips accountTemplate entries with a null handle, warning on stderr.
+# exists. Skips any used_in entry with a null/empty handle, warning on
+# stderr.
 resolve_fanout_consumers() {
   local shared_part_dir="$1"
   local repo_root="$2"
@@ -61,9 +62,15 @@ resolve_fanout_consumers() {
         continue
       fi
       local dir=""
+      # reconciliation/reconciliation_text and account_detail_template/
+      # account_template are pre-migration values still present in real
+      # config.json files - silverfin-cli's own TEMPLATE_MAP_TYPES
+      # (lib/utils/templateUtils.js) normalizes them the same way on read.
+      # Not a rare case: reconciliation outnumbers reconciliationText in
+      # be_market's committed shared_parts/*/config.json (495 vs 268).
       case "$type" in
-        reconciliationText) dir="reconciliation_texts/$handle" ;;
-        accountTemplate)    dir="account_templates/$handle" ;;
+        reconciliationText|reconciliation|reconciliation_text) dir="reconciliation_texts/$handle" ;;
+        accountTemplate|account_detail_template|account_template) dir="account_templates/$handle" ;;
         *)
           echo "WARN: $shared_part_dir used_in has unknown type '$type', skipping" >&2
           continue

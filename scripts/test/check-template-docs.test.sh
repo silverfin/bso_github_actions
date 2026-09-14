@@ -143,12 +143,54 @@ test_resolve_fanout_consumers_malformed_config() {
   rm -f "$stderr_out"
 }
 
+test_resolve_fanout_consumers_legacy_type_aliases() {
+  local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
+  rm -rf "$root"
+  mkdir -p "$root/shared_parts/legacy_types_fixture"
+  mkdir -p "$root/reconciliation_texts/legacy_rt_fixture"
+  mkdir -p "$root/reconciliation_texts/legacy_rt2_fixture"
+  mkdir -p "$root/account_templates/legacy_at_fixture"
+  mkdir -p "$root/account_templates/legacy_at2_fixture"
+
+  cat > "$root/shared_parts/legacy_types_fixture/config.json" << 'JSON'
+{
+  "name": "legacy_types_fixture",
+  "used_in": [
+    {"type": "reconciliation", "handle": "legacy_rt_fixture"},
+    {"type": "reconciliation_text", "handle": "legacy_rt2_fixture"},
+    {"type": "account_detail_template", "handle": "legacy_at_fixture"},
+    {"type": "account_template", "handle": "legacy_at2_fixture"}
+  ]
+}
+JSON
+
+  echo '{}' > "$root/reconciliation_texts/legacy_rt_fixture/config.json"
+  echo '# Legacy RT' > "$root/reconciliation_texts/legacy_rt_fixture/README.md"
+  echo '{}' > "$root/reconciliation_texts/legacy_rt2_fixture/config.json"
+  echo '# Legacy RT 2' > "$root/reconciliation_texts/legacy_rt2_fixture/README.md"
+  echo '{}' > "$root/account_templates/legacy_at_fixture/config.json"
+  echo '# Legacy AT' > "$root/account_templates/legacy_at_fixture/README.md"
+  echo '{}' > "$root/account_templates/legacy_at2_fixture/config.json"
+  echo '# Legacy AT 2' > "$root/account_templates/legacy_at2_fixture/README.md"
+
+  local actual
+  actual=$(resolve_fanout_consumers "shared_parts/legacy_types_fixture" "$root" 2>/dev/null)
+  local expected
+  expected=$(printf '%s\n' \
+    "account_templates/legacy_at2_fixture" \
+    "account_templates/legacy_at_fixture" \
+    "reconciliation_texts/legacy_rt2_fixture" \
+    "reconciliation_texts/legacy_rt_fixture")
+  assert_eq "resolve_fanout_consumers (pre-migration type aliases: reconciliation, reconciliation_text, account_detail_template, account_template)" "$expected" "$actual"
+}
+
 test_extract_template_dirs
 test_extract_shared_part_dirs
 test_extract_dirs_with_no_matches_at_all
 test_resolve_fanout_consumers
 test_resolve_fanout_consumers_empty_result
 test_resolve_fanout_consumers_malformed_config
+test_resolve_fanout_consumers_legacy_type_aliases
 
 if [[ $failures -gt 0 ]]; then
   echo "$failures test(s) failed"
