@@ -12,13 +12,23 @@ resolve_handle() {
     return 0
   fi
 
-  local handle
-  handle=$(jq -r '.handle // empty' "$config_path")
-  if [[ -z "$handle" ]]; then
+  if [[ ! -f "$config_path" ]]; then
+    echo "ERROR: $template_dir has no config.json" >&2
+    return 1
+  fi
+
+  local jq_output
+  if ! jq_output=$(jq -r '.handle // empty' "$config_path" 2>&1); then
+    echo "ERROR: $template_dir has an unparseable config.json (jq failed: $jq_output)" >&2
+    return 1
+  fi
+
+  if [[ -z "$jq_output" ]]; then
     echo "ERROR: $template_dir has no .handle in config.json" >&2
     return 1
   fi
-  echo "$handle"
+
+  echo "$jq_output"
 }
 
 # $1 = template dir, $2 = repo_root.
