@@ -30,6 +30,10 @@ jobs:
           # history: changed-files then resolves no diff and the job silently
           # syncs nothing.
           fetch-depth: 0
+          # This job never pushes anything; leaving the checkout's git
+          # credentials on the runner's disk afterwards is an avoidable
+          # hardening gap (flagged by zizmor's artipacked check).
+          persist-credentials: false
 
       - name: Get changed README files in this push
         id: changed-files
@@ -73,11 +77,22 @@ jobs:
           printf '%s' "${ALL_CHANGED_FILES:-[]}" | jq -r '.[]' > /tmp/changed_readmes.txt
 
       - name: Fetch sync-notion-docs.sh and notion-config.json
+        env:
+          # Pinned to an immutable commit SHA, not `main`: this workflow
+          # already holds NOTION_TOKEN by the time it runs these fetched
+          # files, and a caller pinning `uses: .../sync_notion_docs.yml@<sha>`
+          # gets none of that protection back if the SCRIPT it downloads can
+          # still move out from under it. Bump REF to the actual merged SHA
+          # in a follow-up commit once this change lands on main - the exact
+          # two-step convention this repo already uses for
+          # push_to_review_firm.yml's own self-reference (see e0cb6b2/#50):
+          # this PR cannot know its own post-merge SHA in advance.
+          REF: c2ebea871800b5872b18494e29788152f25bf847
         run: |
           curl -fsSL -o /tmp/sync-notion-docs.sh \
-            "https://raw.githubusercontent.com/silverfin/bso_github_actions/main/scripts/sync-notion-docs.sh"
+            "https://raw.githubusercontent.com/silverfin/bso_github_actions/${REF}/scripts/sync-notion-docs.sh"
           curl -fsSL -o /tmp/notion-config.json \
-            "https://raw.githubusercontent.com/silverfin/bso_github_actions/main/scripts/notion-config.json"
+            "https://raw.githubusercontent.com/silverfin/bso_github_actions/${REF}/scripts/notion-config.json"
 
       - name: Sync to Notion
         id: sync
@@ -102,6 +117,17 @@ jobs:
           MARKET: ${{ inputs.market }}
           SLACK: ${{ secrets.SLACK_CI_ALERTS_WEBHOOK_URL }}
         run: |
+          # SLACK_CI_ALERTS_WEBHOOK_URL is documented as optional
+          # (docs/notion-market-setup.md step 6). The `secrets` context isn't
+          # usable in a step's `if:`, so the empty-webhook case is handled
+          # here instead: without this check, curl would get called with an
+          # empty URL, error out, and paint the step red - masked only by
+          # continue-on-error below, and for the wrong reason (a documented,
+          # supported configuration, not a real failure).
+          if [[ -z "$SLACK" ]]; then
+            echo "SLACK_CI_ALERTS_WEBHOOK_URL not set, skipping Slack notification"
+            exit 0
+          fi
           TEXT="Notion sync CREATED new pages for: ${CREATED_HANDLES} (market: ${MARKET}). If these are not genuinely new templates, check for a handle mismatch in config.json."
           curl -fsS -X POST -H 'Content-Type: application/json' \
             -d "$(jq -n --arg text "$TEXT" '{text: $text}')" \
@@ -116,6 +142,13 @@ jobs:
           COMMIT_SHA: ${{ github.sha }}
           SLACK: ${{ secrets.SLACK_CI_ALERTS_WEBHOOK_URL }}
         run: |
+          # Same reasoning as the "Notify Slack about newly created pages"
+          # step above: the empty-webhook case has to be handled in-script,
+          # not via `if:` (the `secrets` context isn't usable there).
+          if [[ -z "$SLACK" ]]; then
+            echo "SLACK_CI_ALERTS_WEBHOOK_URL not set, skipping Slack alert"
+            exit 0
+          fi
           TEXT="Notion sync failed for: ${FAILED_HANDLES} (market: ${MARKET}, commit: ${COMMIT_SHA})"
           curl -fsS -X POST -H 'Content-Type: application/json' \
             -d "$(jq -n --arg text "$TEXT" '{text: $text}')" \

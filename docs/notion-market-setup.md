@@ -42,7 +42,15 @@ One-off, per market, before its sync_notion_docs.yml caller can run.
    - `SLACK_CI_ALERTS_WEBHOOK_URL` (optional) - without it the sync itself
      still runs, but the "created pages" and "failed handles" alerts post
      nowhere and failures are only visible in the job log.
-7. Add a caller workflow to the market repo:
+7. Add a caller workflow to the market repo, pinning the reusable workflow to
+   an immutable commit SHA on `bso_github_actions` - not `@main`. The reusable
+   workflow already handles `NOTION_TOKEN`; a caller pinned to a mutable ref
+   gets none of that protection back if the workflow *definition* itself can
+   still change out from under it. Use the current tip of `main` on
+   `bso_github_actions` at setup time, and bump it deliberately (a one-line
+   PR) whenever `sync_notion_docs.yml` changes in a way you want to pick up -
+   the same convention this repo's own `push_to_review_firm.yml` uses for its
+   self-reference:
 
    ```yaml
    name: sync-notion-docs
@@ -57,7 +65,7 @@ One-off, per market, before its sync_notion_docs.yml caller can run.
          - "account_templates/**/README.md"
    jobs:
      sync-notion-docs:
-       uses: silverfin/bso_github_actions/.github/workflows/sync_notion_docs.yml@main
+       uses: silverfin/bso_github_actions/.github/workflows/sync_notion_docs.yml@<pin to a commit SHA on bso_github_actions main, not a branch>
        with:
          market: "<MARKET_CODE>"
        secrets: inherit
