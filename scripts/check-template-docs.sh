@@ -196,3 +196,60 @@ validate_readme_structure() {
 
   return $ok
 }
+
+# CLI entrypoint - only runs when this file is executed directly, not when sourced.
+main() {
+  local changed_files_path="$1"
+  local repo_root="$2"
+
+  local expected_path
+  expected_path=$(mktemp)
+  compute_expected_readmes "$changed_files_path" "$repo_root" > "$expected_path"
+
+  local missing
+  missing=$(find_missing "$expected_path" "$changed_files_path")
+
+  local invalid=()
+  while IFS= read -r changed; do
+    [[ "$changed" == *"README.md" ]] || continue
+    local full_path="$repo_root/$changed"
+    [[ -f "$full_path" ]] || continue
+    local errors
+    errors=$(validate_readme_structure "$full_path") || invalid+=("$changed: $errors")
+  done < "$changed_files_path"
+
+  local exit_code=0
+
+  if [[ -n "$missing" ]]; then
+    echo "The following templates changed but their README.md was not updated in this PR:"
+    echo "$missing" | sed 's/^/  - /'
+    exit_code=1
+  fi
+
+  if [[ ${#invalid[@]} -gt 0 ]]; then
+    echo "The following README(s) have structural problems:"
+    printf '%s\n' "${invalid[@]}" | sed 's/^/  - /'
+    exit_code=1
+  fi
+
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    {
+      echo "missing_readmes<<EOF"
+      echo "$missing"
+      echo "EOF"
+      echo "invalid_readmes<<EOF"
+      (( ${#invalid[@]} )) && printf '%s\n' "${invalid[@]}"
+      echo "EOF"
+    } >> "$GITHUB_OUTPUT"
+  fi
+
+  if [[ $exit_code -eq 0 ]]; then
+    echo "All changed templates have an up-to-date, structurally valid README."
+  fi
+
+  return $exit_code
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi

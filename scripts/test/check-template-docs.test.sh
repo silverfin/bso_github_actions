@@ -277,6 +277,59 @@ test_validate_readme_structure_pii_leak() {
   fi
 }
 
+test_cli_passes_when_nothing_missing_and_all_valid() {
+  setup_shared_part_consumers_fixture
+  local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
+  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/reconciliation_texts/vol_1_fixture/README.md"
+  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/account_templates/AT_fixture/README.md"
+  local changed
+  changed=$(printf '%s\n' \
+    "reconciliation_texts/vol_1_fixture/main.liquid" \
+    "reconciliation_texts/vol_1_fixture/README.md" \
+    "account_templates/AT_fixture/README.md")
+  local changed_file rc
+  changed_file="$SCRIPT_DIR/fixtures/changed-files.txt"
+  echo "$changed" > "$changed_file"
+  bash "$SCRIPT_DIR/../check-template-docs.sh" "$changed_file" "$root" > /dev/null 2>&1 && rc=0 || rc=$?
+  assert_eq "CLI passes when nothing missing and all valid" "0" "$rc"
+}
+
+test_cli_fails_when_readme_missing() {
+  setup_shared_part_consumers_fixture
+  local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
+  local changed changed_file rc
+  changed="reconciliation_texts/vol_1_fixture/main.liquid"
+  changed_file="$SCRIPT_DIR/fixtures/changed-files-missing.txt"
+  echo "$changed" > "$changed_file"
+  bash "$SCRIPT_DIR/../check-template-docs.sh" "$changed_file" "$root" > /dev/null 2>&1 && rc=0 || rc=$?
+  assert_eq "CLI fails when a required README is missing from the diff" "1" "$rc"
+}
+
+test_cli_github_output_all_valid() {
+  setup_shared_part_consumers_fixture
+  local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
+  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/reconciliation_texts/vol_1_fixture/README.md"
+  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/account_templates/AT_fixture/README.md"
+  local changed
+  changed=$(printf '%s\n' \
+    "reconciliation_texts/vol_1_fixture/main.liquid" \
+    "reconciliation_texts/vol_1_fixture/README.md" \
+    "account_templates/AT_fixture/README.md")
+  local changed_file rc github_output
+  changed_file="$SCRIPT_DIR/fixtures/changed-files-all-valid.txt"
+  echo "$changed" > "$changed_file"
+  github_output=$(mktemp)
+  GITHUB_OUTPUT="$github_output" bash "$SCRIPT_DIR/../check-template-docs.sh" "$changed_file" "$root" > /dev/null 2>&1 && rc=0 || rc=$?
+  assert_eq "CLI with GITHUB_OUTPUT set and all valid: exit 0" "0" "$rc"
+  if [[ ! -f "$github_output" ]]; then
+    echo "FAIL: GITHUB_OUTPUT file should exist"
+    failures=$((failures + 1))
+  else
+    echo "PASS: GITHUB_OUTPUT file created"
+    rm -f "$github_output"
+  fi
+}
+
 # Isolated regression case: a placeholder whose text contains a hyphen or a
 # digit, with no OTHER placeholder present to mask a regex gap. The
 # fixtures/readmes/unresolved-placeholder.README.md fixture has several
@@ -372,6 +425,9 @@ test_validate_readme_structure_unresolved_placeholder
 test_validate_readme_structure_unresolved_placeholder_with_hyphen_and_digit
 test_validate_readme_structure_wrong_heading_level
 test_validate_readme_structure_pii_leak
+test_cli_passes_when_nothing_missing_and_all_valid
+test_cli_fails_when_readme_missing
+test_cli_github_output_all_valid
 
 if [[ $failures -gt 0 ]]; then
   echo "$failures test(s) failed"
