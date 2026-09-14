@@ -295,13 +295,16 @@ test_notion_request_caps_excessive_retry_after() {
   # against a malformed proxy response or a compromised intermediary
   # stalling this loop (and the whole post-merge job) far longer than the
   # bounded ~31s the fixed schedule would ever take.
-  printf '429\t99999\t{"code":"rate_limited"}\n200\t-\t{"ok":true}\n' > "$STUB_CURL_RESPONSES"
+  # 121 passes the four-digit format check but exceeds
+  # NOTION_RETRY_AFTER_MAX_SECONDS (120), so the numeric cap is what rejects
+  # it — not the regex alone (99999 would fail the format check first).
+  printf '429\t121\t{"code":"rate_limited"}\n200\t-\t{"ok":true}\n' > "$STUB_CURL_RESPONSES"
   local out
   out=$(NOTION_TOKEN="fake-token" notion_request GET "/v1/pages/abc" 2>&1)
   assert_contains "notion_request excessive Retry-After: retries then succeeds" '{"ok":true}' "$out"
   assert_contains "notion_request excessive Retry-After: falls back to fixed backoff" \
     "backing off 1s" "$out"
-  assert_eq "notion_request excessive Retry-After: sleeps the fixed schedule's value, not 99999" \
+  assert_eq "notion_request excessive Retry-After: sleeps the fixed schedule's value, not 121" \
     "1" "$(cat "$STUB_SLEEP_LOG")"
 }
 
