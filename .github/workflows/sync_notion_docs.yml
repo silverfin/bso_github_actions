@@ -87,7 +87,7 @@ jobs:
           # two-step convention this repo already uses for
           # push_to_review_firm.yml's own self-reference (see e0cb6b2/#50):
           # this PR cannot know its own post-merge SHA in advance.
-          REF: c2ebea871800b5872b18494e29788152f25bf847
+          REF: 509e2d85ffa042aa1815d5c3b665c15a6810014b
         run: |
           # Same bounded timeouts as notion_request's curl calls: a stalled
           # raw.githubusercontent.com transfer must not block the whole job
