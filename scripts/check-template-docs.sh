@@ -40,26 +40,40 @@ resolve_fanout_consumers() {
     return 0
   fi
 
+  # Captured via command substitution, not `< <(jq ...)`: a process
+  # substitution's exit status is invisible to the shell (even under
+  # `set -e`), so a malformed config.json would otherwise make jq fail
+  # silently - the while loop just sees zero lines, `results` stays
+  # empty, and this function reports success indistinguishable from "no
+  # consumers to fan out to". Command substitution's status IS checkable.
+  local jq_output
+  if ! jq_output=$(jq -r '.used_in[]? | [.type, (.handle // "null")] | @tsv' "$config_path" 2>&1); then
+    echo "WARN: $shared_part_dir has an unparseable config.json (jq failed: $jq_output), skipping fan-out" >&2
+    return 0
+  fi
+
   local results=()
-  local type handle
-  while IFS=$'\t' read -r type handle; do
-    if [[ "$handle" == "null" || -z "$handle" ]]; then
-      echo "WARN: $shared_part_dir used_in has a $type entry with no handle (common for account templates) - cannot resolve automatically, skipping" >&2
-      continue
-    fi
-    local dir=""
-    case "$type" in
-      reconciliationText) dir="reconciliation_texts/$handle" ;;
-      accountTemplate)    dir="account_templates/$handle" ;;
-      *)
-        echo "WARN: $shared_part_dir used_in has unknown type '$type', skipping" >&2
+  if [[ -n "$jq_output" ]]; then
+    local type handle
+    while IFS=$'\t' read -r type handle; do
+      if [[ "$handle" == "null" || -z "$handle" ]]; then
+        echo "WARN: $shared_part_dir used_in has a $type entry with no handle (common for account templates) - cannot resolve automatically, skipping" >&2
         continue
-        ;;
-    esac
-    if [[ -f "$repo_root/$dir/README.md" ]]; then
-      results+=("$dir")
-    fi
-  done < <(jq -r '.used_in[]? | [.type, (.handle // "null")] | @tsv' "$config_path")
+      fi
+      local dir=""
+      case "$type" in
+        reconciliationText) dir="reconciliation_texts/$handle" ;;
+        accountTemplate)    dir="account_templates/$handle" ;;
+        *)
+          echo "WARN: $shared_part_dir used_in has unknown type '$type', skipping" >&2
+          continue
+          ;;
+      esac
+      if [[ -f "$repo_root/$dir/README.md" ]]; then
+        results+=("$dir")
+      fi
+    done <<< "$jq_output"
+  fi
 
   (( ${#results[@]} )) && printf '%s\n' "${results[@]}" | sort -u
   return 0

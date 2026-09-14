@@ -123,11 +123,32 @@ JSON
   assert_eq "resolve_fanout_consumers (empty result, all null handles skipped)" "" "$actual"
 }
 
+test_resolve_fanout_consumers_malformed_config() {
+  local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
+  rm -rf "$root"
+  mkdir -p "$root/shared_parts/broken_fixture"
+  printf '{ this is not valid json' > "$root/shared_parts/broken_fixture/config.json"
+
+  local actual rc stderr_out
+  stderr_out=$(mktemp)
+  actual=$(resolve_fanout_consumers "shared_parts/broken_fixture" "$root" 2>"$stderr_out") && rc=0 || rc=$?
+  assert_eq "resolve_fanout_consumers (malformed config.json): exit 0, non-blocking" "0" "$rc"
+  assert_eq "resolve_fanout_consumers (malformed config.json): empty output" "" "$actual"
+  if grep -q "WARN:.*unparseable config.json" "$stderr_out"; then
+    echo "PASS: resolve_fanout_consumers (malformed config.json) warns on stderr"
+  else
+    echo "FAIL: resolve_fanout_consumers (malformed config.json) should warn on stderr, got: $(cat "$stderr_out")"
+    failures=$((failures + 1))
+  fi
+  rm -f "$stderr_out"
+}
+
 test_extract_template_dirs
 test_extract_shared_part_dirs
 test_extract_dirs_with_no_matches_at_all
 test_resolve_fanout_consumers
 test_resolve_fanout_consumers_empty_result
+test_resolve_fanout_consumers_malformed_config
 
 if [[ $failures -gt 0 ]]; then
   echo "$failures test(s) failed"
