@@ -1,0 +1,13 @@
+# SCRATCH — throwaway top-level workflow, deleted after Task 6 Step 4's
+# live verification. check_template_docs.yml is workflow_call only (meant
+# for market repos), so this repo needs a temporary pull_request: caller
+# to exercise it end-to-end on a real PR before this file is removed.
+name: scratch-verify-check-template-docs
+
+on:
+  pull_request:
+    branches: ["*"]
+
+jobs:
+  check-template-docs:
+    uses: ./.github/workflows/check_template_docs.yml
