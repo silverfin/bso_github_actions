@@ -234,9 +234,25 @@ test_find_page_by_handle_duplicate() {
   assert_eq "find_page_by_handle: 2 matches returns DUPLICATE" "DUPLICATE" "$out"
 }
 
+test_find_page_by_handle_malformed_response() {
+  setup_stub_curl
+  printf '200\t-\tnot-json\n' > "$STUB_CURL_RESPONSES"
+  local out rc
+  out=$(NOTION_TOKEN="fake-token" find_page_by_handle "ds-abc" "vol_1_fixture" 2>&1) && rc=0 || rc=$?
+  assert_eq "find_page_by_handle: malformed response exit 1" "1" "$rc"
+  assert_contains "find_page_by_handle: malformed response sensible error message" \
+    "unparseable response" "$out"
+}
+
 test_find_page_by_handle_one_match
 test_find_page_by_handle_no_match
 test_find_page_by_handle_duplicate
+test_find_page_by_handle_malformed_response
+
+# Proof that a malformed-JSON response inside find_page_by_handle's jq call
+# doesn't trip set -e and kill this whole test script (the bug the jq guard
+# above is protecting against): if it did, we would never reach this line.
+echo "PASS: test script continued past the malformed jq response"
 
 if [[ $failures -gt 0 ]]; then
   echo "$failures test(s) failed"
