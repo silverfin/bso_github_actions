@@ -259,3 +259,78 @@ sync_readme() {
 
   echo "$result"
 }
+
+# CLI entrypoint. $1 = path to a newline-separated list of changed README
+# paths (relative to repo_root), $2 = repo_root, $3 = market (e.g. BE),
+# $4 = commit_sha, $5 = optional path to the market -> data-source-id config
+# (defaults to repo_root/scripts/notion-config.json). This is a post-merge
+# job with nothing left to block, so it always exits 0; failures are
+# reported via $GITHUB_OUTPUT instead, for the workflow's Slack step.
+main() {
+  local changed_readmes_path="$1"
+  local repo_root="$2"
+  local market="$3"
+  local commit_sha="$4"
+  local config_path="${5:-$repo_root/scripts/notion-config.json}"
+
+  # Guarded like every other jq call in this file: a missing or unparseable
+  # config_path exits non-zero (unlike a merely-missing market key, which jq
+  # resolves to "null" without erroring) and would otherwise trip set -e/
+  # inherit_errexit and kill this CLI run before it reports anything - this
+  # function must always exit 0 per its contract above.
+  local rt_ds at_ds
+  if ! rt_ds=$(jq -r --arg m "$market" '.[$m].reconciliation_texts' "$config_path" 2>&1); then
+    echo "ERROR: could not read $config_path for market '$market' (jq failed: $rt_ds)" >&2
+    return 0
+  fi
+  if ! at_ds=$(jq -r --arg m "$market" '.[$m].account_templates' "$config_path" 2>&1); then
+    echo "ERROR: could not read $config_path for market '$market' (jq failed: $at_ds)" >&2
+    return 0
+  fi
+
+  local failed=()
+  local created=()
+
+  while IFS= read -r readme_path; do
+    [[ -z "$readme_path" ]] && continue
+    local template_dir
+    template_dir=$(dirname "$readme_path")
+
+    local data_source_id
+    if [[ "$template_dir" == reconciliation_texts/* ]]; then
+      data_source_id="$rt_ds"
+    elif [[ "$template_dir" == account_templates/* ]]; then
+      data_source_id="$at_ds"
+    else
+      continue
+    fi
+
+    local full_readme_path="$repo_root/$readme_path"
+    [[ -f "$full_readme_path" ]] || continue
+
+    local result
+    result=$(sync_readme "$full_readme_path" "$template_dir" "$repo_root" "$data_source_id" "$market" "$commit_sha")
+    echo "$template_dir: $result"
+
+    if [[ "$result" == "DUPLICATE" || "$result" == FAILED:* ]]; then
+      failed+=("$(basename "$template_dir")")
+    elif [[ "$result" == "CREATED" ]]; then
+      created+=("$(basename "$template_dir")")
+    fi
+  done < "$changed_readmes_path"
+
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    if [[ ${#failed[@]} -gt 0 ]]; then
+      echo "failed_handles=${failed[*]}" >> "$GITHUB_OUTPUT"
+    fi
+    if [[ ${#created[@]} -gt 0 ]]; then
+      echo "created_handles=${created[*]}" >> "$GITHUB_OUTPUT"
+    fi
+  fi
+
+  return 0
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi

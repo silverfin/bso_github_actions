@@ -415,6 +415,87 @@ test_sync_readme_skips_on_duplicate
 test_sync_readme_reports_failed_without_crashing
 test_sync_readme_create_response_missing_id
 
+test_cli_reports_failed_handles_via_github_output() {
+  setup_stub_curl
+  setup_resolve_fixture
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  echo "# Vol 1" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  # one success (create), one duplicate
+  printf '200\t-\t{"results":[]}\n200\t-\t{"id":"new-page-1"}\n200\t-\t{"id":"new-page-1"}\n200\t-\t{"results":[{"id":"p1"},{"id":"p2"}]}\n' > "$STUB_CURL_RESPONSES"
+
+  local changed_file github_output
+  changed_file="$SCRIPT_DIR/fixtures/notion-sync/changed-readmes.txt"
+  printf '%s\n' \
+    "reconciliation_texts/vol_1_fixture/README.md" \
+    "account_templates/AT_fixture/README.md" > "$changed_file"
+  echo "# AT" > "$root/account_templates/AT_fixture/README.md"
+
+  github_output="$SCRIPT_DIR/fixtures/notion-sync/github_output.txt"
+  : > "$github_output"
+
+  local test_config="$SCRIPT_DIR/fixtures/notion-sync/notion-config.json"
+  cat > "$test_config" << 'JSON'
+{"BE": {"reconciliation_texts": "ds-rt", "account_templates": "ds-at"}}
+JSON
+
+  NOTION_TOKEN="fake-token" GITHUB_OUTPUT="$github_output" \
+    bash "$SCRIPT_DIR/../sync-notion-docs.sh" "$changed_file" "$root" "BE" "abcdef1234567" "$test_config" > /dev/null 2>&1
+
+  if grep -q "^failed_handles=.*AT_fixture" "$github_output"; then
+    echo "PASS: CLI reports the duplicate handle in GITHUB_OUTPUT"
+  else
+    echo "FAIL: CLI should have reported AT_fixture as failed, got:"
+    cat "$github_output"
+    failures=$((failures + 1))
+  fi
+
+  # The brief's one given test only exercises CREATED and DUPLICATE - also
+  # cover created_handles itself, and that a DUPLICATE handle never leaks
+  # into created_handles.
+  assert_contains "CLI reports the created handle in GITHUB_OUTPUT" \
+    "created_handles=vol_1_fixture" "$(cat "$github_output")"
+  assert_not_contains "CLI never reports the duplicate handle as created" \
+    "AT_fixture" "$(grep '^created_handles=' "$github_output" || true)"
+}
+
+test_cli_classifies_updated_and_failed_results() {
+  setup_stub_curl
+  setup_resolve_fixture
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  echo "# Vol 1" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  echo "# AT" > "$root/account_templates/AT_fixture/README.md"
+  # vol_1_fixture: lookup finds an existing page -> UPDATED (3 calls: lookup,
+  # update, stamp). AT_fixture: lookup itself errors -> FAILED:* (1 call).
+  printf '200\t-\t{"results":[{"id":"page-existing"}]}\n200\t-\t{"id":"page-existing"}\n200\t-\t{"id":"page-existing"}\n500\t-\t{"code":"error"}\n' > "$STUB_CURL_RESPONSES"
+
+  local changed_file github_output test_config
+  changed_file="$SCRIPT_DIR/fixtures/notion-sync/changed-readmes.txt"
+  printf '%s\n' \
+    "reconciliation_texts/vol_1_fixture/README.md" \
+    "account_templates/AT_fixture/README.md" > "$changed_file"
+
+  github_output="$SCRIPT_DIR/fixtures/notion-sync/github_output.txt"
+  : > "$github_output"
+
+  test_config="$SCRIPT_DIR/fixtures/notion-sync/notion-config.json"
+  cat > "$test_config" << 'JSON'
+{"BE": {"reconciliation_texts": "ds-rt", "account_templates": "ds-at"}}
+JSON
+
+  NOTION_TOKEN="fake-token" GITHUB_OUTPUT="$github_output" \
+    bash "$SCRIPT_DIR/../sync-notion-docs.sh" "$changed_file" "$root" "BE" "abcdef1234567" "$test_config" > /dev/null 2>&1
+
+  assert_not_contains "CLI: an UPDATED handle is not reported as failed" \
+    "vol_1_fixture" "$(grep '^failed_handles=' "$github_output" || true)"
+  assert_not_contains "CLI: an UPDATED handle is not reported as created" \
+    "vol_1_fixture" "$(grep '^created_handles=' "$github_output" || true)"
+  assert_contains "CLI: a FAILED:* result is reported as failed" \
+    "AT_fixture" "$(grep '^failed_handles=' "$github_output" || true)"
+}
+
+test_cli_reports_failed_handles_via_github_output
+test_cli_classifies_updated_and_failed_results
+
 if [[ $failures -gt 0 ]]; then
   echo "$failures test(s) failed"
   exit 1
