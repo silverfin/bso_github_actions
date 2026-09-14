@@ -7,12 +7,16 @@ on:
 jobs:
   skip-check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     if: contains(github.event.pull_request.labels.*.name, 'no-readme-required')
     steps:
       - run: echo "no-readme-required label present, skipping"
 
   check-template-docs:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'no-readme-required') }}
     steps:
       - name: Checkout Repository
@@ -26,14 +30,33 @@ jobs:
         with:
           base_sha: 'main'
           dir_names: false
-          json: false
+          # Emit the file list as a JSON array so paths containing spaces (e.g. account
+          # template names) survive the hand-off intact. escape_json: false keeps it valid
+          # JSON for jq. safe_output: false stops backslash-escaping of shell metacharacters
+          # (& ( ) ...) inside the JSON values, which is invalid JSON and would silently
+          # empty the list - safe here, the list is passed via env and parsed with jq, never
+          # eval'd by the shell. quotepath: false emits non-ASCII paths as-is instead of
+          # octal-escaping them (which would break the downstream regex match).
+          json: true
+          escape_json: false
+          safe_output: false
+          quotepath: false
           files: |
             **/**.{liquid,yml,yaml,json,md}
 
       - name: Write changed files to a plain list
+        env:
+          # Passed via env (not inlined into the shell body), so a path with quotes/spaces/
+          # metacharacters cannot break the script or be interpreted as shell syntax.
+          ALL_CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
         run: |
-          printf '%s\n' "${{ steps.changed-files.outputs.all_changed_files }}" \
-            | tr ' ' '\n' > /tmp/changed_files.txt
+          # Fail loudly if the changed-files output is not valid JSON. A silent jq failure
+          # here would empty the changed-files list and let every template through unchecked.
+          if ! printf '%s' "${ALL_CHANGED_FILES:-[]}" | jq -e . > /dev/null; then
+            echo "::error::changed-files output is not valid JSON, refusing to skip the check silently"
+            exit 1
+          fi
+          printf '%s' "${ALL_CHANGED_FILES:-[]}" | jq -r '.[]' > /tmp/changed_files.txt
 
       - name: Fetch check-template-docs.sh
         run: |
@@ -41,4 +64,15 @@ jobs:
             "https://raw.githubusercontent.com/silverfin/bso_github_actions/main/scripts/check-template-docs.sh"
 
       - name: Check template docs
+        id: check-template-docs
         run: bash /tmp/check-template-docs.sh /tmp/changed_files.txt "${{ github.workspace }}"
+
+      - name: Summarize failures
+        if: failure()
+        run: |
+          {
+            echo "### Missing READMEs"
+            echo '${{ steps.check-template-docs.outputs.missing_readmes }}'
+            echo "### README structural problems"
+            echo '${{ steps.check-template-docs.outputs.invalid_readmes }}'
+          } >> "$GITHUB_STEP_SUMMARY"
