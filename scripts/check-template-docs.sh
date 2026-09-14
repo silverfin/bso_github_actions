@@ -159,7 +159,11 @@ validate_readme_structure() {
   fi
 
   for heading in "${REQUIRED_HEADINGS[@]}"; do
-    if ! grep -qF "$heading" "$readme_path"; then
+    # -x (whole-line match): plain -F does a substring search, so
+    # "### Metadata" (wrong heading level) would silently pass a check
+    # for "## Metadata" - "###" + " Metadata" contains "## Metadata" as
+    # a substring starting at its second character.
+    if ! grep -qxF "$heading" "$readme_path"; then
       echo "ERROR: missing required section: $heading"
       ok=1
     fi
@@ -167,9 +171,15 @@ validate_readme_structure() {
 
   # Unresolved skeleton placeholders: backtick-quoted {word} left as-is,
   # e.g. `{handle}`, `{situation}`. A filled-in README should have none.
-  if grep -qE '`\{[a-zA-Z_ /]+\}`' "$readme_path"; then
+  # Character class includes digits/hyphen/comma/period, not just letters
+  # and spaces: the skill's own skeleton examples include placeholder text
+  # like `{plain-language answer}` and a hyphen-free class misses it
+  # silently (verified: `{plain-language answer}` does not match
+  # `[a-zA-Z_ /]+`, only the fixture's other, letters-only placeholders
+  # do - masking the gap behind an otherwise-passing test).
+  if grep -qE '`\{[a-zA-Z0-9_ /,.-]+\}`' "$readme_path"; then
     echo "ERROR: unresolved placeholder(s) still present - the skeleton was not filled in:"
-    grep -nE '`\{[a-zA-Z_ /]+\}`' "$readme_path" | sed 's/^/  /'
+    grep -nE '`\{[a-zA-Z0-9_ /,.-]+\}`' "$readme_path" | sed 's/^/  /'
     ok=1
   fi
 

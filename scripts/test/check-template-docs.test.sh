@@ -277,6 +277,84 @@ test_validate_readme_structure_pii_leak() {
   fi
 }
 
+# Isolated regression case: a placeholder whose text contains a hyphen or a
+# digit, with no OTHER placeholder present to mask a regex gap. The
+# fixtures/readmes/unresolved-placeholder.README.md fixture has several
+# placeholders at once (`{handle}`, `{one paragraph}`, etc.) - a class that
+# only matches letters-and-spaces still passes that whole-file test because
+# the other, letters-only placeholders are caught, even if
+# `{plain-language answer}` itself is silently missed. This test isolates
+# a single hyphen/digit placeholder so that masking can't happen.
+test_validate_readme_structure_unresolved_placeholder_with_hyphen_and_digit() {
+  local tmpfile
+  tmpfile=$(mktemp)
+  cat > "$tmpfile" << 'MD'
+## Metadata
+
+## Functional overview
+
+**Purpose:**
+Something.
+
+## Scenarios & edge cases
+
+### Happy path
+- Something happens -> something else happens.
+
+## FAQ / support answers
+
+**Q:** `{step 1}`
+**A:** `{plain-language answer}`
+MD
+  local out rc
+  out=$(validate_readme_structure "$tmpfile") && rc=0 || rc=$?
+  rm -f "$tmpfile"
+  assert_eq "unresolved placeholder with hyphen/digit: exit 1" "1" "$rc"
+  if [[ "$out" == *"unresolved placeholder"* ]]; then
+    echo "PASS: hyphen/digit-only placeholder is still detected"
+  else
+    echo "FAIL: hyphen/digit-only placeholder should be detected, got: $out"
+    failures=$((failures + 1))
+  fi
+}
+
+# Regression case: a wrong heading level (### instead of the required ##)
+# must not be accepted. Plain -F is a substring search, and "### Metadata"
+# contains "## Metadata" as a substring (starting at its second character),
+# so this fails without -x (whole-line match).
+test_validate_readme_structure_wrong_heading_level() {
+  local tmpfile
+  tmpfile=$(mktemp)
+  cat > "$tmpfile" << 'MD'
+### Metadata
+
+## Functional overview
+
+**Purpose:**
+Something.
+
+## Scenarios & edge cases
+
+### Happy path
+- Something happens -> something else happens.
+
+## FAQ / support answers
+
+**Q:** Why?
+**A:** Because.
+MD
+  local out rc
+  out=$(validate_readme_structure "$tmpfile") && rc=0 || rc=$?
+  rm -f "$tmpfile"
+  assert_eq "wrong heading level (### instead of ##): exit 1" "1" "$rc"
+  if [[ "$out" == *"missing required section: ## Metadata"* ]]; then
+    echo "PASS: wrong heading level is not accepted as the required section"
+  else
+    echo "FAIL: wrong heading level should be flagged as a missing section, got: $out"
+    failures=$((failures + 1))
+  fi
+}
+
 test_extract_template_dirs
 test_extract_shared_part_dirs
 test_extract_dirs_with_no_matches_at_all
@@ -291,6 +369,8 @@ test_find_missing_unreadable_input
 test_validate_readme_structure_valid
 test_validate_readme_structure_missing_heading
 test_validate_readme_structure_unresolved_placeholder
+test_validate_readme_structure_unresolved_placeholder_with_hyphen_and_digit
+test_validate_readme_structure_wrong_heading_level
 test_validate_readme_structure_pii_leak
 
 if [[ $failures -gt 0 ]]; then
