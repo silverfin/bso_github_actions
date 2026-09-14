@@ -606,6 +606,35 @@ JSON
     "AT_fixture" "$(grep '^failed_handles=' "$github_output" || true)"
 }
 
+test_cli_stamp_failure_reports_both_failed_and_created() {
+  setup_stub_curl
+  setup_resolve_fixture
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  echo "# Vol 1" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  # lookup: no existing page -> create succeeds -> stamp fails.
+  printf '200\t-\t{"results":[]}\n200\t-\t{"id":"new-page-1"}\n500\t-\t{"code":"error"}\n' > "$STUB_CURL_RESPONSES"
+
+  local changed_file github_output test_config
+  changed_file="$SCRIPT_DIR/fixtures/notion-sync/changed-readmes.txt"
+  printf '%s\n' "reconciliation_texts/vol_1_fixture/README.md" > "$changed_file"
+
+  github_output="$SCRIPT_DIR/fixtures/notion-sync/github_output.txt"
+  : > "$github_output"
+
+  test_config="$SCRIPT_DIR/fixtures/notion-sync/notion-config.json"
+  cat > "$test_config" << 'JSON'
+{"BE": {"reconciliation_texts": "ds-rt", "account_templates": "ds-at"}}
+JSON
+
+  NOTION_TOKEN="fake-token" GITHUB_OUTPUT="$github_output" \
+    bash "$SCRIPT_DIR/../sync-notion-docs.sh" "$changed_file" "$root" "BE" "abcdef1234567" "$test_config" > /dev/null 2>&1
+
+  assert_contains "CLI stamp failure after CREATED: reports failed handle" \
+    "failed_handles=vol_1_fixture" "$(cat "$github_output")"
+  assert_contains "CLI stamp failure after CREATED: also reports created handle" \
+    "created_handles=vol_1_fixture" "$(cat "$github_output")"
+}
+
 test_cli_reports_resolved_handle_not_dir_basename() {
   setup_stub_curl
   setup_resolve_fixture
@@ -679,6 +708,8 @@ test_cli_missing_changed_readmes_file() {
     "does not exist or is not readable" "$out"
   assert_eq "CLI with a missing changed-readmes list: makes no curl calls" \
     "0" "$(curl_call_count)"
+  assert_contains "CLI with a missing changed-readmes list: alerts via GITHUB_OUTPUT" \
+    "failed_handles=config-error:missing-list" "$(cat "$github_output")"
 }
 
 test_cli_malformed_config() {
@@ -704,6 +735,8 @@ test_cli_malformed_config() {
     "could not read" "$out"
   assert_eq "CLI with a malformed notion-config.json: makes no curl calls" \
     "0" "$(curl_call_count)"
+  assert_contains "CLI with a malformed notion-config.json: alerts via GITHUB_OUTPUT" \
+    "failed_handles=config-error:config-read:BE" "$(cat "$github_output")"
 }
 
 # A market key that is simply absent is NOT a jq error - `jq -r` prints the
@@ -736,8 +769,8 @@ test_cli_market_not_in_config() {
     "market 'NL' has no entry in $test_config" "$out"
   assert_eq "CLI with an unconfigured market: makes no curl calls at all" \
     "0" "$(curl_call_count)"
-  assert_eq "CLI with an unconfigured market: writes no GITHUB_OUTPUT" \
-    "" "$(cat "$github_output")"
+  assert_contains "CLI with an unconfigured market: alerts via GITHUB_OUTPUT" \
+    "failed_handles=config-error:unconfigured:NL" "$(cat "$github_output")"
   assert_not_contains "CLI with an unconfigured market: never blames the template" \
     "vol_1_fixture:" "$out"
 }
@@ -821,6 +854,7 @@ test_cli_joins_multiple_handles_readably() {
 
 test_cli_reports_failed_handles_via_github_output
 test_cli_classifies_updated_and_failed_results
+test_cli_stamp_failure_reports_both_failed_and_created
 test_cli_reports_resolved_handle_not_dir_basename
 test_cli_missing_changed_readmes_file
 test_cli_malformed_config

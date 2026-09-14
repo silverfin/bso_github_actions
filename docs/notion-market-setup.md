@@ -22,14 +22,16 @@ One-off, per market, before its sync_notion_docs.yml caller can run.
 4. Fetch each database's data source ID (Notion API: `GET /v1/databases/{id}`
    returns child data sources) and add it to `scripts/notion-config.json`
    under the new market code.
-5. **Merge that `scripts/notion-config.json` change to `main` in
-   `bso_github_actions` before triggering the caller.** The reusable workflow
-   always fetches the config from
-   `raw.githubusercontent.com/silverfin/bso_github_actions/main/scripts/notion-config.json`,
-   no matter which ref the caller workflow itself is pinned to. A market added
-   on a branch is therefore invisible to the job, and every run for it stops
-   with `ERROR: market '<MARKET>' has no entry in ...` (exit 0, nothing
-   synced) until the change is on `main`.
+5. **Merge the `scripts/notion-config.json` change to `main`, then bump the
+   immutable `REF` pin in `.github/workflows/sync_notion_docs.yml` to that
+   commit and merge that workflow change too.** The reusable workflow always
+   fetches both `sync-notion-docs.sh` and `notion-config.json` from the commit
+   SHA set in its `REF` env var (not from `@main` and not from the caller's
+   pin). A market added on a branch, or merged to `main` without a matching
+   `REF` bump, is therefore invisible to the job until `REF` points at a commit
+   that contains the new market entry. After the workflow change lands, pin
+   the market repo's caller workflow (`uses: .../sync_notion_docs.yml@<sha>`)
+   to the resulting workflow commit.
 6. Provision the secrets the reusable workflow needs. Set them at the
    organisation level if you can, so every market repo inherits them;
    otherwise add them to the market repo itself (Settings -> Secrets and

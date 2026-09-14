@@ -370,6 +370,18 @@ join_handles() {
   printf '%s' "$out"
 }
 
+# Writes a sentinel to $GITHUB_OUTPUT so the workflow's Slack step fires even
+# when main() aborts before any per-template sync runs (missing config, market,
+# or changed-readmes list). Best-effort, same contract as the append at the
+# bottom of main().
+write_config_abort_alert() {
+  local sentinel="$1"
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    echo "failed_handles=$sentinel" >> "$GITHUB_OUTPUT" \
+      || echo "WARN: could not write failed_handles to GITHUB_OUTPUT ($GITHUB_OUTPUT)" >&2
+  fi
+}
+
 # CLI entrypoint. $1 = path to a newline-separated list of changed README
 # paths (relative to repo_root), $2 = repo_root, $3 = market (e.g. BE),
 # $4 = commit_sha, $5 = optional path to the market -> data-source-id config
@@ -391,10 +403,12 @@ main() {
   local rt_ds at_ds
   if ! rt_ds=$(jq -r --arg m "$market" '.[$m].reconciliation_texts' "$config_path" 2>&1); then
     echo "ERROR: could not read $config_path for market '$market' (jq failed: $rt_ds)" >&2
+    write_config_abort_alert "config-error:config-read:${market}"
     return 0
   fi
   if ! at_ds=$(jq -r --arg m "$market" '.[$m].account_templates' "$config_path" 2>&1); then
     echo "ERROR: could not read $config_path for market '$market' (jq failed: $at_ds)" >&2
+    write_config_abort_alert "config-error:config-read:${market}"
     return 0
   fi
 
@@ -405,6 +419,7 @@ main() {
   # blames every template instead of naming the one thing actually wrong.
   if [[ -z "$rt_ds" || "$rt_ds" == "null" || -z "$at_ds" || "$at_ds" == "null" ]]; then
     echo "ERROR: market '$market' has no entry in $config_path" >&2
+    write_config_abort_alert "config-error:unconfigured:${market}"
     return 0
   fi
 
@@ -414,6 +429,7 @@ main() {
   # at all - the single worst failure shape for this script.
   if [[ ! -f "$changed_readmes_path" || ! -r "$changed_readmes_path" ]]; then
     echo "ERROR: changed-README list '$changed_readmes_path' does not exist or is not readable" >&2
+    write_config_abort_alert "config-error:missing-list"
     return 0
   fi
 
@@ -460,7 +476,13 @@ main() {
     local reported_handle
     reported_handle=$(resolve_handle "$template_dir" "$repo_root" 2>/dev/null) || reported_handle="$(basename "$template_dir")"
 
-    if [[ "$result" == "DUPLICATE" || "$result" == FAILED:* ]]; then
+    if [[ "$result" =~ ^FAILED:\ metadata\ stamp\ failed\ after\ CREATED ]]; then
+      # Page was created but metadata stamping failed: report both so the
+      # failure alert carries the handle and the creation notification still
+      # fires (per the plan's Global Constraints on surfacing every create).
+      failed+=("$reported_handle")
+      created+=("$reported_handle")
+    elif [[ "$result" == "DUPLICATE" || "$result" == FAILED:* ]]; then
       failed+=("$reported_handle")
     elif [[ "$result" == "CREATED" ]]; then
       created+=("$reported_handle")
