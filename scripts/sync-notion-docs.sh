@@ -65,6 +65,10 @@ resolve_name() {
 NOTION_API_BASE="https://api.notion.com"
 NOTION_VERSION="2026-03-11"
 NOTION_MAX_ATTEMPTS=6
+# Upper bound on how long a single honored Retry-After value can make this
+# script sleep. Matches curl's own --max-time below - there's no point
+# trusting a header to wait longer than we'd already wait for one request.
+NOTION_RETRY_AFTER_MAX_SECONDS=120
 
 # $1 = HTTP method, $2 = path (e.g. /v1/pages/abc), $3 = optional JSON body.
 # Retries on 429/529, honouring the response's own Retry-After header when
@@ -155,14 +159,21 @@ notion_request() {
         # (header names aren't) and takes the last match in case of duplicate
         # headers across a redirect; \r and surrounding space are stripped
         # since raw HTTP headers are CRLF-terminated. Anything that isn't a
-        # plain non-negative integer (missing, malformed, or a HTTP-date form
-        # this script doesn't parse) falls back to the fixed schedule instead
-        # of guessing.
+        # plain, short, non-negative integer (missing, malformed, a HTTP-date
+        # form this script doesn't parse, or a value beyond
+        # NOTION_RETRY_AFTER_MAX_SECONDS) falls back to the fixed schedule
+        # instead of trusting the header unconditionally - a malformed proxy
+        # response or a compromised intermediary could otherwise stall this
+        # loop (and the whole post-merge job) far longer than the bounded
+        # ~31s the fixed schedule ever takes, and an absurdly long digit
+        # string handed straight to `sleep` risks failing outright on some
+        # platforms. `${1,4}` bounds the match itself to 4 digits before the
+        # numeric comparison even runs, so a huge value can't reach `sleep`.
         local retry_after=""
         retry_after=$(grep -i '^retry-after:' "$headers_file" 2>/dev/null | tail -n 1 | cut -d: -f2- | tr -d ' \r\n') || true
-        if [[ "$retry_after" =~ ^[0-9]+$ ]]; then
+        if [[ "$retry_after" =~ ^[0-9]{1,4}$ ]] && (( retry_after <= NOTION_RETRY_AFTER_MAX_SECONDS )); then
           echo "WARN: Notion API returned $status (attempt $attempt/$NOTION_MAX_ATTEMPTS), honoring Retry-After: ${retry_after}s" >&2
-          sleep "$retry_after"
+          sleep "$retry_after" || true
         else
           echo "WARN: Notion API returned $status (attempt $attempt/$NOTION_MAX_ATTEMPTS), backing off ${backoff}s" >&2
           sleep "$backoff"

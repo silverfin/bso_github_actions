@@ -287,6 +287,24 @@ test_notion_request_ignores_invalid_retry_after() {
     "1" "$(cat "$STUB_SLEEP_LOG")"
 }
 
+test_notion_request_caps_excessive_retry_after() {
+  setup_stub_curl
+  # A value beyond NOTION_RETRY_AFTER_MAX_SECONDS (120) is not "trust the
+  # header a little less" - it's rejected outright and treated exactly like
+  # an absent/invalid header, falling back to the fixed schedule. Guards
+  # against a malformed proxy response or a compromised intermediary
+  # stalling this loop (and the whole post-merge job) far longer than the
+  # bounded ~31s the fixed schedule would ever take.
+  printf '429\t99999\t{"code":"rate_limited"}\n200\t-\t{"ok":true}\n' > "$STUB_CURL_RESPONSES"
+  local out
+  out=$(NOTION_TOKEN="fake-token" notion_request GET "/v1/pages/abc" 2>&1)
+  assert_contains "notion_request excessive Retry-After: retries then succeeds" '{"ok":true}' "$out"
+  assert_contains "notion_request excessive Retry-After: falls back to fixed backoff" \
+    "backing off 1s" "$out"
+  assert_eq "notion_request excessive Retry-After: sleeps the fixed schedule's value, not 99999" \
+    "1" "$(cat "$STUB_SLEEP_LOG")"
+}
+
 test_notion_request_succeeds_first_try
 test_notion_request_retries_on_429
 test_notion_request_fails_on_non_retryable_error
@@ -294,6 +312,7 @@ test_notion_request_curl_hard_failure
 test_notion_request_fails_after_max_attempts
 test_notion_request_honors_retry_after
 test_notion_request_ignores_invalid_retry_after
+test_notion_request_caps_excessive_retry_after
 
 # Proof that a hard curl failure inside notion_request doesn't trip set -e
 # and kill this whole test script (the bug being guarded against): if it
