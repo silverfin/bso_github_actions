@@ -21,4 +21,12 @@ mv "${STUB_CURL_RESPONSES}.tmp" "$STUB_CURL_RESPONSES"
 status=$(echo "$line" | cut -f1)
 body=$(echo "$line" | cut -f3-)
 
+# A status of CURLFAIL simulates curl itself failing outright (DNS/connection
+# /TLS - no HTTP response at all), as opposed to a non-2xx HTTP status. Real
+# curl -sS prints its error to stderr and produces no stdout in this case.
+if [[ "$status" == "CURLFAIL" ]]; then
+  echo "curl: (7) Failed to connect (stub-simulated failure)" >&2
+  exit 1
+fi
+
 printf '%s\n%s' "$body" "$status"

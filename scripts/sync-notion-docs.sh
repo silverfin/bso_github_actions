@@ -64,18 +64,26 @@ notion_request() {
 
   while (( attempt <= NOTION_MAX_ATTEMPTS )); do
     local response status response_body
+    local -a curl_args=(
+      -sS -w '\n%{http_code}'
+      -X "$method" "$NOTION_API_BASE$path"
+      -H "Authorization: Bearer $NOTION_TOKEN"
+      -H "Notion-Version: $NOTION_VERSION"
+    )
     if [[ -n "$body" ]]; then
-      response=$(curl -sS -w '\n%{http_code}' \
-        -X "$method" "$NOTION_API_BASE$path" \
-        -H "Authorization: Bearer $NOTION_TOKEN" \
-        -H "Notion-Version: $NOTION_VERSION" \
-        -H "Content-Type: application/json" \
-        -d "$body")
-    else
-      response=$(curl -sS -w '\n%{http_code}' \
-        -X "$method" "$NOTION_API_BASE$path" \
-        -H "Authorization: Bearer $NOTION_TOKEN" \
-        -H "Notion-Version: $NOTION_VERSION")
+      curl_args+=(-H "Content-Type: application/json" -d "$body")
+    fi
+
+    # Guard explicitly against curl itself failing (DNS/connection/TLS - no
+    # HTTP response at all), as opposed to a non-2xx HTTP status. A bare
+    # `response=$(curl ...)` here would trip `set -e` deep inside this
+    # function on that failure and could kill the calling script before it
+    # ever sees a return value - same hazard class as the jq fix in
+    # resolve_handle. Capturing curl's own exit status explicitly keeps the
+    # failure inside this function's normal, reportable return-1 path.
+    if ! response=$(curl "${curl_args[@]}" 2>&1); then
+      echo "ERROR: Notion API $method $path: curl itself failed (network/DNS/TLS, no HTTP response): $response" >&2
+      return 1
     fi
 
     status=$(echo "$response" | tail -n 1)

@@ -141,9 +141,32 @@ test_notion_request_fails_on_non_retryable_error() {
   assert_eq "notion_request 404: exactly 1 call, no retry" "1" "$(wc -l < "$STUB_CURL_LOG" | tr -d ' ')"
 }
 
+test_notion_request_curl_hard_failure() {
+  setup_stub_curl
+  printf 'CURLFAIL\t-\t-\n' > "$STUB_CURL_RESPONSES"
+  local out rc
+  out=$(NOTION_TOKEN="fake-token" notion_request GET "/v1/pages/abc" 2>&1) && rc=0 || rc=$?
+  assert_eq "notion_request curl hard failure: exit 1" "1" "$rc"
+  if [[ "$out" == *"curl itself failed"* ]]; then
+    echo "PASS: notion_request curl hard failure: sensible error message"
+  else
+    echo "FAIL: notion_request curl hard failure: sensible error message"
+    echo "  actual: $out"
+    failures=$((failures + 1))
+  fi
+  assert_eq "notion_request curl hard failure: exactly 1 call, no retry" "1" "$(wc -l < "$STUB_CURL_LOG" | tr -d ' ')"
+}
+
 test_notion_request_succeeds_first_try
 test_notion_request_retries_on_429
 test_notion_request_fails_on_non_retryable_error
+test_notion_request_curl_hard_failure
+
+# Proof that a hard curl failure inside notion_request doesn't trip set -e
+# and kill this whole test script (the bug being guarded against): if it
+# did, we would never reach this line, and the run's final exit code would
+# come from curl's own failure rather than from the failures counter below.
+echo "PASS: test script continued past the hard curl failure"
 
 if [[ $failures -gt 0 ]]; then
   echo "$failures test(s) failed"
