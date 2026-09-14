@@ -16,6 +16,18 @@ assert_eq() {
   fi
 }
 
+assert_contains() {
+  local desc="$1" needle="$2" haystack="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "PASS: $desc"
+  else
+    echo "FAIL: $desc"
+    echo "  expected to contain: $needle"
+    echo "  actual:   $haystack"
+    failures=$((failures + 1))
+  fi
+}
+
 assert_error() {
   local desc="$1" template_dir="$2" repo_root="$3" expected_msg="$4"
   local tempfile output exit_code
@@ -121,6 +133,10 @@ test_notion_request_succeeds_first_try() {
   out=$(NOTION_TOKEN="fake-token" notion_request GET "/v1/pages/abc")
   assert_eq "notion_request success body" '{"ok":true}' "$out"
   assert_eq "notion_request success: exactly 1 call" "1" "$(wc -l < "$STUB_CURL_LOG" | tr -d ' ')"
+  assert_contains "notion_request success: sends Authorization header" \
+    "Authorization: Bearer fake-token" "$(cat "$STUB_CURL_LOG")"
+  assert_contains "notion_request success: sends Notion-Version header" \
+    "Notion-Version: 2026-03-11" "$(cat "$STUB_CURL_LOG")"
 }
 
 test_notion_request_retries_on_429() {
@@ -147,20 +163,46 @@ test_notion_request_curl_hard_failure() {
   local out rc
   out=$(NOTION_TOKEN="fake-token" notion_request GET "/v1/pages/abc" 2>&1) && rc=0 || rc=$?
   assert_eq "notion_request curl hard failure: exit 1" "1" "$rc"
-  if [[ "$out" == *"curl itself failed"* ]]; then
-    echo "PASS: notion_request curl hard failure: sensible error message"
+  assert_contains "notion_request curl hard failure: sensible error message" "curl itself failed" "$out"
+  assert_eq "notion_request curl hard failure: exactly 1 call, no retry" "1" "$(wc -l < "$STUB_CURL_LOG" | tr -d ' ')"
+}
+
+test_notion_request_fails_after_max_attempts() {
+  setup_stub_curl
+  local i
+  for ((i = 0; i < NOTION_MAX_ATTEMPTS; i++)); do
+    printf '429\t0\t{"code":"rate_limited"}\n' >> "$STUB_CURL_RESPONSES"
+  done
+  local out rc start_ts end_ts elapsed
+  start_ts=$(date +%s)
+  out=$(NOTION_TOKEN="fake-token" notion_request GET "/v1/pages/abc" 2>&1) && rc=0 || rc=$?
+  end_ts=$(date +%s)
+  elapsed=$((end_ts - start_ts))
+
+  assert_eq "notion_request exhausted: exit 1" "1" "$rc"
+  assert_contains "notion_request exhausted: sensible error message" \
+    "failed after $NOTION_MAX_ATTEMPTS attempts" "$out"
+  assert_eq "notion_request exhausted: exactly $NOTION_MAX_ATTEMPTS calls, not $((NOTION_MAX_ATTEMPTS + 1))" \
+    "$NOTION_MAX_ATTEMPTS" "$(wc -l < "$STUB_CURL_LOG" | tr -d ' ')"
+
+  # Regression guard for the wasted-final-sleep fix: with the bug, the loop
+  # sleeps out a backoff even on the last, already-doomed attempt, so 6
+  # straight 429s take 1+2+4+8+16+32=63s. Fixed, the pointless final 32s
+  # sleep is skipped, so this takes 1+2+4+8+16=31s. 45s leaves generous
+  # slack for scheduling jitter while still catching a reintroduced sleep.
+  if (( elapsed < 45 )); then
+    echo "PASS: notion_request exhausted: skips the pointless final backoff sleep (${elapsed}s elapsed)"
   else
-    echo "FAIL: notion_request curl hard failure: sensible error message"
-    echo "  actual: $out"
+    echo "FAIL: notion_request exhausted: skips the pointless final backoff sleep (${elapsed}s elapsed, expected < 45s)"
     failures=$((failures + 1))
   fi
-  assert_eq "notion_request curl hard failure: exactly 1 call, no retry" "1" "$(wc -l < "$STUB_CURL_LOG" | tr -d ' ')"
 }
 
 test_notion_request_succeeds_first_try
 test_notion_request_retries_on_429
 test_notion_request_fails_on_non_retryable_error
 test_notion_request_curl_hard_failure
+test_notion_request_fails_after_max_attempts
 
 # Proof that a hard curl failure inside notion_request doesn't trip set -e
 # and kill this whole test script (the bug being guarded against): if it

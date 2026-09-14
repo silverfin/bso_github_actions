@@ -95,9 +95,15 @@ notion_request() {
     fi
 
     if [[ "$status" == "429" || "$status" == "529" ]]; then
-      echo "WARN: Notion API returned $status (attempt $attempt/$NOTION_MAX_ATTEMPTS), backing off ${backoff}s" >&2
-      sleep "$backoff"
-      backoff=$((backoff * 2))
+      # Only sleep/back off when another attempt will actually follow -
+      # there's no point waiting out a backoff right before giving up.
+      if (( attempt < NOTION_MAX_ATTEMPTS )); then
+        echo "WARN: Notion API returned $status (attempt $attempt/$NOTION_MAX_ATTEMPTS), backing off ${backoff}s" >&2
+        sleep "$backoff"
+        backoff=$((backoff * 2))
+      else
+        echo "WARN: Notion API returned $status (attempt $attempt/$NOTION_MAX_ATTEMPTS), no attempts left" >&2
+      fi
       attempt=$((attempt + 1))
       continue
     fi
