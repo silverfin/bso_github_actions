@@ -115,3 +115,40 @@ notion_request() {
   echo "ERROR: Notion API $method $path failed after $NOTION_MAX_ATTEMPTS attempts" >&2
   return 1
 }
+
+# $1 = data_source_id, $2 = handle to search for.
+# stdout: the page ID on exactly one match; empty string on zero matches;
+# the literal string DUPLICATE (plus a stderr warning) on 2+ matches - the
+# caller must treat DUPLICATE as skip-and-alert, never guess which page.
+find_page_by_handle() {
+  local data_source_id="$1"
+  local handle="$2"
+  local body
+  body=$(jq -n --arg h "$handle" '{filter: {property: "Handle", rich_text: {equals: $h}}}')
+
+  local response
+  response=$(notion_request POST "/v1/data_sources/$data_source_id/query" "$body") || return 1
+
+  # Guard explicitly against jq failing (e.g. a malformed/unexpected
+  # response body) - a bare `count=$(echo ... | jq ...)` would trip
+  # `set -e` deep inside this function and kill the calling script before
+  # it ever sees a return value, same hazard class as the fixes already
+  # applied in resolve_handle and notion_request.
+  local count
+  if ! count=$(echo "$response" | jq '.results | length' 2>&1); then
+    echo "ERROR: find_page_by_handle: unparseable response from Notion for handle '$handle' (jq failed: $count)" >&2
+    return 1
+  fi
+
+  if [[ "$count" == "0" ]]; then
+    echo ""
+    return 0
+  elif [[ "$count" == "1" ]]; then
+    echo "$response" | jq -r '.results[0].id'
+    return 0
+  else
+    echo "WARN: Handle '$handle' matches $count pages in data source $data_source_id - skipping, needs manual dedup" >&2
+    echo "DUPLICATE"
+    return 0
+  fi
+}

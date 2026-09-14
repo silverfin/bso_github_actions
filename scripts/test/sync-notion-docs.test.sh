@@ -210,6 +210,34 @@ test_notion_request_fails_after_max_attempts
 # come from curl's own failure rather than from the failures counter below.
 echo "PASS: test script continued past the hard curl failure"
 
+test_find_page_by_handle_one_match() {
+  setup_stub_curl
+  printf '200\t-\t{"results":[{"id":"page-123"}]}\n' > "$STUB_CURL_RESPONSES"
+  local out
+  out=$(NOTION_TOKEN="fake-token" find_page_by_handle "ds-abc" "vol_1_fixture")
+  assert_eq "find_page_by_handle: one match returns its id" "page-123" "$out"
+}
+
+test_find_page_by_handle_no_match() {
+  setup_stub_curl
+  printf '200\t-\t{"results":[]}\n' > "$STUB_CURL_RESPONSES"
+  local out
+  out=$(NOTION_TOKEN="fake-token" find_page_by_handle "ds-abc" "nonexistent")
+  assert_eq "find_page_by_handle: no match returns empty" "" "$out"
+}
+
+test_find_page_by_handle_duplicate() {
+  setup_stub_curl
+  printf '200\t-\t{"results":[{"id":"page-1"},{"id":"page-2"}]}\n' > "$STUB_CURL_RESPONSES"
+  local out
+  out=$(NOTION_TOKEN="fake-token" find_page_by_handle "ds-abc" "dup_handle" 2>/dev/null)
+  assert_eq "find_page_by_handle: 2 matches returns DUPLICATE" "DUPLICATE" "$out"
+}
+
+test_find_page_by_handle_one_match
+test_find_page_by_handle_no_match
+test_find_page_by_handle_duplicate
+
 if [[ $failures -gt 0 ]]; then
   echo "$failures test(s) failed"
   exit 1
