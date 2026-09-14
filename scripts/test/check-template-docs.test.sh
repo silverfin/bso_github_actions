@@ -62,9 +62,51 @@ test_extract_dirs_with_no_matches_at_all() {
   assert_eq "extract_shared_part_dirs with zero matches: empty output" "" "$actual"
 }
 
+setup_shared_part_consumers_fixture() {
+  local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
+  rm -rf "$root"
+  mkdir -p "$root/shared_parts/be_legal_fixture"
+  mkdir -p "$root/reconciliation_texts/vol_1_fixture"
+  mkdir -p "$root/reconciliation_texts/vol_2_fixture"
+  mkdir -p "$root/account_templates/AT_fixture"
+
+  cat > "$root/shared_parts/be_legal_fixture/config.json" << 'JSON'
+{
+  "name": "be_legal_fixture",
+  "used_in": [
+    {"type": "reconciliationText", "handle": "vol_1_fixture"},
+    {"type": "reconciliationText", "handle": "vol_2_fixture"},
+    {"type": "accountTemplate", "handle": "AT_fixture"},
+    {"type": "accountTemplate", "handle": null}
+  ]
+}
+JSON
+
+  echo '{}' > "$root/reconciliation_texts/vol_1_fixture/config.json"
+  echo '# Vol 1' > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  echo '{}' > "$root/reconciliation_texts/vol_2_fixture/config.json"
+  # vol_2_fixture deliberately has no README.md
+
+  echo '{}' > "$root/account_templates/AT_fixture/config.json"
+  echo '# AT Fixture' > "$root/account_templates/AT_fixture/README.md"
+}
+
+test_resolve_fanout_consumers() {
+  setup_shared_part_consumers_fixture
+  local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
+  local actual
+  actual=$(resolve_fanout_consumers "shared_parts/be_legal_fixture" "$root" 2>/dev/null)
+  local expected
+  expected=$(printf '%s\n' \
+    "account_templates/AT_fixture" \
+    "reconciliation_texts/vol_1_fixture")
+  assert_eq "resolve_fanout_consumers (existing-README only, null handle skipped)" "$expected" "$actual"
+}
+
 test_extract_template_dirs
 test_extract_shared_part_dirs
 test_extract_dirs_with_no_matches_at_all
+test_resolve_fanout_consumers
 
 if [[ $failures -gt 0 ]]; then
   echo "$failures test(s) failed"

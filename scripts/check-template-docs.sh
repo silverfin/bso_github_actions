@@ -26,3 +26,40 @@ extract_shared_part_dirs() {
     | sed -E 's#^(shared_parts/[^/]+)/.*#\1#' \
     | sort -u
 }
+
+# $1 = shared part dir (e.g. shared_parts/be_legal), relative to $2 = repo_root.
+# Prints consumer dirs (relative to repo_root) whose README.md already
+# exists. Skips accountTemplate entries with a null handle, warning on stderr.
+resolve_fanout_consumers() {
+  local shared_part_dir="$1"
+  local repo_root="$2"
+  local config_path="$repo_root/$shared_part_dir/config.json"
+
+  if [[ ! -f "$config_path" ]]; then
+    echo "WARN: $shared_part_dir has no config.json, skipping fan-out" >&2
+    return 0
+  fi
+
+  local results=()
+  local type handle
+  while IFS=$'\t' read -r type handle; do
+    if [[ "$handle" == "null" || -z "$handle" ]]; then
+      echo "WARN: $shared_part_dir used_in has a $type entry with no handle (common for account templates) - cannot resolve automatically, skipping" >&2
+      continue
+    fi
+    local dir=""
+    case "$type" in
+      reconciliationText) dir="reconciliation_texts/$handle" ;;
+      accountTemplate)    dir="account_templates/$handle" ;;
+      *)
+        echo "WARN: $shared_part_dir used_in has unknown type '$type', skipping" >&2
+        continue
+        ;;
+    esac
+    if [[ -f "$repo_root/$dir/README.md" ]]; then
+      results+=("$dir")
+    fi
+  done < <(jq -r '.used_in[]? | [.type, (.handle // "null")] | @tsv' "$config_path")
+
+  printf '%s\n' "${results[@]}" | sort -u
+}
