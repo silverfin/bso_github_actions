@@ -120,5 +120,22 @@ compute_expected_readmes() {
 find_missing() {
   local expected_path="$1"
   local changed_path="$2"
+
+  # `-r` (a permission check, not a read) rather than pre-reading each path
+  # via `sort`: reading a process-substitution path twice returns empty on
+  # the second read, which would silently break this function's own tests
+  # (they pass <(...) paths). `-r` catches missing/unreadable input before
+  # the real sort/comm below, whose exit status a process substitution
+  # would otherwise hide from set -e - the same failure mode already
+  # documented and worked around in resolve_fanout_consumers above.
+  if [[ ! -r "$expected_path" ]]; then
+    echo "ERROR: find_missing could not read $expected_path" >&2
+    return 1
+  fi
+  if [[ ! -r "$changed_path" ]]; then
+    echo "ERROR: find_missing could not read $changed_path" >&2
+    return 1
+  fi
+
   comm -23 <(sort -u "$expected_path") <(sort -u "$changed_path")
 }

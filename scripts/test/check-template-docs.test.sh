@@ -219,6 +219,21 @@ test_find_missing() {
   assert_eq "find_missing" "account_templates/AT_fixture/README.md" "$actual"
 }
 
+test_find_missing_unreadable_input() {
+  local actual rc stderr_out
+  stderr_out=$(mktemp)
+  actual=$(find_missing "/tmp/check-template-docs-test-does-not-exist.txt" "/tmp/check-template-docs-test-also-does-not-exist.txt" 2>"$stderr_out") && rc=0 || rc=$?
+  assert_eq "find_missing (unreadable expected_path): nonzero exit, not a silent pass" "1" "$rc"
+  assert_eq "find_missing (unreadable expected_path): empty output" "" "$actual"
+  if grep -q "ERROR:.*could not read" "$stderr_out"; then
+    echo "PASS: find_missing (unreadable expected_path) warns on stderr"
+  else
+    echo "FAIL: find_missing (unreadable expected_path) should warn on stderr, got: $(cat "$stderr_out")"
+    failures=$((failures + 1))
+  fi
+  rm -f "$stderr_out"
+}
+
 test_extract_template_dirs
 test_extract_shared_part_dirs
 test_extract_dirs_with_no_matches_at_all
@@ -229,6 +244,7 @@ test_resolve_fanout_consumers_legacy_type_aliases
 test_compute_expected_readmes
 test_compute_expected_readmes_empty_input
 test_find_missing
+test_find_missing_unreadable_input
 
 if [[ $failures -gt 0 ]]; then
   echo "$failures test(s) failed"
