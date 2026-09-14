@@ -67,10 +67,11 @@ NOTION_VERSION="2026-03-11"
 NOTION_MAX_ATTEMPTS=6
 
 # $1 = HTTP method, $2 = path (e.g. /v1/pages/abc), $3 = optional JSON body.
-# Retries on 429/529 on a fixed exponential backoff (1s, 2s, 4s, ... doubling
-# per attempt) up to NOTION_MAX_ATTEMPTS. The response's Retry-After header is
-# deliberately NOT parsed - a documented simplification, not an oversight. Any
-# other non-2xx is a hard failure - printed to stderr, returns 1.
+# Retries on 429/529, honouring the response's own Retry-After header when
+# present and valid (Notion requires clients to respect it); falls back to a
+# fixed exponential backoff (1s, 2s, 4s, ... doubling per attempt) otherwise.
+# Up to NOTION_MAX_ATTEMPTS. Any other non-2xx is a hard failure - printed to
+# stderr, returns 1.
 notion_request() {
   local method="$1"
   local path="$2"
@@ -82,6 +83,12 @@ notion_request() {
     local response status response_body
     local -a curl_args=(
       -sS -w '\n%{http_code}'
+      # A stalled connection or a hung transfer would otherwise block this
+      # retry loop (and the whole post-merge job) indefinitely instead of
+      # reporting a failure. --max-time is generous rather than short: Notion
+      # notes that create/update requests with large markdown bodies can take
+      # longer than a typical browser/edge timeout budget.
+      --connect-timeout 10 --max-time 120
       -X "$method" "$NOTION_API_BASE$path"
       -H "Authorization: Bearer $NOTION_TOKEN"
       -H "Notion-Version: $NOTION_VERSION"
@@ -108,9 +115,18 @@ notion_request() {
       echo "ERROR: Notion API $method $path: could not create a temp file for curl's stderr" >&2
       return 1
     fi
+    # Response headers go to their own file too (-D), read back only to look
+    # for Retry-After on a 429/529 - never merged into the captured body.
+    local headers_file
+    if ! headers_file=$(mktemp); then
+      echo "ERROR: Notion API $method $path: could not create a temp file for curl's headers" >&2
+      rm -f "$err_file"
+      return 1
+    fi
+    curl_args+=(-D "$headers_file")
     if ! response=$(curl "${curl_args[@]}" 2>"$err_file"); then
       curl_err=$(cat "$err_file")
-      rm -f "$err_file"
+      rm -f "$err_file" "$headers_file"
       echo "ERROR: Notion API $method $path: curl itself failed (network/DNS/TLS, no HTTP response): $curl_err" >&2
       return 1
     fi
@@ -126,6 +142,7 @@ notion_request() {
     response_body=$(echo "$response" | sed '$d')
 
     if [[ "$status" =~ ^2[0-9][0-9]$ ]]; then
+      rm -f "$headers_file"
       echo "$response_body"
       return 0
     fi
@@ -134,16 +151,32 @@ notion_request() {
       # Only sleep/back off when another attempt will actually follow -
       # there's no point waiting out a backoff right before giving up.
       if (( attempt < NOTION_MAX_ATTEMPTS )); then
-        echo "WARN: Notion API returned $status (attempt $attempt/$NOTION_MAX_ATTEMPTS), backing off ${backoff}s" >&2
-        sleep "$backoff"
+        # Honour Retry-After when the server sent one: grep is case-insensitive
+        # (header names aren't) and takes the last match in case of duplicate
+        # headers across a redirect; \r and surrounding space are stripped
+        # since raw HTTP headers are CRLF-terminated. Anything that isn't a
+        # plain non-negative integer (missing, malformed, or a HTTP-date form
+        # this script doesn't parse) falls back to the fixed schedule instead
+        # of guessing.
+        local retry_after=""
+        retry_after=$(grep -i '^retry-after:' "$headers_file" 2>/dev/null | tail -n 1 | cut -d: -f2- | tr -d ' \r\n') || true
+        if [[ "$retry_after" =~ ^[0-9]+$ ]]; then
+          echo "WARN: Notion API returned $status (attempt $attempt/$NOTION_MAX_ATTEMPTS), honoring Retry-After: ${retry_after}s" >&2
+          sleep "$retry_after"
+        else
+          echo "WARN: Notion API returned $status (attempt $attempt/$NOTION_MAX_ATTEMPTS), backing off ${backoff}s" >&2
+          sleep "$backoff"
+        fi
         backoff=$((backoff * 2))
       else
         echo "WARN: Notion API returned $status (attempt $attempt/$NOTION_MAX_ATTEMPTS), no attempts left" >&2
       fi
+      rm -f "$headers_file"
       attempt=$((attempt + 1))
       continue
     fi
 
+    rm -f "$headers_file"
     echo "ERROR: Notion API $method $path failed with $status: $response_body" >&2
     return 1
   done
@@ -177,8 +210,19 @@ find_page_by_handle() {
   # `set -e` deep inside this function and kill the calling script before
   # it ever sees a return value, same hazard class as the fixes already
   # applied in resolve_handle and notion_request.
+  #
+  # `.results | length` on its own is not enough: if `.results` is absent or
+  # `null`, jq's `length` treats that as 0, not an error - a 2xx response
+  # with an unexpected shape (Notion API change, a proxy returning something
+  # unrelated) would then look exactly like "zero matches" and this function
+  # would tell sync_readme to CREATE a brand new page instead of failing
+  # loudly. Forcing an explicit type check turns that into a real jq error,
+  # caught by the same guard below.
   local count
-  if ! count=$(echo "$response" | jq '.results | length' 2>&1); then
+  if ! count=$(echo "$response" | jq '
+      if (.results | type) == "array" then .results | length
+      else error("`.results` is missing or not an array") end
+    ' 2>&1); then
     echo "ERROR: find_page_by_handle: unparseable response from Notion for handle '$handle' (jq failed: $count)" >&2
     return 1
   fi
@@ -291,7 +335,14 @@ sync_readme() {
     echo "FAILED: could not build metadata stamp body"
     return 0
   fi
-  notion_request PATCH "/v1/pages/$page_id" "$stamp_body" > /dev/null || { echo "FAILED: metadata stamp failed"; return 0; }
+  # Include $result and $page_id in the failure message: create/update
+  # already succeeded by this point, so a stamp failure here is not "nothing
+  # happened" - it's a live page that will otherwise sit unstamped and
+  # unnoticed (worse for a CREATE, since per the plan's Global Constraints
+  # every create is meant to be surfaced, and a plain "FAILED" here would
+  # drop it from created_handles with no trace of what actually happened).
+  notion_request PATCH "/v1/pages/$page_id" "$stamp_body" > /dev/null \
+    || { echo "FAILED: metadata stamp failed after $result of page $page_id"; return 0; }
 
   echo "$result"
 }
@@ -385,10 +436,23 @@ main() {
       || result="FAILED: unexpected error"
     echo "$template_dir: $result"
 
+    # Reported identifier: the resolved Notion Handle, not the directory
+    # basename. For reconciliation_texts, config.json's .handle can differ
+    # from the directory name - reporting the basename would undermine the
+    # created-page alert's own "check for a handle mismatch in config.json"
+    # guidance, since the mismatch is exactly what the basename would hide.
+    # A second resolve_handle call here (cheap - local file reads, no network)
+    # rather than threading it back out of sync_readme's stdout, which is a
+    # fixed CREATED/UPDATED/DUPLICATE/FAILED: <reason> contract other callers
+    # already depend on. Falls back to the basename if resolution itself
+    # fails, matching this function's prior behavior for that edge case.
+    local reported_handle
+    reported_handle=$(resolve_handle "$template_dir" "$repo_root" 2>/dev/null) || reported_handle="$(basename "$template_dir")"
+
     if [[ "$result" == "DUPLICATE" || "$result" == FAILED:* ]]; then
-      failed+=("$(basename "$template_dir")")
+      failed+=("$reported_handle")
     elif [[ "$result" == "CREATED" ]]; then
-      created+=("$(basename "$template_dir")")
+      created+=("$reported_handle")
     fi
   done < "$changed_readmes_path"
 

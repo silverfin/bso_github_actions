@@ -144,7 +144,9 @@ setup_stub_curl() {
   export PATH="$stub_dir:$PATH"
   export STUB_CURL_LOG="$SCRIPT_DIR/fixtures/notion-sync/curl.log"
   export STUB_CURL_RESPONSES="$SCRIPT_DIR/fixtures/notion-sync/curl-responses.tsv"
+  export STUB_SLEEP_LOG="$SCRIPT_DIR/fixtures/notion-sync/sleep.log"
   : > "$STUB_CURL_LOG"
+  : > "$STUB_SLEEP_LOG"
 }
 
 # $STUB_CURL_LOG holds one call's full argv per entry, but a call whose
@@ -191,11 +193,15 @@ test_notion_request_succeeds_first_try() {
     "Authorization: Bearer fake-token" "$(cat "$STUB_CURL_LOG")"
   assert_contains "notion_request success: sends Notion-Version header" \
     "Notion-Version: 2026-03-11" "$(cat "$STUB_CURL_LOG")"
+  assert_contains "notion_request success: sets a connect timeout" \
+    "--connect-timeout 10" "$(cat "$STUB_CURL_LOG")"
+  assert_contains "notion_request success: sets a max transfer time" \
+    "--max-time 120" "$(cat "$STUB_CURL_LOG")"
 }
 
 test_notion_request_retries_on_429() {
   setup_stub_curl
-  printf '429\t0\t{"code":"rate_limited"}\n200\t-\t{"ok":true}\n' > "$STUB_CURL_RESPONSES"
+  printf '429\t-\t{"code":"rate_limited"}\n200\t-\t{"ok":true}\n' > "$STUB_CURL_RESPONSES"
   local out
   out=$(NOTION_TOKEN="fake-token" notion_request GET "/v1/pages/abc")
   assert_eq "notion_request retries then succeeds" '{"ok":true}' "$out"
@@ -225,13 +231,10 @@ test_notion_request_fails_after_max_attempts() {
   setup_stub_curl
   local i
   for ((i = 0; i < NOTION_MAX_ATTEMPTS; i++)); do
-    printf '429\t0\t{"code":"rate_limited"}\n' >> "$STUB_CURL_RESPONSES"
+    printf '429\t-\t{"code":"rate_limited"}\n' >> "$STUB_CURL_RESPONSES"
   done
-  local out rc start_ts end_ts elapsed
-  start_ts=$(date +%s)
+  local out rc
   out=$(NOTION_TOKEN="fake-token" notion_request GET "/v1/pages/abc" 2>&1) && rc=0 || rc=$?
-  end_ts=$(date +%s)
-  elapsed=$((end_ts - start_ts))
 
   assert_eq "notion_request exhausted: exit 1" "1" "$rc"
   assert_contains "notion_request exhausted: sensible error message" \
@@ -239,17 +242,49 @@ test_notion_request_fails_after_max_attempts() {
   assert_eq "notion_request exhausted: exactly $NOTION_MAX_ATTEMPTS calls, not $((NOTION_MAX_ATTEMPTS + 1))" \
     "$NOTION_MAX_ATTEMPTS" "$(wc -l < "$STUB_CURL_LOG" | tr -d ' ')"
 
-  # Regression guard for the wasted-final-sleep fix: with the bug, the loop
-  # sleeps out a backoff even on the last, already-doomed attempt, so 6
-  # straight 429s take 1+2+4+8+16+32=63s. Fixed, the pointless final 32s
-  # sleep is skipped, so this takes 1+2+4+8+16=31s. 45s leaves generous
-  # slack for scheduling jitter while still catching a reintroduced sleep.
-  if (( elapsed < 45 )); then
-    echo "PASS: notion_request exhausted: skips the pointless final backoff sleep (${elapsed}s elapsed)"
-  else
-    echo "FAIL: notion_request exhausted: skips the pointless final backoff sleep (${elapsed}s elapsed, expected < 45s)"
-    failures=$((failures + 1))
-  fi
+  # Regression guard for the wasted-final-sleep fix, against the exact
+  # recorded backoff sequence rather than inferring it from wall-clock
+  # elapsed time: with the bug, the loop sleeps out a backoff even on the
+  # last, already-doomed attempt (1 2 4 8 16 32); fixed, the pointless final
+  # 32s sleep never happens (1 2 4 8 16). The stubbed `sleep` (same
+  # directory as the stubbed `curl`, already on PATH via setup_stub_curl)
+  # makes this instant and exact instead of a ~31s real-time assertion.
+  assert_eq "notion_request exhausted: skips the pointless final backoff sleep" \
+    "1
+2
+4
+8
+16" "$(cat "$STUB_SLEEP_LOG")"
+}
+
+test_notion_request_honors_retry_after() {
+  setup_stub_curl
+  printf '429\t3\t{"code":"rate_limited"}\n200\t-\t{"ok":true}\n' > "$STUB_CURL_RESPONSES"
+  local out
+  out=$(NOTION_TOKEN="fake-token" notion_request GET "/v1/pages/abc" 2>&1)
+  assert_contains "notion_request retries then succeeds (with Retry-After)" '{"ok":true}' "$out"
+  assert_eq "notion_request Retry-After: exactly 2 calls" "2" "$(wc -l < "$STUB_CURL_LOG" | tr -d ' ')"
+  assert_contains "notion_request Retry-After: logs that it's honoring the header" \
+    "honoring Retry-After: 3s" "$out"
+  # The header value (3), not the fixed schedule's first backoff (1) -
+  # proves the header is actually driving the sleep, not just being logged.
+  assert_eq "notion_request Retry-After: sleeps the header's value, not the fixed schedule" \
+    "3" "$(cat "$STUB_SLEEP_LOG")"
+}
+
+test_notion_request_ignores_invalid_retry_after() {
+  setup_stub_curl
+  # "soon" is not a plain non-negative integer (nor is a HTTP-date, which
+  # this script also doesn't parse) - falls back to the fixed schedule
+  # exactly like "-" (absent) does, rather than guessing or crashing.
+  printf '429\tsoon\t{"code":"rate_limited"}\n200\t-\t{"ok":true}\n' > "$STUB_CURL_RESPONSES"
+  local out
+  out=$(NOTION_TOKEN="fake-token" notion_request GET "/v1/pages/abc" 2>&1)
+  assert_contains "notion_request invalid Retry-After: retries then succeeds" '{"ok":true}' "$out"
+  assert_contains "notion_request invalid Retry-After: falls back to fixed backoff" \
+    "backing off 1s" "$out"
+  assert_eq "notion_request invalid Retry-After: sleeps the fixed schedule's value" \
+    "1" "$(cat "$STUB_SLEEP_LOG")"
 }
 
 test_notion_request_succeeds_first_try
@@ -257,6 +292,8 @@ test_notion_request_retries_on_429
 test_notion_request_fails_on_non_retryable_error
 test_notion_request_curl_hard_failure
 test_notion_request_fails_after_max_attempts
+test_notion_request_honors_retry_after
+test_notion_request_ignores_invalid_retry_after
 
 # Proof that a hard curl failure inside notion_request doesn't trip set -e
 # and kill this whole test script (the bug being guarded against): if it
@@ -298,10 +335,37 @@ test_find_page_by_handle_malformed_response() {
     "unparseable response" "$out"
 }
 
+test_find_page_by_handle_missing_results_field() {
+  setup_stub_curl
+  # Valid JSON, 2xx, but missing `.results` entirely - the kind of
+  # malformed-but-parseable response `.results | length` alone would
+  # silently treat as "0 matches" (jq's `length` on a missing/null field is
+  # 0, not an error), letting sync_readme create a duplicate page instead of
+  # failing loudly. Must be caught as a real error, same as unparseable JSON.
+  printf '200\t-\t{"object":"list"}\n' > "$STUB_CURL_RESPONSES"
+  local out rc
+  out=$(NOTION_TOKEN="fake-token" find_page_by_handle "ds-abc" "vol_1_fixture" 2>&1) && rc=0 || rc=$?
+  assert_eq "find_page_by_handle: missing .results field exit 1" "1" "$rc"
+  assert_contains "find_page_by_handle: missing .results field sensible error message" \
+    "unparseable response" "$out"
+}
+
+test_find_page_by_handle_null_results_field() {
+  setup_stub_curl
+  printf '200\t-\t{"results":null}\n' > "$STUB_CURL_RESPONSES"
+  local out rc
+  out=$(NOTION_TOKEN="fake-token" find_page_by_handle "ds-abc" "vol_1_fixture" 2>&1) && rc=0 || rc=$?
+  assert_eq "find_page_by_handle: null .results field exit 1" "1" "$rc"
+  assert_contains "find_page_by_handle: null .results field sensible error message" \
+    "unparseable response" "$out"
+}
+
 test_find_page_by_handle_one_match
 test_find_page_by_handle_no_match
 test_find_page_by_handle_duplicate
 test_find_page_by_handle_malformed_response
+test_find_page_by_handle_missing_results_field
+test_find_page_by_handle_null_results_field
 
 # Proof that a malformed-JSON response inside find_page_by_handle's jq call
 # doesn't trip set -e and kill this whole test script (the bug the jq guard
@@ -418,11 +482,32 @@ test_sync_readme_create_response_missing_id() {
     "2" "$(curl_call_count)"
 }
 
+test_sync_readme_stamp_failure_names_result_and_page() {
+  setup_stub_curl
+  setup_resolve_fixture
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  echo "# Vol 1 fixture content" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  # lookup: no existing page (CREATE path) -> create succeeds -> stamp fails.
+  # A plain "FAILED: metadata stamp failed" here would drop this page from
+  # created_handles with no trace that a page WAS created and now sits
+  # unstamped - the result ($result) and the page id must ride along in the
+  # message so a human reading the job log/Slack alert can find it.
+  printf '200\t-\t{"results":[]}\n200\t-\t{"id":"new-page-1"}\n500\t-\t{"code":"error"}\n' > "$STUB_CURL_RESPONSES"
+  local out
+  out=$(NOTION_TOKEN="fake-token" sync_readme \
+    "$root/reconciliation_texts/vol_1_fixture/README.md" \
+    "reconciliation_texts/vol_1_fixture" "$root" "ds-abc" "BE" "abcdef1234567")
+  assert_contains "sync_readme stamp failure: still reports FAILED" "FAILED:" "$out"
+  assert_contains "sync_readme stamp failure: names the already-known result (CREATED)" "CREATED" "$out"
+  assert_contains "sync_readme stamp failure: names the orphaned page id" "new-page-1" "$out"
+}
+
 test_sync_readme_creates_when_missing
 test_sync_readme_updates_when_present
 test_sync_readme_skips_on_duplicate
 test_sync_readme_reports_failed_without_crashing
 test_sync_readme_create_response_missing_id
+test_sync_readme_stamp_failure_names_result_and_page
 
 test_cli_reports_failed_handles_via_github_output() {
   setup_stub_curl
@@ -500,6 +585,41 @@ JSON
     "vol_1_fixture" "$(grep '^created_handles=' "$github_output" || true)"
   assert_contains "CLI: a FAILED:* result is reported as failed" \
     "AT_fixture" "$(grep '^failed_handles=' "$github_output" || true)"
+}
+
+test_cli_reports_resolved_handle_not_dir_basename() {
+  setup_stub_curl
+  setup_resolve_fixture
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  # config.json's .handle can differ from the directory name for
+  # reconciliation_texts - reporting the directory basename here would
+  # undermine the created-page alert's own "check for a handle mismatch in
+  # config.json" guidance, since a real mismatch is exactly what the
+  # basename would hide instead of reveal.
+  mkdir -p "$root/reconciliation_texts/dir_name_fixture"
+  echo '{"handle": "actual_handle_value"}' > "$root/reconciliation_texts/dir_name_fixture/config.json"
+  echo "# Mismatched dir name" > "$root/reconciliation_texts/dir_name_fixture/README.md"
+  printf '200\t-\t{"results":[]}\n200\t-\t{"id":"new-page-1"}\n200\t-\t{"id":"new-page-1"}\n' > "$STUB_CURL_RESPONSES"
+
+  local changed_file github_output test_config
+  changed_file="$SCRIPT_DIR/fixtures/notion-sync/changed-readmes.txt"
+  printf '%s\n' "reconciliation_texts/dir_name_fixture/README.md" > "$changed_file"
+
+  github_output="$SCRIPT_DIR/fixtures/notion-sync/github_output.txt"
+  : > "$github_output"
+
+  test_config="$SCRIPT_DIR/fixtures/notion-sync/notion-config.json"
+  cat > "$test_config" << 'JSON'
+{"BE": {"reconciliation_texts": "ds-rt", "account_templates": "ds-at"}}
+JSON
+
+  NOTION_TOKEN="fake-token" GITHUB_OUTPUT="$github_output" \
+    bash "$SCRIPT_DIR/../sync-notion-docs.sh" "$changed_file" "$root" "BE" "abcdef1234567" "$test_config" > /dev/null 2>&1
+
+  assert_contains "CLI reports the resolved .handle, not the directory name" \
+    "created_handles=actual_handle_value" "$(cat "$github_output")"
+  assert_not_contains "CLI does not report the directory basename instead" \
+    "dir_name_fixture" "$(cat "$github_output")"
 }
 
 # --- CLI exit-0 safety contract -------------------------------------------
@@ -682,6 +802,7 @@ test_cli_joins_multiple_handles_readably() {
 
 test_cli_reports_failed_handles_via_github_output
 test_cli_classifies_updated_and_failed_results
+test_cli_reports_resolved_handle_not_dir_basename
 test_cli_missing_changed_readmes_file
 test_cli_malformed_config
 test_cli_market_not_in_config

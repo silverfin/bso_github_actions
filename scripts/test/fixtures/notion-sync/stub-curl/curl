@@ -5,12 +5,22 @@
 # Emulates real `curl -w '\n%{http_code}'`: body, then a final line with
 # just the status code.
 #
-# The retry_after column is currently unused - notion_request backs off on
-# its own fixed exponential schedule rather than parsing the header (see
-# Step 4's note). The column is kept so a future header-parsing version can
-# use it without changing every fixture.
+# retry_after: "-" means "no Retry-After header on this response" (the
+# common case, matches real Notion behavior when it isn't rate-limiting).
+# Any other value is written as a Retry-After response header to whatever
+# path follows -D in argv, letting notion_request's header-parsing be
+# tested without a real HTTP server.
 set -euo pipefail
 echo "$*" >> "$STUB_CURL_LOG"
+
+headers_file=""
+prev=""
+for arg in "$@"; do
+  if [[ "$prev" == "-D" ]]; then
+    headers_file="$arg"
+  fi
+  prev="$arg"
+done
 
 line=$(head -n 1 "$STUB_CURL_RESPONSES")
 # Pop the first line. Use tail+mv, not `sed -i` - BSD/macOS sed requires an
@@ -19,6 +29,7 @@ tail -n +2 "$STUB_CURL_RESPONSES" > "${STUB_CURL_RESPONSES}.tmp"
 mv "${STUB_CURL_RESPONSES}.tmp" "$STUB_CURL_RESPONSES"
 
 status=$(echo "$line" | cut -f1)
+retry_after=$(echo "$line" | cut -f2)
 body=$(echo "$line" | cut -f3-)
 
 # A status of CURLFAIL simulates curl itself failing outright (DNS/connection
@@ -27,6 +38,13 @@ body=$(echo "$line" | cut -f3-)
 if [[ "$status" == "CURLFAIL" ]]; then
   echo "curl: (7) Failed to connect (stub-simulated failure)" >&2
   exit 1
+fi
+
+if [[ -n "$headers_file" ]]; then
+  : > "$headers_file"
+  if [[ "$retry_after" != "-" ]]; then
+    printf 'Retry-After: %s\r\n' "$retry_after" >> "$headers_file"
+  fi
 fi
 
 printf '%s\n%s' "$body" "$status"
