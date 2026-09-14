@@ -149,12 +149,20 @@ curl_call_count() {
 }
 
 # $1 = 1-based call index. Prints that call's full argv block (spanning
-# multiple lines if its body is pretty-printed JSON).
+# multiple lines if its body is pretty-printed JSON), or nothing if there
+# is no such call.
 curl_call_block() {
   local n="$1"
   local starts start_line next_start
-  starts=$(grep -n -- '^-sS -w' "$STUB_CURL_LOG" | cut -d: -f1)
+  # grep exits 1 on zero matches (e.g. a test expecting fewer calls than
+  # were actually made) - guarded so that case degrades to an empty
+  # $starts and a normal `assert_*` FAIL line, not a raw abort now that
+  # inherit_errexit is active in this sourcing test file too.
+  starts=$(grep -n -- '^-sS -w' "$STUB_CURL_LOG" | cut -d: -f1) || true
   start_line=$(echo "$starts" | sed -n "${n}p")
+  if [[ -z "$start_line" ]]; then
+    return 0
+  fi
   next_start=$(echo "$starts" | sed -n "$((n + 1))p")
   if [[ -z "$next_start" ]]; then
     sed -n "${start_line},\$p" "$STUB_CURL_LOG"

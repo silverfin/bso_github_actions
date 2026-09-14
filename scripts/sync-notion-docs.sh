@@ -7,7 +7,14 @@ set -euo pipefail
 # every "guard fires, function returns cleanly" assumption this script
 # relies on throughout resolve_handle/notion_request/find_page_by_handle/
 # sync_readme.
-shopt -s inherit_errexit
+# inherit_errexit is a bash 4.4+ option; macOS's stock /bin/bash is 3.2
+# (Apple never shipped a GPLv3 bash), where `shopt -s <unknown option>`
+# itself fails and - with `set -e` above - would kill this script before
+# a single function gets defined. Version-guarded rather than piping
+# stderr to /dev/null, so an unrelated future shopt typo still surfaces.
+if ((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4))); then
+  shopt -s inherit_errexit
+fi
 
 # $1 = template dir (e.g. reconciliation_texts/vol_1), $2 = repo_root.
 resolve_handle() {
@@ -198,11 +205,15 @@ sync_readme() {
 
   local page_id result
   if [[ -z "$existing_page_id" ]]; then
+    # Name/Market are deliberately not set here - the metadata-stamp PATCH
+    # below is their single owner and runs on every successful path
+    # (create and update alike), so setting them here too would just be
+    # duplicated, driftable state.
     local create_body
     if ! create_body=$(jq -n \
-      --arg ds "$data_source_id" --arg name "$name" \
-      --arg handle "$handle" --arg market "$market" --arg md "$markdown_body" \
-      '{parent: {data_source_id: $ds}, properties: {Name: {title: [{text: {content: $name}}]}, Handle: {rich_text: [{text: {content: $handle}}]}, Market: {select: {name: $market}}}, markdown: $md}'); then
+      --arg ds "$data_source_id" \
+      --arg handle "$handle" --arg md "$markdown_body" \
+      '{parent: {data_source_id: $ds}, properties: {Handle: {rich_text: [{text: {content: $handle}}]}}, markdown: $md}'); then
       echo "FAILED: could not build create request body"
       return 0
     fi
