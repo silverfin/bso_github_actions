@@ -38,7 +38,7 @@ jobs:
       - name: Fetch check-template-docs.sh
         run: |
           curl -fsSL -o /tmp/check-template-docs.sh \
-            "https://raw.githubusercontent.com/silverfin/bso_github_actions/worktree-check-template-docs-task1/scripts/check-template-docs.sh" # SCRATCH: main during real use, this branch only for Task 6 Step 4's pre-merge live verification, reverted before merge
+            "https://raw.githubusercontent.com/silverfin/bso_github_actions/main/scripts/check-template-docs.sh"
 
       - name: Check template docs
         run: bash /tmp/check-template-docs.sh /tmp/changed_files.txt "${{ github.workspace }}"
