@@ -70,7 +70,14 @@ history for that exact file.
    refreshed value to `$HOME/.silverfin/config.json`, and the consumer step reads *that local
    file* - it never re-reads `${{ secrets.CONFIG_JSON }}`, which is still the queue-time
    snapshot even within the same job. The secret context itself doesn't update mid-run; only a
-   local write-back does.
+   local write-back does. `needs: some-refresher-job` does NOT imply your job reads the
+   refreshed value either, even if that job runs first - `run_tests.yml`'s `test-templates`
+   job `needs: check-auth` but is a genuinely separate job, and still loads
+   `${{ secrets.CONFIG_JSON }}` (the queue-time snapshot) directly, not a same-run refresh.
+   Whether that's actually safe depends on whether the consumer can tolerate a secret that's
+   at most as stale as the queue-time snapshot (e.g. an access token still well inside its
+   normal validity window) - know which case you're in before assuming `needs:` bought you
+   freshness.
 
 6. **`tj-actions/changed-files` needs `safe_output: false` and `quotepath: false`** when
    piping its output through `jq`. The default `safe_output: true` backslash-escapes shell
@@ -82,7 +89,11 @@ history for that exact file.
 7. **CLI install stays unpinned (`npm install https://github.com/silverfin/silverfin-cli.git`)
    unless this workflow depends on a flag not yet on `main`** - then pin to the exact commit,
    with a comment saying to revert once the CLI PR merges. Unpinned is the deliberate,
-   repo-wide convention; don't "fix" it on an unrelated PR.
+   repo-wide convention; don't "fix" it on an unrelated PR. Separate exception, needing no
+   unreleased flag: a workflow that **writes secrets/handles credentials** should pin even
+   against `main` - `@main` can silently change credential-handling code itself with no
+   workflow diff to review. `push_to_review_firm.yml` does this (pinned while silverfin-cli#273
+   is open, reverting once it merges) precisely because it's a secret-writing job.
 
 8. **A new reusable workflow needs a README.md entry** (Individual Action Documentation
    section) - repo convention since #24, and README drift on this file is treated as a real
