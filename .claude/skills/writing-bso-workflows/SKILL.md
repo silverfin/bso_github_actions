@@ -73,7 +73,8 @@ history for that exact file.
      X=$(tr ... <<< "$X")
      ```
      (a single capture can use `RC=0; X=$(cmd1) || RC=$?` instead of the `set +e`/`set -e`
-     pair - reach for `set +e ... set -e` once more than one command in the block can fail).
+     pair - use `set +e ... set -e` only when you capture or check every command's
+     status before re-enabling `-e`, not just the one you care about).
      Don't rely on pipefail unless you've added `shell: bash` yourself.
 
 4. **`$GITHUB_OUTPUT` multiline values need a `key<<DELIMITER` heredoc** - `echo "key=$val"`
