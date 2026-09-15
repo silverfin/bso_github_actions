@@ -256,8 +256,10 @@ jobs:
             # node's, breaking the RC-gated retry check below.
             OUTPUT=$(node "${SILVERFIN_CLI_BIN}" run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1)
             RC=$?
-            OUTPUT=$(tr -d '\r' <<< "${OUTPUT}")
             set -e
+            # Restore -e before stripping CRs so a failed `tr` cannot empty OUTPUT while
+            # leaving RC as node's status (that would skip the 422-text retry below).
+            OUTPUT=$(tr -d '\r' <<< "${OUTPUT}")
             echo "----- run-sampler output (exit ${RC}) -----"
             echo "$OUTPUT"
             echo "--------------------------------------------"
@@ -369,7 +371,10 @@ jobs:
             if ERR=$(echo "${CONFIG_JSON}" | gh secret set "PARTNER_CONFIG_JSON_${PARTNER}" 2>&1); then
               break
             fi
-            if ! grep -qE 'HTTP 5[0-9]{2}' <<< "${ERR}"; then
+            # 5xx is the check_auth.yml shape. Also retry explicit GitHub rate limits:
+            # 429, and 403 only when the body says rate-limit (a plain 403 is a permanent
+            # auth/scope failure and must not burn retries).
+            if ! grep -qE 'HTTP 5[0-9]{2}|HTTP 429' <<< "${ERR}" && ! { grep -qE 'HTTP 403' <<< "${ERR}" && grep -qiE 'rate.?limit|retry[- ]after' <<< "${ERR}"; }; then
               echo "::error::failed to write PARTNER_CONFIG_JSON_${PARTNER} back (non-transient failure): ${ERR} — the rotated token is LOST and the stored secret is now stale/dead; partner ${PARTNER} needs manual re-authorization."
               exit 1
             fi
