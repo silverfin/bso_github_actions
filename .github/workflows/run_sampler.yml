@@ -249,8 +249,14 @@ jobs:
             printf ' --firm-ids %s --compact\n' "${SAMPLER_FIRM_IDS}"
             set +e
             # shellcheck disable=SC2086 # SAMPLER_FIRM_IDS is intentionally word-split (space-separated ids -> separate args)
-            OUTPUT=$(node "${SILVERFIN_CLI_BIN}" run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1 | tr -d '\r')
+            # RC must come straight from `node`, not from a pipeline: this step has no explicit
+            # `shell: bash`, so GitHub Actions runs it as plain `bash -e {0}` - NOT `-o pipefail`
+            # (that only applies when `shell: bash` is set explicitly). Piping into `tr` before
+            # capturing $? would silently make RC reflect tr's (always 0) exit status instead of
+            # node's, breaking the RC-gated retry check below.
+            OUTPUT=$(node "${SILVERFIN_CLI_BIN}" run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1)
             RC=$?
+            OUTPUT=$(tr -d '\r' <<< "${OUTPUT}")
             set -e
             echo "----- run-sampler output (exit ${RC}) -----"
             echo "$OUTPUT"
