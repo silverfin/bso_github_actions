@@ -65,7 +65,12 @@ history for that exact file.
    fix for this exact problem (`push_to_review_firm.yml`'s refresh-then-push). Don't hand off a
    secret value via a job output or artifact instead: GitHub can redact/omit an output
    containing a recognized secret value, and artifacts are plaintext-persisted, readable by
-   anyone with run access - neither is a safe substitute for same-job handling.
+   anyone with run access - neither is a safe substitute for same-job handling. Being in the
+   same job isn't the whole fix either: `push_to_review_firm.yml`'s refresh action writes the
+   refreshed value to `$HOME/.silverfin/config.json`, and the consumer step reads *that local
+   file* - it never re-reads `${{ secrets.CONFIG_JSON }}`, which is still the queue-time
+   snapshot even within the same job. The secret context itself doesn't update mid-run; only a
+   local write-back does.
 
 6. **`tj-actions/changed-files` needs `safe_output: false` and `quotepath: false`** when
    piping its output through `jq`. The default `safe_output: true` backslash-escapes shell
@@ -83,14 +88,23 @@ history for that exact file.
    section) - repo convention since #24, and README drift on this file is treated as a real
    regression here, not a nit.
 
-9. **Every market repo (be/nl/lu/uk) consumes this repo's reusable workflows at `@main`, with
-   no per-consumer pin** - confirmed across all 4 repos' `.github/workflows/*.yml`. The only
-   exceptions are be_market's `check_auth.yml`/`refresh-config-json` pins, deliberately added
-   to isolate the CI-auth pilot (see silverfin-cli's `CI_AUTH_SAMPLER_PLAN.md`).
-   **A merge to `main` here takes effect for every other consumer's very next run** - there's
-   no gradual rollout and no way for a market repo to opt out short of pinning itself. Design
-   changes to an *existing* reusable workflow to be backward-compatible for callers that
-   haven't opted in, or coordinate the merge explicitly; this is why this repo's own merge
+9. **A market repo consumes this repo's workflows one of three ways - know which before
+   assuming a merge here reaches it:**
+   - **`uses: .../X.yml@main`** - the default. Confirmed across all 4 market repos (be/nl/lu/uk)
+     for every wrapper except the two cases below. **A merge to `main` reaches this caller on
+     its very next run** - no gradual rollout, no opt-out short of the caller pinning itself.
+   - **`uses: .../X.yml@<sha>`** - pinned. Only be_market's `check_auth.yml`/
+     `refresh-config-json`, deliberately isolating the CI-auth pilot (see silverfin-cli's
+     `CI_AUTH_SAMPLER_PLAN.md`). A merge here does NOT reach that caller until its pin is
+     bumped.
+   - **Fully forked/inlined - no `uses:` reference at all.** be_market's own `run_tests.yml` is
+     a complete local reimplementation, not a call to this repo's `run_tests.yml`. A merge here
+     never reaches it automatically, under any circumstances - only a human manually re-syncing
+     the fork does. Check for an actual `uses: silverfin/bso_github_actions` line before
+     assuming a market repo's same-named file tracks this one.
+
+   Design changes to an *existing* `uses:`-consumed workflow to be backward-compatible for
+   `@main` callers, or coordinate the merge explicitly; this is why this repo's own merge
    policy restricts changes to "non-breaking for the non-pilot markets."
 
 ## Common mistakes (from review history, don't re-litigate)
@@ -100,7 +114,7 @@ history for that exact file.
 | CI green but a template was silently skipped | `jq` failure inside `<( )` process substitution swallowed by `set -e` | Capture via `x=$(jq ...)`, check exit status explicitly |
 | Job fails on an empty match, not a real failure | `VAR=$(cmd \| grep pattern)` with no match | Append `\|\| true` to the assignment |
 | Later job doesn't see a secret another job just wrote | `secrets.*` queue-time snapshot | Merge writer and consumer into one job |
-| `actionlint` flags `concurrency.queue: max` as an unknown key | actionlint's schema predates this real GitHub Actions beta feature | Known false positive - don't "fix" it, don't downgrade to `queue: single` |
+| `actionlint` flags `concurrency.queue: max` as an unknown key | actionlint's schema predates this real GitHub Actions beta feature | Known false positive - don't "fix" it, don't downgrade to `queue: single`. `queue: max` and `cancel-in-progress: true` are mutually exclusive - don't add the latter alongside it |
 | PR comment markdown breaks on one specific template | Raw backtick/pipe interpolated into a code span or table cell | CommonMark fencing, or `tr -d` in table cells |
 | A workflow_call output looks empty even though the step set it | Caller didn't use `if: always()` to read it after a later step failed | Add `if: always()` on the consuming step |
 
