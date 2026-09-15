@@ -116,18 +116,19 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout repository at PR head
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ inputs.ref }}
-          fetch-depth: 1
-          persist-credentials: false
-
       - name: Setup Node
         uses: actions/setup-node@v6
         with:
           node-version: 22
 
+      # Installed BEFORE checkout, into $RUNNER_TEMP (outside $GITHUB_WORKSPACE) rather than
+      # `npm install` in the checked-out PR tree: a PR is untrusted content sampled with real
+      # partner credentials, and `npm install` treats the current directory as a project too -
+      # a PR-added root package.json's lifecycle scripts (preinstall/postinstall) would
+      # otherwise execute with SF_API_CLIENT_ID/SF_API_SECRET/PARTNER_CONFIG_JSON already in
+      # the job env. --ignore-scripts is defense in depth on top of the location change, not a
+      # substitute for it - it only suppresses npm's own lifecycle hooks, not e.g. a `.npmrc`
+      # in the tree redirecting the registry.
       - name: Install silverfin-cli
         run: |
           # Pinned to a commit on silverfin-cli's sampler-compact-diff-v2 branch, since
@@ -141,9 +142,22 @@ jobs:
           # ancestor of the branch, and missing five later fixes to the compact diff (flag-array
           # flip direction, radio-checked attribute boundary, flag-flip suffix side, the
           # no-view.html rewrite skip, and the identical-render diffs/ skip).
-          npm install https://github.com/silverfin/silverfin-cli.git#1ba5a0f
-          VERSION=$(node ./node_modules/silverfin-cli/bin/cli.js -V)
+          INSTALL_DIR="${RUNNER_TEMP}/silverfin-cli-install"
+          mkdir -p "${INSTALL_DIR}"
+          npm install --prefix "${INSTALL_DIR}" --ignore-scripts \
+            https://github.com/silverfin/silverfin-cli.git#1ba5a0f
+          # Exported via $GITHUB_ENV (not job-level `env:`, which can't use $RUNNER_TEMP or the
+          # `runner` context) so every later step in this job gets the resolved absolute path.
+          echo "SILVERFIN_CLI_BIN=${INSTALL_DIR}/node_modules/silverfin-cli/bin/cli.js" >> "$GITHUB_ENV"
+          VERSION=$(node "${INSTALL_DIR}/node_modules/silverfin-cli/bin/cli.js" -V)
           echo "CLI version: ${VERSION}"
+
+      - name: Checkout repository at PR head
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Load PARTNER_CONFIG_JSON (host + partnerCredentials)
         env:
@@ -235,7 +249,7 @@ jobs:
             printf ' --firm-ids %s --compact\n' "${SAMPLER_FIRM_IDS}"
             set +e
             # shellcheck disable=SC2086 # SAMPLER_FIRM_IDS is intentionally word-split (space-separated ids -> separate args)
-            OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1 | tr -d '\r')
+            OUTPUT=$(node "${SILVERFIN_CLI_BIN}" run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1 | tr -d '\r')
             RC=$?
             set -e
             echo "----- run-sampler output (exit ${RC}) -----"
@@ -365,7 +379,7 @@ jobs:
         if: always() && steps.download.outputs.downloaded == 'true'
         continue-on-error: true
         run: |
-          if node ./node_modules/silverfin-cli/bin/cli.js run-sampler --from-zip results.zip --add-diffs-folder; then
+          if node "${SILVERFIN_CLI_BIN}" run-sampler --from-zip results.zip --add-diffs-folder; then
             echo "diffs_added=true" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::Failed to add diffs/ folder to results.zip — the uploaded artifact is the plain sampler output for this run."
