@@ -326,9 +326,30 @@ jobs:
             local CLI_FLAG="--handle"
             [[ "${TYPE}" == "accountTemplate" ]] && CLI_FLAG="--account-template"
             local -A FINAL=() ATTEMPT_OF=()
-            local -a REMAINING=() NEXT=() BATCH=()
+            local -a REMAINING=() NEXT=() BATCH=() VALID=()
             local ATTEMPT=1 TOTAL START RAW PARSED BATCH_EXIT NAME STATUS TRANSIENT
             mapfile -t REMAINING < "${LIST}"
+            # A name starting with "-" would be read by the CLI's option parser as a FLAG rather
+            # than a value: commander stops consuming a variadic option (--handle/--account-template
+            # take <names...>) at the first "-"-prefixed token. Reject up front - same guard as
+            # run_sampler.yml's reject_option_like_names - so it surfaces as an ordinary FAIL
+            # verdict instead of being silently misparsed by the CLI.
+            for NAME in "${REMAINING[@]}"; do
+              if [[ "${NAME}" == -* ]]; then
+                # The remediation differs by TYPE: accountTemplate's NAME is the directory
+                # basename (renaming it changes NAME), but reconciliationText's NAME comes from
+                # config.json's `.handle // .name` - renaming the directory does nothing there.
+                if [[ "${TYPE}" == "accountTemplate" ]]; then
+                  FINAL["${NAME}"]="FAIL - name starts with '-', which silverfin-cli would parse as an option instead of a value. Rename the template directory."
+                else
+                  FINAL["${NAME}"]="FAIL - name starts with '-', which silverfin-cli would parse as an option instead of a value. Change the handle (or fallback name) in the template's config.json."
+                fi
+                ATTEMPT_OF["${NAME}"]=0
+              else
+                VALID+=("${NAME}")
+              fi
+            done
+            REMAINING=("${VALID[@]}")
             while (( ${#REMAINING[@]} > 0 && ATTEMPT <= MAX_ATTEMPTS )); do
               if (( ATTEMPT > 1 )); then
                 echo "--- attempt ${ATTEMPT}: retrying ${#REMAINING[@]} template(s) after a transient platform error ---" >> "${OUT}"
