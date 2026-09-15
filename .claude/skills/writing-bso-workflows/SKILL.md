@@ -57,10 +57,15 @@ history for that exact file.
    (template output, PR text), don't use a fixed delimiter string - generate one and verify
    it doesn't collide with the content first.
 
-5. **`secrets.*` is snapshotted for the whole run at queue time.** A job that `gh secret
-   set`s a refreshed value does NOT change what a later job in the *same run* reads via
-   `${{ secrets.X }}`. Either merge the writer and the consumer into one job, or hand off the
-   fresh value via a job output/artifact - never assume a same-run re-read sees the write.
+5. **Repository/organization `secrets.*` are snapshotted at queue time** (environment secrets
+   are read when a job referencing that environment starts, not queue time - this repo doesn't
+   use environments, so queue-time is what applies here). A job that `gh secret set`s a
+   refreshed value does NOT change what a later job in the *same run* reads via
+   `${{ secrets.X }}`. **Merge the writer and the consumer into one job** - this repo's actual
+   fix for this exact problem (`push_to_review_firm.yml`'s refresh-then-push). Don't hand off a
+   secret value via a job output or artifact instead: GitHub can redact/omit an output
+   containing a recognized secret value, and artifacts are plaintext-persisted, readable by
+   anyone with run access - neither is a safe substitute for same-job handling.
 
 6. **`tj-actions/changed-files` needs `safe_output: false` and `quotepath: false`** when
    piping its output through `jq`. The default `safe_output: true` backslash-escapes shell
@@ -84,14 +89,16 @@ history for that exact file.
 |---|---|---|
 | CI green but a template was silently skipped | `jq` failure inside `<( )` process substitution swallowed by `set -e` | Capture via `x=$(jq ...)`, check exit status explicitly |
 | Job fails on an empty match, not a real failure | `VAR=$(cmd \| grep pattern)` with no match | Append `\|\| true` to the assignment |
-| Later job doesn't see a secret another job just wrote | `secrets.*` queue-time snapshot | Same job, or hand off via output/artifact |
+| Later job doesn't see a secret another job just wrote | `secrets.*` queue-time snapshot | Merge writer and consumer into one job |
+| `actionlint` flags `concurrency.queue: max` as an unknown key | actionlint's schema predates this real GitHub Actions beta feature | Known false positive - don't "fix" it, don't downgrade to `queue: single` |
 | PR comment markdown breaks on one specific template | Raw backtick/pipe interpolated into a code span or table cell | CommonMark fencing, or `tr -d` in table cells |
 | A workflow_call output looks empty even though the step set it | Caller didn't use `if: always()` to read it after a later step failed | Add `if: always()` on the consuming step |
 
 ## Also worth knowing
 
 - `permissions: contents: write` is usually unnecessary - checkout needs `read`, and
-  `gh secret set` authenticates via `REPO_ACCESS_TOKEN`/`GH_TOKEN`, not the implicit token.
+  `gh secret set` authenticates via `GH_TOKEN`/`GITHUB_TOKEN` (`gh`'s recognized env vars) -
+  map `secrets.REPO_ACCESS_TOKEN` to `GH_TOKEN` in the step's `env:`, not the implicit token.
 - A local `uses: ./.github/actions/...` only resolves when the reusable workflow runs in its
   own repo's checkout - a reusable workflow called from a different repo runs in the caller's
   checkout, so a local relative path there needs a fully-qualified `owner/repo/path@ref`.
