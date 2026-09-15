@@ -83,6 +83,16 @@ history for that exact file.
    section) - repo convention since #24, and README drift on this file is treated as a real
    regression here, not a nit.
 
+9. **Every market repo (be/nl/lu/uk) consumes this repo's reusable workflows at `@main`, with
+   no per-consumer pin** - confirmed across all 4 repos' `.github/workflows/*.yml`. The only
+   exceptions are be_market's `check_auth.yml`/`refresh-config-json` pins, deliberately added
+   to isolate the CI-auth pilot (see silverfin-cli's `CI_AUTH_SAMPLER_PLAN.md`).
+   **A merge to `main` here takes effect for every other consumer's very next run** - there's
+   no gradual rollout and no way for a market repo to opt out short of pinning itself. Design
+   changes to an *existing* reusable workflow to be backward-compatible for callers that
+   haven't opted in, or coordinate the merge explicitly; this is why this repo's own merge
+   policy restricts changes to "non-breaking for the non-pilot markets."
+
 ## Common mistakes (from review history, don't re-litigate)
 
 | Symptom | Cause | Fix |
