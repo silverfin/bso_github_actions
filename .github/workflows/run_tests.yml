@@ -336,7 +336,14 @@ jobs:
             # verdict instead of being silently misparsed by the CLI.
             for NAME in "${REMAINING[@]}"; do
               if [[ "${NAME}" == -* ]]; then
-                FINAL["${NAME}"]="FAIL - name starts with '-', which silverfin-cli would parse as an option instead of a value. Rename the template directory."
+                # The remediation differs by TYPE: accountTemplate's NAME is the directory
+                # basename (renaming it changes NAME), but reconciliationText's NAME comes from
+                # config.json's `.handle // .name` - renaming the directory does nothing there.
+                if [[ "${TYPE}" == "accountTemplate" ]]; then
+                  FINAL["${NAME}"]="FAIL - name starts with '-', which silverfin-cli would parse as an option instead of a value. Rename the template directory."
+                else
+                  FINAL["${NAME}"]="FAIL - name starts with '-', which silverfin-cli would parse as an option instead of a value. Change the handle (or fallback name) in the template's config.json."
+                fi
                 ATTEMPT_OF["${NAME}"]=0
               else
                 VALID+=("${NAME}")
