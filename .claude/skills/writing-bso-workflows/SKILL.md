@@ -62,8 +62,19 @@ history for that exact file.
      `cmd2`'s exit status, not `cmd1`'s, whenever pipefail is absent - a real bug shipped in
      this repo's own `run_sampler.yml` (`node ... | tr -d '\r'`, `RC=$?` silently reading
      `tr`'s always-zero status instead of the CLI's). If you need `cmd1`'s exit code and the
-     step has no explicit `shell: bash`, capture it BEFORE piping: `X=$(cmd1); RC=$?; X=$(cmd2
-     <<< "$X")` - don't rely on pipefail unless you've added `shell: bash` yourself.
+     step has no explicit `shell: bash`, capture it BEFORE piping - and note a bare
+     `X=$(cmd1)` on its own line still aborts the step under plain `-e` the instant `cmd1`
+     fails, before a following `RC=$?` ever runs, so wrap the capture so `-e` can't fire:
+     ```bash
+     set +e
+     X=$(cmd1)
+     RC=$?
+     set -e
+     X=$(tr ... <<< "$X")
+     ```
+     (a single capture can use `RC=0; X=$(cmd1) || RC=$?` instead of the `set +e`/`set -e`
+     pair - reach for `set +e ... set -e` once more than one command in the block can fail).
+     Don't rely on pipefail unless you've added `shell: bash` yourself.
 
 4. **`$GITHUB_OUTPUT` multiline values need a `key<<DELIMITER` heredoc** - `echo "key=$val"`
    truncates at the first newline. If the value can contain arbitrary/untrusted content
