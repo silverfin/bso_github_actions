@@ -72,9 +72,12 @@ history for that exact file.
      set -e
      X=$(tr ... <<< "$X")
      ```
-     (a single capture can use `RC=0; X=$(cmd1) || RC=$?` instead of the `set +e`/`set -e`
-     pair - use `set +e ... set -e` only when you capture or check every command's
-     status before re-enabling `-e`, not just the one you care about).
+     Put `set -e` **immediately** after `RC=$?`. A follow-up `tr`/`sed` still inside the
+     `set +e` block (the residual after `run_sampler.yml`'s first RC-capture fix, be_market#3178
+     / this repo's #53) can fail silently, empty `X`, and skip a later text match while `RC`
+     still looks like `cmd1`'s. A single capture can use `RC=0; X=$(cmd1) || RC=$?` instead of
+     the `set +e`/`set -e` pair - use `set +e ... set -e` only when you capture or check every
+     command's status before re-enabling `-e`, not just the one you care about.
      Don't rely on pipefail unless you've added `shell: bash` yourself.
 
 4. **`$GITHUB_OUTPUT` multiline values need a `key<<DELIMITER` heredoc** - `echo "key=$val"`
@@ -163,6 +166,7 @@ history for that exact file.
 | `actionlint` flags `concurrency.queue: max` as an unknown key | actionlint's schema predates this real GitHub Actions beta feature | Known false positive - don't "fix" it, don't downgrade to `queue: single`. `queue: max` and `cancel-in-progress: true` are mutually exclusive - don't add the latter alongside it |
 | PR comment markdown breaks on one specific template | Raw backtick/pipe interpolated into a code span or table cell | CommonMark fencing, or `tr -d` in table cells |
 | A workflow_call output looks empty even though the step set it | Caller didn't use `if: always()` to read it after a later step failed | Add `if: always()` on the consuming step |
+| Rotated credential lost after one failed `gh secret set` | Retry loop only matched HTTP 5xx | Also retry HTTP 429 and HTTP 403 *with* rate-limit/`retry-after` text; a plain 403 is a permanent auth/scope failure. Name the secret and that re-authorization is required on final failure. |
 
 ## Also worth knowing
 
@@ -175,3 +179,7 @@ history for that exact file.
 - Squash-merges don't produce a SHA match on `git log origin/main..branch` - `git fetch` +
   content-diff before trusting a commit list, and remember a self-referencing pin needs its
   own bump after a squash-merge.
+- After a token has already rotated server-side, a single failed `gh secret set` strands a
+  dead stored credential. Retry transient GitHub errors (5xx, 429, and 403 only when the body
+  says rate-limit/`retry-after`); fail immediately on a plain 403. `check_auth.yml` and
+  `run_sampler.yml` are the reference write-backs.
