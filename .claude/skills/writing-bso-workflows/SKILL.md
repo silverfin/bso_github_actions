@@ -1,0 +1,100 @@
+---
+name: writing-bso-workflows
+description: Use when creating or editing a .github/workflows/*.yml file (or scripts/*.sh it calls) in bso_github_actions - distilled from repeated /review-pr findings, so the same mistakes don't get re-flagged on every new workflow.
+---
+
+# Writing bso_github_actions workflows
+
+## Overview
+
+This repo's `/review-pr` history (`.cursor/review-learnings/`) shows the same ~8 mistakes
+getting introduced in new workflow files, then caught in review, over and over - often in a
+file that gets the pattern right in one step and wrong in the next step of the *same* diff.
+This skill is the checklist to apply BEFORE writing, so the reviewer doesn't have to.
+
+**Also read `.cursor/review-learnings/_syntax.md` in full** - it holds the platform-mechanics
+facts (GITHUB_OUTPUT limits, workflow_call boundaries, etc.) this skill builds on, kept there
+instead of duplicated here. If you're editing a workflow that already has its own topic file
+under `.cursor/review-learnings/` (check `INDEX.md`), read that file too - it has the specific
+history for that exact file.
+
+## The checklist
+
+1. **Never splice `${{ }}` directly into a `run:` script body.** Always pass through `env:`
+   and reference `$VAR`. This is the single most-repeated finding in this repo's history -
+   check EVERY `${{ }}` in the step, not just the obvious one (a step can fix 4 of 5
+   occurrences and miss the 5th, e.g. the right side of a comparison).
+   ```yaml
+   # Wrong: a filename/title with backticks or $(...) executes as shell code
+   run: echo "Changed: ${{ steps.x.outputs.all_changed_files }}"
+   # Right
+   env:
+     CHANGED: ${{ steps.x.outputs.all_changed_files }}
+   run: echo "Changed: ${CHANGED}"
+   ```
+
+2. **Repo-tree/PR-derived names (handles, template dirs, filenames) need three guards:**
+   - Split newline-separated, never space-separated (`mapfile -t`, not `arr=($(cmd))`) -
+     account template names contain spaces.
+   - Reject a name starting with `-` before passing it to a variadic CLI flag (`-h`/`-at`/
+     `--handle`) - commander reads it as a flag, not a value. `run_sampler.yml`'s
+     `reject_option_like_names` is the reference implementation.
+   - Before embedding in a markdown PR comment: CommonMark-safe backtick fencing (one more
+     backtick than the longest run in the name, space-pad if it starts/ends with a backtick) -
+     NOT backslash-escaping (a backslash is literal inside a code span, doesn't escape
+     anything). Inside a markdown *table cell*, also strip `|` (breaks the column structure) -
+     `tr -d '\`|'` is simpler and acceptable there since exact fidelity doesn't matter as much
+     as in a comment body.
+
+3. **`bash -eo pipefail` is the default shell, even unwritten.** `VAR=$(cmd | grep ...)`
+   aborts the step when grep finds no match - add `|| true` whenever zero-match is a valid
+   outcome. Process substitution (`done < <(cmd)`) hides a failing command's exit status from
+   `set -e` entirely - only use it for best-effort/warn-and-skip logic, capture via
+   `x=$(cmd)` first when the operation's success actually matters.
+
+4. **`$GITHUB_OUTPUT` multiline values need a `key<<DELIMITER` heredoc** - `echo "key=$val"`
+   truncates at the first newline. If the value can contain arbitrary/untrusted content
+   (template output, PR text), don't use a fixed delimiter string - generate one and verify
+   it doesn't collide with the content first.
+
+5. **`secrets.*` is snapshotted for the whole run at queue time.** A job that `gh secret
+   set`s a refreshed value does NOT change what a later job in the *same run* reads via
+   `${{ secrets.X }}`. Either merge the writer and the consumer into one job, or hand off the
+   fresh value via a job output/artifact - never assume a same-run re-read sees the write.
+
+6. **`tj-actions/changed-files` needs `safe_output: false` and `quotepath: false`** when
+   piping its output through `jq`. The default `safe_output: true` backslash-escapes shell
+   metacharacters *inside* the JSON string values (`\&`, `\(`, `\)` are invalid JSON, jq
+   aborts). Git's default `core.quotepath` double-quotes and octal-escapes non-ASCII paths
+   (e.g. a curly apostrophe) - `quotepath: false` on the action's own input is the fix; a
+   global git-config attempt does not override the action's default.
+
+7. **CLI install stays unpinned (`npm install https://github.com/silverfin/silverfin-cli.git`)
+   unless this workflow depends on a flag not yet on `main`** - then pin to the exact commit,
+   with a comment saying to revert once the CLI PR merges. Unpinned is the deliberate,
+   repo-wide convention; don't "fix" it on an unrelated PR.
+
+8. **A new reusable workflow needs a README.md entry** (Individual Action Documentation
+   section) - repo convention since #24, and README drift on this file is treated as a real
+   regression here, not a nit.
+
+## Common mistakes (from review history, don't re-litigate)
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| CI green but a template was silently skipped | `jq` failure inside `<( )` process substitution swallowed by `set -e` | Capture via `x=$(jq ...)`, check exit status explicitly |
+| Job fails on an empty match, not a real failure | `VAR=$(cmd \| grep pattern)` with no match | Append `\|\| true` to the assignment |
+| Later job doesn't see a secret another job just wrote | `secrets.*` queue-time snapshot | Same job, or hand off via output/artifact |
+| PR comment markdown breaks on one specific template | Raw backtick/pipe interpolated into a code span or table cell | CommonMark fencing, or `tr -d` in table cells |
+| A workflow_call output looks empty even though the step set it | Caller didn't use `if: always()` to read it after a later step failed | Add `if: always()` on the consuming step |
+
+## Also worth knowing
+
+- `permissions: contents: write` is usually unnecessary - checkout needs `read`, and
+  `gh secret set` authenticates via `REPO_ACCESS_TOKEN`/`GH_TOKEN`, not the implicit token.
+- A local `uses: ./.github/actions/...` only resolves when the reusable workflow runs in its
+  own repo's checkout - a reusable workflow called from a different repo runs in the caller's
+  checkout, so a local relative path there needs a fully-qualified `owner/repo/path@ref`.
+- Squash-merges don't produce a SHA match on `git log origin/main..branch` - `git fetch` +
+  content-diff before trusting a commit list, and remember a self-referencing pin needs its
+  own bump after a squash-merge.
