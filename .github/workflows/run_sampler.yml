@@ -242,7 +242,10 @@ jobs:
             echo "$OUTPUT"
             echo "--------------------------------------------"
 
-            if echo "$OUTPUT" | grep -qi "already in progress"; then
+            # RC check first: grepping the whole $OUTPUT for this phrase without it would also
+            # match a SUCCESSFUL run whose compact diff happens to contain that text somewhere in
+            # a sampled entry's own rendered content, sending a clean run into the retry loop.
+            if [[ "${RC}" -ne 0 ]] && echo "$OUTPUT" | grep -qi "already in progress"; then
               NOW=$(date +%s)
               if (( NOW >= DEADLINE )); then
                 # Don't exit here: fall through to the normal output-setting logic below (which
@@ -285,10 +288,19 @@ jobs:
 
           # Compact named_results diff, between the CLI's own markers.
           COMPACT=$(echo "$OUTPUT" | sed 's/\x1b\[[0-9;]*m//g' | awk '/SAMPLER_COMPACT_START/{f=1;next} /SAMPLER_COMPACT_END/{f=0} f')
+
+          # A fixed delimiter would corrupt $GITHUB_OUTPUT's multiline parsing if that exact
+          # string ever appeared inside a sampled template's own rendered content. Generate a
+          # random one and confirm it doesn't collide before using it - astronomically unlikely
+          # with 16 hex bytes, but "unlikely" isn't a guarantee, so check rather than assume.
+          DELIM="SAMPLER_COMPACT_EOF_$(openssl rand -hex 16)"
+          while grep -qF "${DELIM}" <<< "${COMPACT}"; do
+            DELIM="SAMPLER_COMPACT_EOF_$(openssl rand -hex 16)"
+          done
           {
-            echo "compact<<SAMPLER_COMPACT_EOF_9c2a"
+            echo "compact<<${DELIM}"
             echo "$COMPACT"
-            echo "SAMPLER_COMPACT_EOF_9c2a"
+            echo "${DELIM}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Capture partner token after the run and write back if rotated
