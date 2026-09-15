@@ -46,11 +46,24 @@ history for that exact file.
      `tr -d '\`|'` is simpler and acceptable there since exact fidelity doesn't matter as much
      as in a comment body.
 
-3. **`bash -eo pipefail` is the default shell, even unwritten.** `VAR=$(cmd | grep ...)`
-   aborts the step when grep finds no match - add `|| true` whenever zero-match is a valid
-   outcome. Process substitution (`done < <(cmd)`) hides a failing command's exit status from
-   `set -e` entirely - only use it for best-effort/warn-and-skip logic, capture via
-   `x=$(cmd)` first when the operation's success actually matters.
+3. **Know which of the two default shells you're getting - they are NOT the same.** An
+   **unspecified** `run:` (no `shell:` key anywhere) runs as plain `bash -e {0}` - no
+   `pipefail`. Only an **explicit** `shell: bash` gets `bash --noprofile --norc -eo pipefail
+   {0}`. Verified directly against GitHub's own docs; every workflow this skill was written
+   from has no explicit `shell:` on its steps, so treat `pipefail` as ABSENT unless you've
+   confirmed otherwise for the specific step.
+   - **With `-e` alone (the common case here):** `VAR=$(cmd | grep ...)` still aborts the step
+     when `grep` finds no match (that part doesn't need pipefail - `grep`/`sort`/etc failing is
+     what aborts, and the pipeline's own reported status is its LAST command's either way) -
+     add `|| true` whenever zero-match is a valid outcome. Process substitution
+     (`done < <(cmd)`) hides a failing command's exit status entirely regardless of pipefail -
+     only use it for best-effort/warn-and-skip logic.
+   - **The dangerous mistake this causes:** `RC=$?` right after `X=$(cmd1 | cmd2)` captures
+     `cmd2`'s exit status, not `cmd1`'s, whenever pipefail is absent - a real bug shipped in
+     this repo's own `run_sampler.yml` (`node ... | tr -d '\r'`, `RC=$?` silently reading
+     `tr`'s always-zero status instead of the CLI's). If you need `cmd1`'s exit code and the
+     step has no explicit `shell: bash`, capture it BEFORE piping: `X=$(cmd1); RC=$?; X=$(cmd2
+     <<< "$X")` - don't rely on pipefail unless you've added `shell: bash` yourself.
 
 4. **`$GITHUB_OUTPUT` multiline values need a `key<<DELIMITER` heredoc** - `echo "key=$val"`
    truncates at the first newline. If the value can contain arbitrary/untrusted content
@@ -87,13 +100,23 @@ history for that exact file.
    global git-config attempt does not override the action's default.
 
 7. **CLI install stays unpinned (`npm install https://github.com/silverfin/silverfin-cli.git`)
-   unless this workflow depends on a flag not yet on `main`** - then pin to the exact commit,
-   with a comment saying to revert once the CLI PR merges. Unpinned is the deliberate,
-   repo-wide convention; don't "fix" it on an unrelated PR. Separate exception, needing no
-   unreleased flag: a workflow that **writes secrets/handles credentials** should pin even
-   against `main` - `@main` can silently change credential-handling code itself with no
-   workflow diff to review. `push_to_review_firm.yml` does this (pinned while silverfin-cli#273
-   is open, reverting once it merges) precisely because it's a secret-writing job.
+   by default** - unpinned-from-`main` is the deliberate, repo-wide convention; don't "fix" it
+   on an unrelated PR. Pin to an exact commit only for a specific, time-boxed reason, always
+   with a comment saying when to revert:
+   - **This workflow needs a flag not yet on `main`** - revert once that CLI PR merges.
+   - **A currently-open, unmerged CLI PR touches credential-handling code this workflow relies
+     on**, so an ordinary `@main` merge elsewhere could change how secrets are handled here
+     with zero visible diff in *this* repo. `push_to_review_firm.yml` pins for this reason
+     (against open silverfin-cli#273), reverting once it merges. This is NOT "every
+     secret-writing workflow must always pin" - `check_auth.yml` also writes a secret
+     (`CONFIG_JSON`) and stays deliberately unpinned, because at the time of writing there's
+     no open CLI PR whose unmerged state it needs shielding from. Pin against a specific named
+     risk, not against the general category of "handles credentials."
+   - **This file's design is itself mid-migration** (e.g. the CI-auth pilot currently piloted
+     in `be_market` is expected to become the standard auth flow repo-wide) - treat any
+     specific-file example in this skill about auth/credential workflows as time-bound. Verify
+     against the current file rather than assuming `check_auth.yml`'s shape described here
+     still matches once that migration lands.
 
 8. **A new reusable workflow needs a README.md entry** (Individual Action Documentation
    section) - repo convention since #24, and README drift on this file is treated as a real
