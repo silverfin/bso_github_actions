@@ -355,7 +355,33 @@ jobs:
           echo "Partner token rotated mid-run (401 refresh) — writing PARTNER_CONFIG_JSON_${PARTNER} back."
           CONFIG_JSON=$(cat "$HOME/.silverfin/config.json" | tr -d '\n')
           echo "::add-mask::${CONFIG_JSON}"
-          echo "$CONFIG_JSON" | gh secret set "PARTNER_CONFIG_JSON_${PARTNER}"
+
+          # By this point the backend has ALREADY rotated away from BEFORE_TOKEN - unlike a
+          # firm's refresh token (self-heals via check_auth.yml's next */10 tick), the partner
+          # api_key has no other writer and no cron. A single failed write-back here doesn't
+          # just leave a stale secret, it strands a dead one: BEFORE_TOKEN no longer works
+          # server-side, and AFTER_TOKEN never made it to disk. Retry transient failures
+          # (same shape as check_auth.yml's/repair_firm_auth.yml's write-back), and make the
+          # final failure message say exactly that, naming the partner.
+          MAX_ATTEMPTS=3
+          ATTEMPT=1
+          while true; do
+            if ERR=$(echo "${CONFIG_JSON}" | gh secret set "PARTNER_CONFIG_JSON_${PARTNER}" 2>&1); then
+              break
+            fi
+            if ! grep -qE 'HTTP 5[0-9]{2}' <<< "${ERR}"; then
+              echo "::error::failed to write PARTNER_CONFIG_JSON_${PARTNER} back (non-transient failure): ${ERR} — the rotated token is LOST and the stored secret is now stale/dead; partner ${PARTNER} needs manual re-authorization."
+              exit 1
+            fi
+            if (( ATTEMPT >= MAX_ATTEMPTS )); then
+              echo "::error::failed to write PARTNER_CONFIG_JSON_${PARTNER} back after ${MAX_ATTEMPTS} attempts: ${ERR} — the rotated token is LOST and the stored secret is now stale/dead; partner ${PARTNER} needs manual re-authorization."
+              exit 1
+            fi
+            SLEEP=$(( 2 ** ATTEMPT ))
+            echo "::warning::gh secret set PARTNER_CONFIG_JSON_${PARTNER} failed with a transient error (attempt ${ATTEMPT}/${MAX_ATTEMPTS}), retrying in ${SLEEP}s"
+            sleep "${SLEEP}"
+            ATTEMPT=$((ATTEMPT+1))
+          done
 
       - name: Download results.zip for the workflow artifact
         id: download
