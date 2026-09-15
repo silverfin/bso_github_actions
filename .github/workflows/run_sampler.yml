@@ -116,18 +116,19 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout repository at PR head
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ inputs.ref }}
-          fetch-depth: 1
-          persist-credentials: false
-
       - name: Setup Node
         uses: actions/setup-node@v6
         with:
           node-version: 22
 
+      # Installed BEFORE checkout, into $RUNNER_TEMP (outside $GITHUB_WORKSPACE) rather than
+      # `npm install` in the checked-out PR tree: a PR is untrusted content sampled with real
+      # partner credentials, and `npm install` treats the current directory as a project too -
+      # a PR-added root package.json's lifecycle scripts (preinstall/postinstall) would
+      # otherwise execute with SF_API_CLIENT_ID/SF_API_SECRET/PARTNER_CONFIG_JSON already in
+      # the job env. --ignore-scripts is defense in depth on top of the location change, not a
+      # substitute for it - it only suppresses npm's own lifecycle hooks, not e.g. a `.npmrc`
+      # in the tree redirecting the registry.
       - name: Install silverfin-cli
         run: |
           # Pinned to a commit on silverfin-cli's sampler-compact-diff-v2 branch, since
@@ -141,9 +142,22 @@ jobs:
           # ancestor of the branch, and missing five later fixes to the compact diff (flag-array
           # flip direction, radio-checked attribute boundary, flag-flip suffix side, the
           # no-view.html rewrite skip, and the identical-render diffs/ skip).
-          npm install https://github.com/silverfin/silverfin-cli.git#1ba5a0f
-          VERSION=$(node ./node_modules/silverfin-cli/bin/cli.js -V)
+          INSTALL_DIR="${RUNNER_TEMP}/silverfin-cli-install"
+          mkdir -p "${INSTALL_DIR}"
+          npm install --prefix "${INSTALL_DIR}" --ignore-scripts \
+            https://github.com/silverfin/silverfin-cli.git#1ba5a0f
+          # Exported via $GITHUB_ENV (not job-level `env:`, which can't use $RUNNER_TEMP or the
+          # `runner` context) so every later step in this job gets the resolved absolute path.
+          echo "SILVERFIN_CLI_BIN=${INSTALL_DIR}/node_modules/silverfin-cli/bin/cli.js" >> "$GITHUB_ENV"
+          VERSION=$(node "${INSTALL_DIR}/node_modules/silverfin-cli/bin/cli.js" -V)
           echo "CLI version: ${VERSION}"
+
+      - name: Checkout repository at PR head
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Load PARTNER_CONFIG_JSON (host + partnerCredentials)
         env:
@@ -235,14 +249,25 @@ jobs:
             printf ' --firm-ids %s --compact\n' "${SAMPLER_FIRM_IDS}"
             set +e
             # shellcheck disable=SC2086 # SAMPLER_FIRM_IDS is intentionally word-split (space-separated ids -> separate args)
-            OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1 | tr -d '\r')
+            # RC must come straight from `node`, not from a pipeline: this step has no explicit
+            # `shell: bash`, so GitHub Actions runs it as plain `bash -e {0}` - NOT `-o pipefail`
+            # (that only applies when `shell: bash` is set explicitly). Piping into `tr` before
+            # capturing $? would silently make RC reflect tr's (always 0) exit status instead of
+            # node's, breaking the RC-gated retry check below.
+            OUTPUT=$(node "${SILVERFIN_CLI_BIN}" run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1)
             RC=$?
             set -e
+            # Restore -e before stripping CRs so a failed `tr` cannot empty OUTPUT while
+            # leaving RC as node's status (that would skip the 422-text retry below).
+            OUTPUT=$(tr -d '\r' <<< "${OUTPUT}")
             echo "----- run-sampler output (exit ${RC}) -----"
             echo "$OUTPUT"
             echo "--------------------------------------------"
 
-            if echo "$OUTPUT" | grep -qi "already in progress"; then
+            # RC check first: grepping the whole $OUTPUT for this phrase without it would also
+            # match a SUCCESSFUL run whose compact diff happens to contain that text somewhere in
+            # a sampled entry's own rendered content, sending a clean run into the retry loop.
+            if [[ "${RC}" -ne 0 ]] && echo "$OUTPUT" | grep -qi "already in progress"; then
               NOW=$(date +%s)
               if (( NOW >= DEADLINE )); then
                 # Don't exit here: fall through to the normal output-setting logic below (which
@@ -285,10 +310,19 @@ jobs:
 
           # Compact named_results diff, between the CLI's own markers.
           COMPACT=$(echo "$OUTPUT" | sed 's/\x1b\[[0-9;]*m//g' | awk '/SAMPLER_COMPACT_START/{f=1;next} /SAMPLER_COMPACT_END/{f=0} f')
+
+          # A fixed delimiter would corrupt $GITHUB_OUTPUT's multiline parsing if that exact
+          # string ever appeared inside a sampled template's own rendered content. Generate a
+          # random one and confirm it doesn't collide before using it - astronomically unlikely
+          # with 16 hex bytes, but "unlikely" isn't a guarantee, so check rather than assume.
+          DELIM="SAMPLER_COMPACT_EOF_$(openssl rand -hex 16)"
+          while grep -qF "${DELIM}" <<< "${COMPACT}"; do
+            DELIM="SAMPLER_COMPACT_EOF_$(openssl rand -hex 16)"
+          done
           {
-            echo "compact<<SAMPLER_COMPACT_EOF_9c2a"
+            echo "compact<<${DELIM}"
             echo "$COMPACT"
-            echo "SAMPLER_COMPACT_EOF_9c2a"
+            echo "${DELIM}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Capture partner token after the run and write back if rotated
@@ -323,7 +357,36 @@ jobs:
           echo "Partner token rotated mid-run (401 refresh) — writing PARTNER_CONFIG_JSON_${PARTNER} back."
           CONFIG_JSON=$(cat "$HOME/.silverfin/config.json" | tr -d '\n')
           echo "::add-mask::${CONFIG_JSON}"
-          echo "$CONFIG_JSON" | gh secret set "PARTNER_CONFIG_JSON_${PARTNER}"
+
+          # By this point the backend has ALREADY rotated away from BEFORE_TOKEN - unlike a
+          # firm's refresh token (self-heals via check_auth.yml's next */10 tick), the partner
+          # api_key has no other writer and no cron. A single failed write-back here doesn't
+          # just leave a stale secret, it strands a dead one: BEFORE_TOKEN no longer works
+          # server-side, and AFTER_TOKEN never made it to disk. Retry transient failures
+          # (same shape as check_auth.yml's/repair_firm_auth.yml's write-back), and make the
+          # final failure message say exactly that, naming the partner.
+          MAX_ATTEMPTS=3
+          ATTEMPT=1
+          while true; do
+            if ERR=$(echo "${CONFIG_JSON}" | gh secret set "PARTNER_CONFIG_JSON_${PARTNER}" 2>&1); then
+              break
+            fi
+            # 5xx is the check_auth.yml shape. Also retry explicit GitHub rate limits:
+            # 429, and 403 only when the body says rate-limit (a plain 403 is a permanent
+            # auth/scope failure and must not burn retries).
+            if ! grep -qE 'HTTP 5[0-9]{2}|HTTP 429' <<< "${ERR}" && ! { grep -qE 'HTTP 403' <<< "${ERR}" && grep -qiE 'rate.?limit|retry[- ]after' <<< "${ERR}"; }; then
+              echo "::error::failed to write PARTNER_CONFIG_JSON_${PARTNER} back (non-transient failure): ${ERR} — the rotated token is LOST and the stored secret is now stale/dead; partner ${PARTNER} needs manual re-authorization."
+              exit 1
+            fi
+            if (( ATTEMPT >= MAX_ATTEMPTS )); then
+              echo "::error::failed to write PARTNER_CONFIG_JSON_${PARTNER} back after ${MAX_ATTEMPTS} attempts: ${ERR} — the rotated token is LOST and the stored secret is now stale/dead; partner ${PARTNER} needs manual re-authorization."
+              exit 1
+            fi
+            SLEEP=$(( 2 ** ATTEMPT ))
+            echo "::warning::gh secret set PARTNER_CONFIG_JSON_${PARTNER} failed with a transient error (attempt ${ATTEMPT}/${MAX_ATTEMPTS}), retrying in ${SLEEP}s"
+            sleep "${SLEEP}"
+            ATTEMPT=$((ATTEMPT+1))
+          done
 
       - name: Download results.zip for the workflow artifact
         id: download
@@ -353,7 +416,7 @@ jobs:
         if: always() && steps.download.outputs.downloaded == 'true'
         continue-on-error: true
         run: |
-          if node ./node_modules/silverfin-cli/bin/cli.js run-sampler --from-zip results.zip --add-diffs-folder; then
+          if node "${SILVERFIN_CLI_BIN}" run-sampler --from-zip results.zip --add-diffs-folder; then
             echo "diffs_added=true" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::Failed to add diffs/ folder to results.zip — the uploaded artifact is the plain sampler output for this run."
