@@ -345,13 +345,22 @@ history for that exact file.
       `run-name:`. So matching a run against `$GITHUB_WORKFLOW` is unsafe wherever `run-name:` is
       set - it can silently never match, leaving the guard inert with no signal. A filename can't
       drift that way (`workflowDatabaseId` also works).
-    - **A workflow with no runs yet is not an error.** `gh` reports it as `HTTP 404` when you pass
-      a **filename** but as `could not find any workflows named` when you pass a **display name**,
-      so a tolerant branch has to match both spellings. Get this wrong and a workflow that guards
-      *itself* is permanently unrunnable - it 404s on its own file until it has merged and run,
-      which it now never can.
+    - **Do NOT add a tolerant branch for a name that fails to resolve.** It is tempting, because
+      an unmerged workflow really does 404 on its own file - but that symptom is an artefact of
+      testing from a branch, not something a real run can hit. Two measured facts close it:
+      `workflow_dispatch` only triggers from the **default branch**, so such a workflow cannot run
+      before it merges; and a workflow present on the default branch with **zero runs** lists as
+      `rc=0` + empty, *not* 404. Only an absent workflow 404s. So at runtime every name resolves,
+      and a tolerant branch can only ever fire on a renamed/mistyped entry or a descoped token -
+      both of which it would then wave through while silently watching nothing. Fail on any name
+      that does not resolve, and say in the message that the cause is either a wrong name or an
+      unreachable repo, because `gh` reports both as 404 and they are indistinguishable there.
     - **Include your own workflow in the watch list, excluding only your own run id.** A guard that
-      watches the *other* writers but not itself lets two dispatches pass each other.
+      watches the *other* writers but not itself lets two dispatches pass each other. Name it by
+      filename like the rest - never a hardcoded `SELF=` literal compared against the loop
+      variable, which a rename leaves stale and silently unmatched. If you genuinely need the
+      running workflow's own identity, derive it from `github.workflow_ref`
+      (`owner/repo/.github/workflows/<file>@<ref>`), never a literal.
 
 ## Common mistakes (from review history, don't re-litigate)
 
@@ -375,11 +384,15 @@ history for that exact file.
 | A dispatched input appeared in the log as its own `::error::`/`::add-mask::` | The value was echoed into a workflow command *before* being validated; a newline plus `::` injects | Report `${#VAR}` or a sanitised form until the value is known well-formed |
 | Every space in the job log became `***` | `::add-mask::` registered a whitespace-only line | Guard the mask loop on `${LINE//[[:space:]]/}` and a minimum length |
 | A writer-detection guard never fires | Matched `$GITHUB_WORKFLOW` against gh's `workflowName`, which is the `name:` key, not the `run-name:` | Match by workflow filename or `workflowDatabaseId` |
-| A self-guarding workflow can never run | Its own `--workflow <file>.yml` lookup 404s until it has merged and run once | Treat `HTTP 404` *and* `could not find any workflows named` as "no runs" |
+| A writer-check waves through a descoped token | A "workflow not found" tolerance added to work around a 404 seen while testing from an unmerged branch | Don't add it: `workflow_dispatch` needs the default branch, and a zero-run workflow lists empty rather than 404, so at runtime every name resolves |
 | Rotated credential lost after one failed `gh secret set` | Retry loop only matched HTTP 5xx | Also retry HTTP 429 and HTTP 403 *with* rate-limit/`retry-after` text; a plain 403 is a permanent auth/scope failure. Name the secret and that re-authorization is required on final failure. |
 
 ## Also worth knowing
 
+- **The 5xx-only retry predicate in `check_auth.yml` and `refresh-config-json/action.yml` has not
+  caught up with the rule above.** Both are `grep -qE 'HTTP 5[0-9]{2}'` with `MAX_ATTEMPTS=3`, so
+  the rate-limit 403 / 429 guidance in this skill is currently ahead of those two implementations.
+  Worth knowing before you cite either as the reference to copy - copy the rule, not the file.
 - **`github.run_started_at` does not exist.** It reads like it should, and it is a real field -
   but on the REST *run object*, not in the `github` context (whose properties stop at `run_id`,
   `run_number`, `run_attempt`). Interpolated it yields an empty string silently. Get a run's
