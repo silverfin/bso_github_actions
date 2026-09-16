@@ -234,8 +234,11 @@ history for that exact file.
     failure into a green gate.** A job with `needs: upstream` and no job-level `if:` is
     *skipped*, not failed, when `upstream` fails, and branch protection counts `skipped` (and
     `neutral`) as passing. Verified on be_market, where `test-templates` is the only required
-    check: PRs #3174 and #3124 both merged with it skipped. Any job that backs a required check
-    must run and fail on its own:
+    check: PRs #3174 and #3124 both merged with it skipped. (Those two skipped via a job-level
+    `if:` on a changed-files output, not via an upstream failure - they prove that skipped passes
+    protection, which is the load-bearing half, not that the upstream-failure path has fired. When
+    citing a merged PR as evidence, read the workflow *as of that PR*, not as of `main`.) Any job
+    that backs a required check must run and fail on its own:
     ```yaml
     my-required-job:
       needs: upstream
