@@ -242,7 +242,7 @@ history for that exact file.
     ```yaml
     my-required-job:
       needs: upstream
-      if: ${{ !cancelled() }}   # not the implicit default, and not always()
+      if: ${{ always() }}   # NOT the implicit default, and NOT !cancelled()
       steps:
         - name: Fail if upstream did not succeed
           if: ${{ needs.upstream.result != 'success' }}
@@ -250,8 +250,20 @@ history for that exact file.
             echo "::error::upstream did not succeed - failing so the required check stays red"
             exit 1
     ```
-    `!cancelled()` rather than `always()` so a genuinely cancelled run still reports cancelled
-    instead of manufacturing a failure.
+    **`!cancelled()` looks like the polite choice here and is the wrong one.** A job whose `if:`
+    evaluates false on a cancelled run reports **skipped** - which passes protection - where the
+    same job with no `if:` at all would have reported **cancelled**, which blocks. So
+    `!cancelled()` reopens the hole for the window between a cancel and the job starting. Use
+    `always()` and let the guard step turn a non-success upstream into a real failure. Keep the
+    guard's predicate (`!= 'success'`) identical to whatever a downstream alert branches on -
+    guarding on `!= 'success'` while the alert tests `== 'failure'` sends `cancelled` and
+    `skipped` down the wrong branch.
+
+    **Watch the `needs` outputs you read in job-level `env:` once the job runs on `always()`.**
+    An upstream failure yields an *empty* output, and `'' != '[]'` is **true** - a condition like
+    `env: HAS_X: ${{ needs.up.outputs.list != '[]' }}` then gates every dependent step OPEN, with
+    only the guard step's ordering stopping the job from proceeding on nothing. Add the `!= ''`
+    half to the condition rather than relying on step order.
 
     **The corollary bites any dispatch-based retry.** A `workflow_dispatch` run's check runs
     anchor to the dispatched ref's commit - the PR head SHA - and required checks match by name
@@ -263,6 +275,26 @@ history for that exact file.
     360. A job whose real work is a sleep plus two `gh` calls will, on one hung API call, hold
     back the alert that `needs:` it for six hours - and the alert is usually the thing you added
     the job to protect.
+
+14. **A `workflow_dispatch` input that selects a diff range cannot be validated by shape.** If a
+    dispatched input picks what a run compares against (a `base_sha` for
+    `tj-actions/changed-files`, a tag, a range), a well-formed value is not a safe one: any base
+    that already *contains* the dispatched commit yields an empty changed-file list by
+    construction - the default branch's tip once the branch has merged, a same-tree branch or tag,
+    a later commit on the same branch. The run then passes having tested nothing, and if that job
+    backs a required check (see 12) the gate goes green. Assert reachability, in this direction:
+    ```bash
+    # The head must not already be reachable FROM the base.
+    if git merge-base --is-ancestor "${GITHUB_SHA}" "${BASE_SHA}"; then
+      echo "::error::base already contains the dispatched commit - the diff would be empty"
+      exit 1
+    fi
+    ```
+    The opposite assertion is a bug: `pull_request.base.sha` is the base-*branch tip* and
+    legitimately is **not** an ancestor of the head, so `--is-ancestor BASE HEAD` rejects
+    legitimate runs. Run the check inside `if` so a base missing from the checkout doesn't abort
+    under `-e`; `fail_on_initial_diff_error: true` catches that case downstream. Note also that
+    `required: true` on a dispatch input is a *presence* check, not a non-empty one.
 
 ## Common mistakes (from review history, don't re-litigate)
 
@@ -281,6 +313,9 @@ history for that exact file.
 | A required check went green on a run that tested nothing | A job feeding it was `skipped` (upstream failed), and `skipped` passes branch protection | `if: !cancelled()` plus a fail-if-upstream-failed first step - see checklist 12 |
 | A `workflow_dispatch` input arrived empty despite `required: true` | `required` is a presence check, not a non-empty one; empty then falls through an `&&/||` ternary to the next branch | Validate the input's shape in a first step (e.g. `^[0-9a-f]{40}$` for a SHA) |
 | `tj-actions/changed-files` started hard-failing on `push`/`pull_request` after a retry fix | `fail_on_initial_diff_error` is global, not per-event - a force-pushed `event.before` or a rebased PR base is now fatal too | Intended, but document it and test both paths, not just the one you added it for |
+| Cancelling a run left a required check *passing* | The job carried `if: !cancelled()`, so it reported `skipped` (passes) instead of `cancelled` (blocks) | `always()` plus a guard step - see checklist 12 |
+| A dependent step ran even though its upstream job failed | Job-level `env:` read an empty `needs.*.outputs.*`, and `'' != '[]'` is **true** | Add the `!= ''` half to the condition; don't rely on a guard step's ordering |
+| A dispatched input appeared in the log as its own `::error::`/`::add-mask::` | The value was echoed into a workflow command *before* being validated; a newline plus `::` injects | Report `${#VAR}` or a sanitised form until the value is known well-formed |
 | Rotated credential lost after one failed `gh secret set` | Retry loop only matched HTTP 5xx | Also retry HTTP 429 and HTTP 403 *with* rate-limit/`retry-after` text; a plain 403 is a permanent auth/scope failure. Name the secret and that re-authorization is required on final failure. |
 
 ## Also worth knowing
