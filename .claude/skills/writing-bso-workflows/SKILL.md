@@ -79,6 +79,19 @@ history for that exact file.
      the `set +e`/`set -e` pair - use `set +e ... set -e` only when you capture or check every
      command's status before re-enabling `-e`, not just the one you care about.
      Don't rely on pipefail unless you've added `shell: bash` yourself.
+   - **A guard placed *after* a bare capture never runs for the failure it describes.**
+     `VAR=$(gh ...)` followed by `if [[ -z "${VAR}" ]]; then echo "::error::..."` only covers
+     the case where the command *succeeded* and printed nothing - under `-e` a real API, auth
+     or rate-limit failure aborts at the assignment itself and the carefully-worded message
+     never prints, leaving a bare exit code. When you want a **diagnostic** rather than a
+     status, capture with `if !` and keep the emptiness check as a separate second case:
+     ```bash
+     if ! VAR=$(gh run view "${RUN_ID}" --json createdAt --jq '.createdAt // empty'); then
+       echo "::error::could not query ... (check the PAT's actions:read scope)"
+       exit 1
+     fi
+     if [[ -z "${VAR}" ]]; then echo "::error::... came back empty"; exit 1; fi
+     ```
 
 4. **`$GITHUB_OUTPUT` multiline values need a `key<<DELIMITER` heredoc** - `echo "key=$val"`
    truncates at the first newline. If the value can contain arbitrary/untrusted content
@@ -106,6 +119,23 @@ history for that exact file.
    at most as stale as the queue-time snapshot (e.g. an access token still well inside its
    normal validity window) - know which case you're in before assuming `needs:` bought you
    freshness.
+
+   **A `concurrency:` group does NOT fix a stale-snapshot race between two runs** - it is the
+   obvious-looking fix and it does not work. Serializing makes the second run *wait*, but its
+   snapshot was already taken when it was **queued**, so it still writes back a blob predating
+   the first run's write. The winner's write is reverted just as silently, only later. For a
+   read-whole-blob/write-whole-blob secret the workable pattern is **detect and refuse**: check
+   for other writers and fail loudly, rather than queueing behind them.
+
+   **A guard that looks for other writers has to count its own workflow.** A run-listing check
+   that names the *other* writers but not itself lets two dispatches of the same workflow pass
+   each other, and the second reverts the first. Match on `$GITHUB_WORKFLOW` (not a hand-copied
+   literal name) and exclude only your own run id. Two shapes are fatal, not one: a writer still
+   in flight, **and** a writer that already completed *after* your run was queued - the latter is
+   the one a naive `status != "completed"` filter misses, and it is precisely the write you are
+   about to revert. Size any `gh run list --limit` against the longest writer's wall-clock, not a
+   run count (in a busy repo 30 runs can be well under an hour, while a single test run has taken
+   ~52m).
 
 6. **`tj-actions/changed-files` needs `safe_output: false` and `quotepath: false`** when
    piping its output through `jq`. The default `safe_output: true` backslash-escapes shell
@@ -156,6 +186,39 @@ history for that exact file.
    `@main` callers, or coordinate the merge explicitly; this is why this repo's own merge
    policy restricts changes to "non-breaking for the non-pilot markets."
 
+10. **Workflow commands are line-based - a newline ends the command.** Verified directly:
+    `echo "::add-mask::${VAL}"` on a two-line value registers **only the first line** as a mask
+    and `echo` prints the second line into the log verbatim. `inputs.*` is never auto-masked
+    (unlike `secrets.*`), so a one-time credential arriving as a `workflow_dispatch` input is
+    exactly the value most at risk. Mask line by line:
+    ```bash
+    while IFS= read -r LINE; do
+      if [[ -n "${LINE}" ]]; then echo "::add-mask::${LINE}"; fi
+    done <<< "${VAL}"
+    ```
+    The same line-orientation applies to `::error::`/`::warning::`: interpolating
+    server-controlled text (an API `error_description`, a CLI's stderr) that contains a newline
+    pushes everything after it out of the annotation and into the raw log, so the operator sees
+    a message that trails off mid-sentence. Flatten before interpolating -
+    `"${MSG//$'\n'/ }"` - which also keeps a hostile response from opening a
+    `::stop-commands::` of its own.
+    Separately: **a `workflow_dispatch` input is retained in the run's metadata** and stays
+    readable by anyone with repo read access. Masking hides it from the *log*, not from that
+    record - so a guard that aborts before spending a one-time code should tell the operator to
+    discard it, not to re-run with it.
+
+11. **Validate a JSON field's type before writing it into a credential - `jq -r` is not a
+    validator.** Two distinct traps, both of which pass a naive non-empty check:
+    - `jq -r '.x // "default"'` on an **empty** body exits 0 printing **nothing**, so the `//`
+      alternative never fires and your default silently doesn't apply (an empty body is a normal
+      proxy 502/504). Check `-z` on the result as well as relying on `//`.
+    - `jq -r` renders *any* JSON type as text, so `true`, `123` or `{}` all produce non-empty
+      output and sail through `[[ -z ... ]]`. Before storing a token, assert the type:
+      ```bash
+      jq -e '(.access_token | (type == "string" and length > 0))
+         and (.refresh_token | (type == "string" and length > 0))' response.json > /dev/null
+      ```
+
 ## Common mistakes (from review history, don't re-litigate)
 
 | Symptom | Cause | Fix |
@@ -166,10 +229,22 @@ history for that exact file.
 | `actionlint` flags `concurrency.queue: max` as an unknown key | actionlint's schema predates this real GitHub Actions beta feature | Known false positive - don't "fix" it, don't downgrade to `queue: single`. `queue: max` and `cancel-in-progress: true` are mutually exclusive - don't add the latter alongside it |
 | PR comment markdown breaks on one specific template | Raw backtick/pipe interpolated into a code span or table cell | CommonMark fencing, or `tr -d` in table cells |
 | A workflow_call output looks empty even though the step set it | Caller didn't use `if: always()` to read it after a later step failed | Add `if: always()` on the consuming step |
+| Only the first line of a multi-line secret ends up masked | `::add-mask::` is a line-based command; `inputs.*` isn't auto-masked | Register one mask per line |
+| An `::error::` annotation trails off mid-sentence | Server-controlled text contained a newline; the rest fell out of the annotation | Flatten to one line before interpolating |
+| A `jq -r '.x // "fallback"'` fallback silently didn't apply | Empty response body - jq exits 0 printing nothing, so `//` never fires | Also `-z`-check the captured result |
+| Two runs of the same workflow reverted each other's secret write | The writer-guard listed the *other* writers but not itself | Match `$GITHUB_WORKFLOW` too, excluding only your own run id |
 | Rotated credential lost after one failed `gh secret set` | Retry loop only matched HTTP 5xx | Also retry HTTP 429 and HTTP 403 *with* rate-limit/`retry-after` text; a plain 403 is a permanent auth/scope failure. Name the secret and that re-authorization is required on final failure. |
 
 ## Also worth knowing
 
+- **`github.run_started_at` does not exist.** It reads like it should, and it is a real field -
+  but on the REST *run object*, not in the `github` context (whose properties stop at `run_id`,
+  `run_number`, `run_attempt`). Interpolated it yields an empty string silently. Get a run's
+  timestamps from `gh run view "${GITHUB_RUN_ID}" --json createdAt,startedAt` instead; prefer
+  `createdAt` when you want the conservative anchor, since the two diverge on a re-run.
+  More generally: **actionlint validates context properties**, so it catches an invented one
+  immediately - run it before trusting any suggested `${{ github.* }}` expression, including one
+  from a reviewer.
 - `permissions: contents: write` is usually unnecessary - checkout needs `read`, and
   `gh secret set` authenticates via `GH_TOKEN`/`GITHUB_TOKEN` (`gh`'s recognized env vars) -
   map `secrets.REPO_ACCESS_TOKEN` to `GH_TOKEN` in the step's `env:`, not the implicit token.
