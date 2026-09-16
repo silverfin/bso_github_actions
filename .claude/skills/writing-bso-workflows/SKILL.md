@@ -98,9 +98,13 @@ history for that exact file.
    (template output, PR text), don't use a fixed delimiter string - generate one and verify
    it doesn't collide with the content first.
 
-5. **Repository/organization `secrets.*` are snapshotted at queue time** (environment secrets
-   are read when a job referencing that environment starts, not queue time - this repo doesn't
-   use environments, so queue-time is what applies here). A job that `gh secret set`s a
+5. **Repository/organization `secrets.*` are snapshotted when the run is CREATED** - not when
+   its jobs start, and not re-read mid-run (environment secrets are read when a job referencing
+   that environment starts - this repo doesn't use environments, so run-creation is what applies
+   here). Measured on be_market's `experiment_secret_snapshot`: run B was created seconds
+   *before* run A's write landed and started its job two minutes *after* it, and still read the
+   pre-write value. "Queue time" is the same moment loosely, but the precision matters - see the
+   dispatch note at the end of this point. A job that `gh secret set`s a
    refreshed value does NOT change what a later job in the *same run* reads via
    `${{ secrets.X }}`. **Merge the writer and the consumer into one job** - this repo's actual
    fix for this exact problem (`push_to_review_firm.yml`'s refresh-then-push). Don't hand off a
@@ -136,6 +140,13 @@ history for that exact file.
    about to revert. Size any `gh run list --limit` against the longest writer's wall-clock, not a
    run count (in a busy repo 30 runs can be well under an hour, while a single test run has taken
    ~52m).
+
+   **Dispatching a fresh run is the only way to pick up another job's secret write, and it is
+   not a guarantee.** Because the snapshot is taken at run creation, the `gh workflow run` call
+   *is* the snapshot point. So a deliberate delay before dispatching is load-bearing for
+   freshness, not just anti-collision jitter - dispatch instantly and the new run can snapshot
+   the same stale value and fail identically. Don't write "guaranteed to see the winner's
+   write"; it is the only option that *can* see it.
 
 6. **`tj-actions/changed-files` needs `safe_output: false` and `quotepath: false`** when
    piping its output through `jq`. The default `safe_output: true` backslash-escapes shell
@@ -219,6 +230,37 @@ history for that exact file.
          and (.refresh_token | (type == "string" and length > 0))' response.json > /dev/null
       ```
 
+12. **A SKIPPED job satisfies a required status check - so `needs:` alone turns an upstream
+    failure into a green gate.** A job with `needs: upstream` and no job-level `if:` is
+    *skipped*, not failed, when `upstream` fails, and branch protection counts `skipped` (and
+    `neutral`) as passing. Verified on be_market, where `test-templates` is the only required
+    check: PRs #3174 and #3124 both merged with it skipped. Any job that backs a required check
+    must run and fail on its own:
+    ```yaml
+    my-required-job:
+      needs: upstream
+      if: ${{ !cancelled() }}   # not the implicit default, and not always()
+      steps:
+        - name: Fail if upstream did not succeed
+          if: ${{ needs.upstream.result != 'success' }}
+          run: |
+            echo "::error::upstream did not succeed - failing so the required check stays red"
+            exit 1
+    ```
+    `!cancelled()` rather than `always()` so a genuinely cancelled run still reports cancelled
+    instead of manufacturing a failure.
+
+    **The corollary bites any dispatch-based retry.** A `workflow_dispatch` run's check runs
+    anchor to the dispatched ref's commit - the PR head SHA - and required checks match by name
+    with the latest winning. So a retry run supersedes the original red check. If anything in
+    that retry can skip or no-op the required job, the retry is a way to turn the gate green
+    having tested nothing. Check that before adding a retry, not after.
+
+13. **Give any job a downstream alert `needs:` an explicit `timeout-minutes`.** The default is
+    360. A job whose real work is a sleep plus two `gh` calls will, on one hung API call, hold
+    back the alert that `needs:` it for six hours - and the alert is usually the thing you added
+    the job to protect.
+
 ## Common mistakes (from review history, don't re-litigate)
 
 | Symptom | Cause | Fix |
@@ -233,6 +275,9 @@ history for that exact file.
 | An `::error::` annotation trails off mid-sentence | Server-controlled text contained a newline; the rest fell out of the annotation | Flatten to one line before interpolating |
 | A `jq -r '.x // "fallback"'` fallback silently didn't apply | Empty response body - jq exits 0 printing nothing, so `//` never fires | Also `-z`-check the captured result |
 | Two runs of the same workflow reverted each other's secret write | The writer-guard listed the *other* writers but not itself | Match `$GITHUB_WORKFLOW` too, excluding only your own run id |
+| A required check went green on a run that tested nothing | A job feeding it was `skipped` (upstream failed), and `skipped` passes branch protection | `if: !cancelled()` plus a fail-if-upstream-failed first step - see checklist 12 |
+| A `workflow_dispatch` input arrived empty despite `required: true` | `required` is a presence check, not a non-empty one; empty then falls through an `&&/||` ternary to the next branch | Validate the input's shape in a first step (e.g. `^[0-9a-f]{40}$` for a SHA) |
+| `tj-actions/changed-files` started hard-failing on `push`/`pull_request` after a retry fix | `fail_on_initial_diff_error` is global, not per-event - a force-pushed `event.before` or a rebased PR base is now fatal too | Intended, but document it and test both paths, not just the one you added it for |
 | Rotated credential lost after one failed `gh secret set` | Retry loop only matched HTTP 5xx | Also retry HTTP 429 and HTTP 403 *with* rate-limit/`retry-after` text; a plain 403 is a permanent auth/scope failure. Name the secret and that re-authorization is required on final failure. |
 
 ## Also worth knowing
