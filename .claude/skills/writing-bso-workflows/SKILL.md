@@ -254,11 +254,18 @@ history for that exact file.
       if: ${{ always() }}   # NOT the implicit default, and NOT !cancelled()
       steps:
         - name: Fail if upstream did not succeed
-          if: ${{ needs.upstream.result != 'success' }}
+          # `cancelled()` too - see below
+          if: ${{ cancelled() || needs.upstream.result != 'success' }}
           run: |
             echo "::error::upstream did not succeed - failing so the required check stays red"
             exit 1
     ```
+    **`always()` hands the cancel window back to you, so pay it in the guard.** `always()` runs
+    the job even when the workflow is cancelled, so a cancel landing *after* the upstream already
+    succeeded would start the job's real work on a run someone deliberately killed - on a long
+    job that is expensive. Adding `cancelled()` to the guard keeps the blocking-not-skipped
+    property (the job still reports `failure`) while stopping the work from starting. Only the
+    clean success-and-not-cancelled path should reach the real steps.
     **`!cancelled()` looks like the polite choice here and is the wrong one.** A job whose `if:`
     evaluates false on a cancelled run reports **skipped** - which passes protection - where the
     same job with no `if:` at all would have reported **cancelled**, which blocks. So
