@@ -201,18 +201,27 @@ history for that exact file.
     `echo "::add-mask::${VAL}"` on a two-line value registers **only the first line** as a mask
     and `echo` prints the second line into the log verbatim. `inputs.*` is never auto-masked
     (unlike `secrets.*`), so a one-time credential arriving as a `workflow_dispatch` input is
-    exactly the value most at risk. Mask line by line:
+    exactly the value most at risk. Mask line by line - but **guard what you register**, because
+    `::add-mask::` on a whitespace-only or 1-2 character value makes the runner replace that text
+    *everywhere* for the rest of the job, redacting the very `::error::` diagnostics you rely on.
+    `[[ -n "${LINE}" ]]` is not a sufficient guard: a line of spaces passes it.
     ```bash
     while IFS= read -r LINE; do
-      if [[ -n "${LINE}" ]]; then echo "::add-mask::${LINE}"; fi
+      # Non-blank after stripping whitespace, AND long enough to be a real secret.
+      if [[ -n "${LINE//[[:space:]]/}" && "${#LINE}" -ge 8 ]]; then
+        echo "::add-mask::${LINE}"
+      fi
     done <<< "${VAL}"
     ```
+    Apply the same loop to *every* secret in the step, not just the input one - a token read back
+    from an API response deserves it as much as a pasted code does.
     The same line-orientation applies to `::error::`/`::warning::`: interpolating
     server-controlled text (an API `error_description`, a CLI's stderr) that contains a newline
     pushes everything after it out of the annotation and into the raw log, so the operator sees
-    a message that trails off mid-sentence. Flatten before interpolating -
-    `"${MSG//$'\n'/ }"` - which also keeps a hostile response from opening a
-    `::stop-commands::` of its own.
+    a message that trails off mid-sentence. Flatten before interpolating, and strip a bare
+    **carriage return** too - the runner breaks lines on `\r` as well as `\n`, so stripping only
+    `\n` still lets a hostile response start its own line and open a `::stop-commands::`:
+    `"${MSG//[$'\n'$'\r']/ }"`.
     Separately: **a `workflow_dispatch` input is retained in the run's metadata** and stays
     readable by anyone with repo read access. Masking hides it from the *log*, not from that
     record - so a guard that aborts before spending a one-time code should tell the operator to
@@ -296,6 +305,33 @@ history for that exact file.
     under `-e`; `fail_on_initial_diff_error: true` catches that case downstream. Note also that
     `required: true` on a dispatch input is a *presence* check, not a non-empty one.
 
+15. **`gh run list` is a window sized in RUNS, not time - and it is repo-wide.** If you are
+    listing runs to detect another workflow that might be writing the same thing you are, a bare
+    `--limit N` is the wrong tool: unrelated high-frequency workflows crowd the ones you care
+    about out of the window. Measured in `be_market`: the last 100 runs spanned **1h51m**, 54 of
+    them a single label workflow - against a job timeout of 120m, so a long-running writer could
+    sit entirely outside the window and the check would pass while it was still about to write.
+    Query **per workflow** instead, which gives each one its own window (the same 50-run limit
+    reached back days per writer):
+    ```bash
+    for WF in run_tests.yml refresh_token.yml push_to_review_firm.yml; do
+      gh run list --workflow "${WF}" --limit 50 --json databaseId,status,url,updatedAt
+    done
+    ```
+    Three traps in that loop, all verified:
+    - **Identify the workflow by filename, not display name.** `gh run list`'s `workflowName` is
+      the workflow's `name:` key, while the run's `name`/`displayTitle` carry the evaluated
+      `run-name:`. So matching a run against `$GITHUB_WORKFLOW` is unsafe wherever `run-name:` is
+      set - it can silently never match, leaving the guard inert with no signal. A filename can't
+      drift that way (`workflowDatabaseId` also works).
+    - **A workflow with no runs yet is not an error.** `gh` reports it as `HTTP 404` when you pass
+      a **filename** but as `could not find any workflows named` when you pass a **display name**,
+      so a tolerant branch has to match both spellings. Get this wrong and a workflow that guards
+      *itself* is permanently unrunnable - it 404s on its own file until it has merged and run,
+      which it now never can.
+    - **Include your own workflow in the watch list, excluding only your own run id.** A guard that
+      watches the *other* writers but not itself lets two dispatches pass each other.
+
 ## Common mistakes (from review history, don't re-litigate)
 
 | Symptom | Cause | Fix |
@@ -316,6 +352,9 @@ history for that exact file.
 | Cancelling a run left a required check *passing* | The job carried `if: !cancelled()`, so it reported `skipped` (passes) instead of `cancelled` (blocks) | `always()` plus a guard step - see checklist 12 |
 | A dependent step ran even though its upstream job failed | Job-level `env:` read an empty `needs.*.outputs.*`, and `'' != '[]'` is **true** | Add the `!= ''` half to the condition; don't rely on a guard step's ordering |
 | A dispatched input appeared in the log as its own `::error::`/`::add-mask::` | The value was echoed into a workflow command *before* being validated; a newline plus `::` injects | Report `${#VAR}` or a sanitised form until the value is known well-formed |
+| Every space in the job log became `***` | `::add-mask::` registered a whitespace-only line | Guard the mask loop on `${LINE//[[:space:]]/}` and a minimum length |
+| A writer-detection guard never fires | Matched `$GITHUB_WORKFLOW` against gh's `workflowName`, which is the `name:` key, not the `run-name:` | Match by workflow filename or `workflowDatabaseId` |
+| A self-guarding workflow can never run | Its own `--workflow <file>.yml` lookup 404s until it has merged and run once | Treat `HTTP 404` *and* `could not find any workflows named` as "no runs" |
 | Rotated credential lost after one failed `gh secret set` | Retry loop only matched HTTP 5xx | Also retry HTTP 429 and HTTP 403 *with* rate-limit/`retry-after` text; a plain 403 is a permanent auth/scope failure. Name the secret and that re-authorization is required on final failure. |
 
 ## Also worth knowing
