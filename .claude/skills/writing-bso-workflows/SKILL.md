@@ -266,6 +266,20 @@ history for that exact file.
     job that is expensive. Adding `cancelled()` to the guard keeps the blocking-not-skipped
     property (the job still reports `failure`) while stopping the work from starting. Only the
     clean success-and-not-cancelled path should reach the real steps.
+
+    **`cancelled()` is only available in `jobs.<id>.if` and `jobs.<id>.steps.if`** - you cannot
+    pass it through `env:` into a script, and a plain YAML parse won't tell you (actionlint will).
+    So use two steps rather than one step with a branching message:
+    ```yaml
+    - name: Stop a cancelled run before the work starts
+      if: ${{ cancelled() }}
+      run: echo "::error::run cancelled"; exit 1
+    - name: Fail if upstream did not succeed
+      if: ${{ !cancelled() && needs.upstream.result != 'success' }}
+      run: echo "::error::upstream did not succeed"; exit 1
+    ```
+    A downstream job that needs to know the run was cancelled has the same restriction - key off
+    `needs.<up>.result == 'cancelled'`, which *is* allowed in `env:`.
     **`!cancelled()` looks like the polite choice here and is the wrong one.** A job whose `if:`
     evaluates false on a cancelled run reports **skipped** - which passes protection - where the
     same job with no `if:` at all would have reported **cancelled**, which blocks. So
