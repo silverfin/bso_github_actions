@@ -42,6 +42,11 @@ on:
         required: false
         type: string
         default: ""
+      shared_parts:
+        description: "Shared part names to sample, ONE PER LINE (directory names under shared_parts/). Newline-separated. A name starting with '-' is rejected (the CLI would parse it as an option). Optional if handles or account_templates is set. The backend expands each shared part to every RT/ADT that includes it, so one name here can fan out to many rendered templates."
+        required: false
+        type: string
+        default: ""
       firm_ids:
         description: "Firm id(s) to sample against, space-separated. The backend 422s if empty."
         required: true
@@ -105,10 +110,11 @@ jobs:
         env:
           HANDLES: ${{ inputs.handles }}
           ACCOUNT_TEMPLATES: ${{ inputs.account_templates }}
+          SHARED_PARTS: ${{ inputs.shared_parts }}
           FIRM_IDS: ${{ inputs.firm_ids }}
         run: |
-          if [[ -z "${HANDLES//[[:space:]]/}" && -z "${ACCOUNT_TEMPLATES//[[:space:]]/}" ]]; then
-            echo "::error::Neither handles nor account_templates was supplied — nothing to sample."
+          if [[ -z "${HANDLES//[[:space:]]/}" && -z "${ACCOUNT_TEMPLATES//[[:space:]]/}" && -z "${SHARED_PARTS//[[:space:]]/}" ]]; then
+            echo "::error::None of handles, account_templates or shared_parts was supplied — nothing to sample."
             exit 1
           fi
           if [[ -z "${FIRM_IDS//[[:space:]]/}" ]]; then
@@ -175,6 +181,7 @@ jobs:
           SAMPLER_PARTNER: ${{ inputs.partner }}
           SAMPLER_HANDLES: ${{ inputs.handles }}
           SAMPLER_ACCOUNT_TEMPLATES: ${{ inputs.account_templates }}
+          SAMPLER_SHARED_PARTS: ${{ inputs.shared_parts }}
           SAMPLER_FIRM_IDS: ${{ inputs.firm_ids }}
         run: |
           # One name per line, and each line becomes exactly ONE CLI arg. Newline-separated (not
@@ -185,18 +192,22 @@ jobs:
           # Same convention as run_tests.yml's TEMPLATE_BUCKETS.
           HANDLE_NAMES=()
           ACCOUNT_NAMES=()
+          SHARED_NAMES=()
           if [[ -n "${SAMPLER_HANDLES//[[:space:]]/}" ]]; then
             mapfile -t HANDLE_NAMES < <(printf '%s\n' "${SAMPLER_HANDLES}" | sed '/^[[:space:]]*$/d')
           fi
           if [[ -n "${SAMPLER_ACCOUNT_TEMPLATES//[[:space:]]/}" ]]; then
             mapfile -t ACCOUNT_NAMES < <(printf '%s\n' "${SAMPLER_ACCOUNT_TEMPLATES}" | sed '/^[[:space:]]*$/d')
           fi
+          if [[ -n "${SAMPLER_SHARED_PARTS//[[:space:]]/}" ]]; then
+            mapfile -t SHARED_NAMES < <(printf '%s\n' "${SAMPLER_SHARED_PARTS}" | sed '/^[[:space:]]*$/d')
+          fi
 
           # A name starting with "-" would be read by the CLI's option parser as a FLAG rather
           # than a value: commander stops consuming a variadic option (-h/-at take <names...>) at
           # the first "-"-prefixed token, and a leading "--" separator does not protect variadic
           # values either. Reject such a name up front instead of letting the CLI silently
-          # reinterpret it as an option. Both lists are checked, so the message names which kind
+          # reinterpret it as an option. All three lists are checked, so the message names which kind
           # of value and which directory to rename.
           reject_option_like_names() {
             local kind="$1" dir="$2"
@@ -211,6 +222,7 @@ jobs:
           }
           reject_option_like_names "Reconciliation handle" "reconciliation_texts/" "${HANDLE_NAMES[@]}"
           reject_option_like_names "Account template name" "account_templates/" "${ACCOUNT_NAMES[@]}"
+          reject_option_like_names "Shared part name" "shared_parts/" "${SHARED_NAMES[@]}"
 
           HANDLE_ARGS=()
           if [[ ${#HANDLE_NAMES[@]} -gt 0 ]]; then
@@ -219,6 +231,10 @@ jobs:
           ACCOUNT_ARGS=()
           if [[ ${#ACCOUNT_NAMES[@]} -gt 0 ]]; then
             ACCOUNT_ARGS=(-at "${ACCOUNT_NAMES[@]}")
+          fi
+          SHARED_ARGS=()
+          if [[ ${#SHARED_NAMES[@]} -gt 0 ]]; then
+            SHARED_ARGS=(-s "${SHARED_NAMES[@]}")
           fi
 
           # GitHub Actions concurrency (group + queue: max) serializes runs within THIS repo, but
@@ -231,11 +247,11 @@ jobs:
           while true; do
             # %q-quoted so a name containing spaces is visibly one argument in the log.
             printf '[%s] run-sampler attempt %s: -p %s' "$(date -u +%H:%M:%S)" "${ATTEMPT}" "${SAMPLER_PARTNER}"
-            printf ' %q' "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}"
+            printf ' %q' "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" "${SHARED_ARGS[@]}"
             printf ' --firm-ids %s --compact\n' "${SAMPLER_FIRM_IDS}"
             set +e
             # shellcheck disable=SC2086 # SAMPLER_FIRM_IDS is intentionally word-split (space-separated ids -> separate args)
-            OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1 | tr -d '\r')
+            OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" "${SHARED_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1 | tr -d '\r')
             RC=$?
             set -e
             echo "----- run-sampler output (exit ${RC}) -----"
@@ -376,6 +392,7 @@ jobs:
           PARTNER: ${{ inputs.partner }}
           HANDLES: ${{ inputs.handles }}
           ACCOUNT_TEMPLATES: ${{ inputs.account_templates }}
+          SHARED_PARTS: ${{ inputs.shared_parts }}
           FIRM_IDS: ${{ inputs.firm_ids }}
           SAMPLER_OK: ${{ steps.sampler.outputs.sampler_ok }}
           REPORT_URL: ${{ steps.sampler.outputs.report_url }}
@@ -423,6 +440,7 @@ jobs:
             const fmtNames = v => (v || "").split("\n").map(s => s.trim()).filter(Boolean).map(codeSpan).join(", ");
             if (process.env.HANDLES) lines.push(`- Reconciliation handles: ${fmtNames(process.env.HANDLES)}`);
             if (process.env.ACCOUNT_TEMPLATES) lines.push(`- Account templates: ${fmtNames(process.env.ACCOUNT_TEMPLATES)}`);
+            if (process.env.SHARED_PARTS) lines.push(`- Shared parts: ${fmtNames(process.env.SHARED_PARTS)} (expanded server-side to every template that includes them)`);
             lines.push(`- Firm(s): \`${process.env.FIRM_IDS}\``);
             if (artifactUrl) {
               lines.push(`- **[📊 Open full sampler report](${artifactUrl})** (GitHub sign-in required; downloads \`results.zip\`, kept 7 days)`);
