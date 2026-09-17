@@ -1,11 +1,13 @@
 # Reusable workflow. Runs the Liquid Sampler (silverfin-cli `run-sampler`) for a single
-# partner's changed reconciliation/account templates and posts the result on a PR.
+# partner's changed reconciliation texts, account templates and shared parts and posts
+# the result on a PR.
 #
 # This is deliberately partner-agnostic and repo-layout-agnostic: given a partner id, a list
-# of already-classified handles/account templates, and firm ids, it loads that partner's
-# credentials, runs the sampler, and reports back. All market-specific logic (which templates
-# changed, which partner they belong to) lives in the calling wrapper — see
-# docs/liquid_sampler.md and the CI_AUTH_SAMPLER_PLAN.md design notes (§6, §8) this implements.
+# of already-classified handles/account templates/shared parts, and firm ids, it loads that
+# partner's credentials, runs the sampler, and reports back. All market-specific logic (which
+# templates changed, which partner they belong to) lives in the calling wrapper — see
+# docs/liquid_sampler.md and the CI_AUTH_SAMPLER_PLAN.md design notes (§6, §8) this
+# implements.
 #
 # Design decisions this encodes (see plan §6 D1-D9, §8):
 # - Serialized per partner: the backend allows only one sampler run per partner at a time.
@@ -204,7 +206,7 @@ jobs:
           fi
 
           # A name starting with "-" would be read by the CLI's option parser as a FLAG rather
-          # than a value: commander stops consuming a variadic option (-h/-at take <names...>) at
+          # than a value: commander stops consuming a variadic option (-h/-at/-s take <names...>) at
           # the first "-"-prefixed token, and a leading "--" separator does not protect variadic
           # values either. Reject such a name up front instead of letting the CLI silently
           # reinterpret it as an option. All three lists are checked, so the message names which kind
