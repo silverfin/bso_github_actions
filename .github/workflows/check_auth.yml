@@ -118,7 +118,11 @@ jobs:
           # Caps keep failed_firms_summary a single Slack-sized line even with many failures -
           # GitHub's own job-output limit is 1MB, but an unbounded summary would still make a
           # firm-refresh incident unreadable, or push a pathological run over that limit.
-          MAX_ERROR_LINE_LEN=200
+          # 260, not 200: the standard OAuth invalid_grant description is ~228 chars and is the
+          # single most common failure shape here - 200 cut it mid-sentence every time for no
+          # benefit, since the message is fixed boilerplate, not per-incident detail worth
+          # trimming.
+          MAX_ERROR_LINE_LEN=260
           MAX_SUMMARY_LEN=4000
           if [[ "${SEED_NO_AUTO_RENEW}" == "true" ]]; then
             # Read the incoming state *before* seeding. The line printed afterwards cannot tell "the
@@ -177,9 +181,8 @@ jobs:
               # silverfin-cli's refreshFirm always ends an HTTP failure with a generic "try
               # running the authentication process again" line - tail -1 would report only that,
               # dropping the actual "Response Status: 401 (...)" / "Error description: ..." lines
-              # printed just before it. Prefer those; fall back to the last non-empty line for any
-              # other failure shape (e.g. a network error with no HTTP response at all).
-              # `|| true` on both: under this shell's `-e`/`pipefail`, a `grep` with no match
+              # printed just before it. Prefer those, then the fallback tiers below.
+              # `|| true` throughout: under this shell's `-e`/`pipefail`, a `grep` with no match
               # exits 1 and that status survives the pipe into `paste`/`tail`, which would abort
               # the whole step right here on any non-HTTP failure (network error, DNS, etc.) -
               # before the fallback below ever runs, and before failed_firms/refresh_completed
@@ -187,6 +190,14 @@ jobs:
               # cmd)` exits the script without reaching the next line.
               ERROR_LINE=$(grep -E 'Response Status|Error description' /tmp/refresh-"${FIRM_ID}".log | paste -sd' ' - || true)
               if [[ -z "${ERROR_LINE}" ]]; then
+                # A bare network failure (no HTTP response) never matches the grep above. The CLI
+                # always logs a generic "[error] Error refreshing the tokens. Try running the
+                # authentication process again" line first and the actually useful one (e.g.
+                # "[error] read ECONNRESET") right after it - exclude the generic one.
+                ERROR_LINE=$(grep -E '^\[error\]' /tmp/refresh-"${FIRM_ID}".log | grep -v 'Try running the authentication process again' | head -1 || true)
+              fi
+              if [[ -z "${ERROR_LINE}" ]]; then
+                # Last resort: no recognizable [error]/Response Status line at all.
                 ERROR_LINE=$(grep -v '^[[:space:]]*$' /tmp/refresh-"${FIRM_ID}".log | tail -1 || true)
               fi
               # The CLI's own refresh request carries client_secret/refresh_token/access_token,

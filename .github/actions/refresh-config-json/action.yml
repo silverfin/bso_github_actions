@@ -90,7 +90,10 @@ runs:
           exit 1
         fi
         echo "EXPECTED_FIRM_IDS=$(tr '\n' ' ' <<< "${FIRM_IDS}")" >> "$GITHUB_ENV"
-        MAX_ERROR_LINE_LEN=200
+        # 260, not 200: the standard OAuth invalid_grant description is ~228 chars and is the
+        # single most common failure shape here - 200 cut it mid-sentence every time for no
+        # benefit, since the message is fixed boilerplate, not per-incident detail worth trimming.
+        MAX_ERROR_LINE_LEN=260
         MAX_SUMMARY_LEN=4000
         if [[ "${SEED_NO_AUTO_RENEW}" == "true" ]]; then
           if ARRIVED_WITHOUT=$(jq -r 'to_entries | map(select((.key|test("^[0-9]+$")) and (.value|type == "object") and ((.value.autoRenew|type) != "boolean")) | .key) | join(" ")' "$HOME/.silverfin/config.json"); then
@@ -129,6 +132,14 @@ runs:
           if ! node ./node_modules/silverfin-cli/bin/cli.js config --refresh-token "${FIRM_ID}" 2>&1 | tee /tmp/refresh-"${FIRM_ID}".log; then
             ERROR_LINE=$(grep -E 'Response Status|Error description' /tmp/refresh-"${FIRM_ID}".log | paste -sd' ' - || true)
             if [[ -z "${ERROR_LINE}" ]]; then
+              # A bare network failure (no HTTP response) never matches the grep above. The CLI
+              # always logs a generic "[error] Error refreshing the tokens. Try running the
+              # authentication process again" line first and the actually useful one (e.g.
+              # "[error] read ECONNRESET") right after it - exclude the generic one.
+              ERROR_LINE=$(grep -E '^\[error\]' /tmp/refresh-"${FIRM_ID}".log | grep -v 'Try running the authentication process again' | head -1 || true)
+            fi
+            if [[ -z "${ERROR_LINE}" ]]; then
+              # Last resort: no recognizable [error]/Response Status line at all.
               ERROR_LINE=$(grep -v '^[[:space:]]*$' /tmp/refresh-"${FIRM_ID}".log | tail -1 || true)
             fi
             # The CLI's own refresh request carries client_secret/refresh_token/access_token, and
