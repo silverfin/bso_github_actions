@@ -263,7 +263,7 @@ _Prerequisites:_
 #### Run liquid sampler `(run_sampler.yml)`
 
 _Description_:
-Reusable workflow. Runs the Liquid Sampler (`silverfin-cli run-sampler`) for a single partner's changed reconciliation/account templates and posts the result on a PR. It is deliberately partner-agnostic and repo-layout-agnostic: given a partner id, a list of already-classified handles/account templates, and firm ids, it loads that partner's credentials, runs the sampler, and reports back. All market-specific logic (which templates changed, which partner they belong to) lives in the calling wrapper.
+Reusable workflow. Runs the Liquid Sampler (`silverfin-cli run-sampler`) for a single partner's changed reconciliation texts, account templates and shared parts and posts the result on a PR. It is deliberately partner-agnostic and repo-layout-agnostic: given a partner id, a list of already-classified handles/account templates, and firm ids, it loads that partner's credentials, runs the sampler, and reports back. All market-specific logic (which templates changed, which partner they belong to) lives in the calling wrapper.
 
 _Trigger:_
 
@@ -276,6 +276,7 @@ _Inputs:_
 * `account_templates` (optional) — account template names to sample, **one per line** (directory names under `account_templates/`). Optional if `handles` is set.
   * Both lists are newline-separated, **not** space-separated: account template directory names routinely contain spaces (e.g. `Investment- and depreciation details`), so a space-joined list is ambiguous and gets word-split into template names that don't exist (`Config file for account template "Investment-" not found`). Same convention as [`run_tests.yml`](#run-liquid-tests-run_testsyml). `firm_ids` is the exception — numeric, so it stays space-separated.
   * A name that **starts with `-`** is rejected before the CLI is called, and the job fails with the directory to rename. `silverfin-cli`'s `-h`/`-at` are variadic options, so commander stops consuming values at the first `-`-prefixed token and would read such a name as a flag; a `--` separator does not protect variadic values. Only a leading `-` is affected — internal and trailing hyphens (`Cut-off`, `Investment- and depreciation details`) are fine.
+* `shared_parts` (optional) — shared part names to sample, one per line (directory names under `shared_parts/`). Optional if `handles` or `account_templates` is set. The sampler backend expands each shared part to every reconciliation text / account detail template that includes it, so one name here can fan out to many rendered templates — no `used_in` expansion is needed on the caller's side.
 * `firm_ids` (required) — firm id(s) to sample against, space-separated. The backend 422s if empty.
 * `ref` (required) — git ref (commit SHA) to check out — the PR head, so sampled template content matches the PR under review.
 * `pull_request_number` (optional) — PR number to post the result comment on. If empty, no comment is posted (results still upload as an artifact).
