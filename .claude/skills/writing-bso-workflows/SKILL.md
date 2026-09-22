@@ -160,6 +160,9 @@ history for that exact file.
    on an unrelated PR. Pin to an exact commit only for a specific, time-boxed reason, always
    with a comment saying when to revert:
    - **This workflow needs a flag not yet on `main`** - revert once that CLI PR merges.
+     While a pin is in force, check any *new* flag you add against **the pinned commit**, not
+     against `main` - "the CLI has supported this since #236" is about `main` and says nothing
+     about what the workflow actually installs.
    - **A currently-open, unmerged CLI PR touches credential-handling code this workflow relies
      on**, so an ordinary `@main` merge elsewhere could change how secrets are handled here
      with zero visible diff in *this* repo. `push_to_review_firm.yml` pins for this reason
@@ -187,11 +190,23 @@ history for that exact file.
      `refresh-config-json`, deliberately isolating the CI-auth pilot (see silverfin-cli's
      `CI_AUTH_SAMPLER_PLAN.md`). A merge here does NOT reach that caller until its pin is
      bumped.
-   - **Fully forked/inlined - no `uses:` reference at all.** be_market's own `run_tests.yml` is
-     a complete local reimplementation, not a call to this repo's `run_tests.yml`. A merge here
-     never reaches it automatically, under any circumstances - only a human manually re-syncing
-     the fork does. Check for an actual `uses: silverfin/bso_github_actions` line before
-     assuming a market repo's same-named file tracks this one.
+   - **Fully forked/inlined - no `uses:` reference at all.** Two shapes, both live: a permanent
+     local reimplementation (be_market's `run_tests.yml`) and a *temporary* inlined copy carried
+     while something upstream settles (`run_sampler.yml`, inlined in be/nl/lu - so that file
+     currently has **zero** `uses:` consumers and a merge to it changes nothing at runtime).
+     A merge here never reaches either automatically - only a human re-syncing does.
+
+   **Don't state the census from memory - it goes stale.** `push_to_review_firm.yml` was
+   "be_market only" in this repo's own learnings until uk_market added a wrapper. Re-derive it
+   per PR, and against each market's **default branch** (a local checkout can be behind):
+   ```bash
+   for R in be_market nl_market lu_market uk_market; do
+     gh api "repos/silverfin/$R/contents/.github/workflows" --jq '.[].name' | while read -r F; do
+       gh api "repos/silverfin/$R/contents/.github/workflows/$F" --jq .content |
+         base64 --decode | grep -Hn "bso_github_actions" | sed "s|^|$R/$F |"
+     done
+   done
+   ```
 
    Design changes to an *existing* `uses:`-consumed workflow to be backward-compatible for
    `@main` callers, or coordinate the merge explicitly; this is why this repo's own merge
@@ -362,6 +377,39 @@ history for that exact file.
       running workflow's own identity, derive it from `github.workflow_ref`
       (`owner/repo/.github/workflows/<file>@<ref>`), never a literal.
 
+16. **`npm install` inside a checked-out PR tree runs that PR's code with your job secrets.**
+    `npm install <git-url>` still treats the **current directory** as a project, so a PR-added
+    root `package.json`'s `preinstall`/`postinstall` executes with whatever is in the job env at
+    that moment. In a workflow that samples/tests untrusted PR content with real credentials this
+    is the whole ballgame. Install **before** `actions/checkout`, **outside** `$GITHUB_WORKSPACE`:
+    ```yaml
+    - uses: actions/setup-node@v6        # no checkout yet - workspace is empty
+    - name: Install silverfin-cli
+      run: |
+        INSTALL_DIR="${RUNNER_TEMP}/silverfin-cli-install"
+        mkdir -p "${INSTALL_DIR}"
+        npm install --prefix "${INSTALL_DIR}" --ignore-scripts https://github.com/silverfin/silverfin-cli.git
+        echo "SILVERFIN_CLI_BIN=${INSTALL_DIR}/node_modules/silverfin-cli/bin/cli.js" >> "$GITHUB_ENV"
+    - uses: actions/checkout@v6          # now the untrusted tree lands, with npm already done
+    ```
+    `$RUNNER_TEMP` survives checkout's `clean: true`, and `$GITHUB_ENV` is how you carry the
+    resolved path (job-level `env:` cannot use `$RUNNER_TEMP`). **`--ignore-scripts` alone is not
+    the fix** - it suppresses npm's own lifecycle hooks but not a tree `.npmrc` redirecting the
+    registry; the location change is what closes it, and `--ignore-scripts` is depth on top.
+    When you write the rationale comment, name only the secrets that really are **job**-scoped -
+    a step-scoped secret was never reachable, and naming it weakens a correct argument.
+
+17. **Two open PRs can both say MERGEABLE and still conflict with each other.** GitHub computes
+    mergeability against the **base branch only** - it never compares one PR to another. Two PRs
+    branched from the same commit that rewrite the same lines will both show CLEAN, and the
+    second to merge gets the conflict. That matters most when one of them carries a security or
+    correctness fix on the contested line: resolving toward the other side silently reverts it,
+    with no red CI to say so. Before merging either, check the pair directly and state the order:
+    ```bash
+    git merge-tree "$(git merge-base origin/branch-a origin/branch-b)" origin/branch-a origin/branch-b |
+      grep -c '<<<<<<<'
+    ```
+
 ## Common mistakes (from review history, don't re-litigate)
 
 | Symptom | Cause | Fix |
@@ -386,6 +434,10 @@ history for that exact file.
 | A writer-detection guard never fires | Matched `$GITHUB_WORKFLOW` against gh's `workflowName`, which is the `name:` key, not the `run-name:` | Match by workflow filename or `workflowDatabaseId` |
 | A writer-check waves through a descoped token | A "workflow not found" tolerance added to work around a 404 seen while testing from an unmerged branch | Don't add it: `workflow_dispatch` needs the default branch, and a zero-run workflow lists empty rather than 404, so at runtime every name resolves |
 | Rotated credential lost after one failed `gh secret set` | Retry loop only matched HTTP 5xx | Also retry HTTP 429 and HTTP 403 *with* rate-limit/`retry-after` text; a plain 403 is a permanent auth/scope failure. Name the secret and that re-authorization is required on final failure. |
+| Rotated credential lost on a network blip despite a retry loop | The predicate classified by **HTTP status**, and a connection-level `gh` failure (`dial tcp`, `connection reset`, `no such host`, `i/o timeout`, TLS handshake, `context deadline exceeded`) carries no status at all | Add a third arm matching connection-level text - it is the likeliest transient case, not the rarest |
+| The operator read the annotation and missed "needs manual re-authorization" | Raw multi-line tool stderr was interpolated *before* the actionable sentence, and a newline ends the `::error::` command | Flatten (`tr '\n\r' '  '`) **and** put the instruction first, tool output last |
+| A PR's `postinstall` ran with `SF_API_SECRET` in env | `npm install` ran with cwd inside the checked-out PR tree | Install before checkout into `$RUNNER_TEMP` - see checklist 16 |
+| A merge silently reverted another PR's fix to the same line | Both PRs showed MERGEABLE; GitHub only checks each branch against `main` | `git merge-tree` the pair and fix the merge order - see checklist 17 |
 
 ## Also worth knowing
 
