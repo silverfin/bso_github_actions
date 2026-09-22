@@ -7,6 +7,25 @@ on:
         description: "Ensure every firm in this caller's CONFIG_JSON carries an `autoRenew` flag, and fail the job if the CLI drops it. Default false, so a caller that does not pass this sees no change. Note the flag is persisted into the caller's own CONFIG_JSON secret, so one enabled run affects every workflow in *that* repository from then on - it is not scoped to this run, and this workflow has no un-seed path."
         type: boolean
         default: false
+    # Declared so a caller *can* pass a scoped map instead of `secrets: inherit` - GitHub
+    # rejects an explicit `secrets:` map against a reusable workflow with no matching
+    # declaration here, which is exactly what blocked doing this until now. Declaring this
+    # does not change existing callers: `secrets: inherit` keeps working exactly as before:
+    # this is additive, not a breaking change. Narrowing any specific caller off `inherit` is
+    # a separate decision, not made by this change.
+    secrets:
+      SF_API_CLIENT_ID:
+        description: "Silverfin API OAuth client id (silverfin-cli needs it at startup)."
+        required: true
+      SF_API_SECRET:
+        description: "Silverfin API OAuth client secret."
+        required: true
+      CONFIG_JSON:
+        description: "silverfin-cli credentials file content (per-firm OAuth tokens). Refreshed and written back by this workflow's own refresh step."
+        required: true
+      REPO_ACCESS_TOKEN:
+        description: "PAT with permission to write this repository's CONFIG_JSON secret (used by the refresh step's gh secret set)."
+        required: true
     outputs:
       failed_firms:
         description: "Space-separated firm IDs whose token refresh failed this run, if any."
@@ -177,7 +196,12 @@ jobs:
           FAILED_SUMMARY=""
           while IFS= read -r FIRM_ID; do
             echo "[Action] refreshing token for firm ${FIRM_ID}"
-            if ! node ./node_modules/silverfin-cli/bin/cli.js config --refresh-token "${FIRM_ID}" 2>&1 | tee /tmp/refresh-"${FIRM_ID}".log; then
+            # Captured to the log file only, never echoed live to this step's own stdout: the
+            # CLI's error path can echo a request or response body verbatim (client_secret/
+            # refresh_token/access_token included), and only the ERROR_LINE extracted below gets
+            # redacted before going anywhere - a live `tee` would put the unredacted original in
+            # this job's own log first, before that redaction ever runs.
+            if ! node ./node_modules/silverfin-cli/bin/cli.js config --refresh-token "${FIRM_ID}" > /tmp/refresh-"${FIRM_ID}".log 2>&1; then
               # silverfin-cli's refreshFirm always ends an HTTP failure with a generic "try
               # running the authentication process again" line - tail -1 would report only that,
               # dropping the actual "Response Status: 401 (...)" / "Error description: ..." lines

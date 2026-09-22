@@ -129,7 +129,12 @@ runs:
         FAILED_SUMMARY=""
         while IFS= read -r FIRM_ID; do
           echo "[Action] refreshing token for firm ${FIRM_ID}"
-          if ! node ./node_modules/silverfin-cli/bin/cli.js config --refresh-token "${FIRM_ID}" 2>&1 | tee /tmp/refresh-"${FIRM_ID}".log; then
+          # Captured to the log file only, never echoed live to this step's own stdout: the
+          # CLI's error path can echo a request or response body verbatim (client_secret/
+          # refresh_token/access_token included), and only the ERROR_LINE extracted below gets
+          # redacted before going anywhere - a live `tee` would put the unredacted original in
+          # this job's own log first, before that redaction ever runs.
+          if ! node ./node_modules/silverfin-cli/bin/cli.js config --refresh-token "${FIRM_ID}" > /tmp/refresh-"${FIRM_ID}".log 2>&1; then
             ERROR_LINE=$(grep -E 'Response Status|Error description' /tmp/refresh-"${FIRM_ID}".log | paste -sd' ' - || true)
             if [[ -z "${ERROR_LINE}" ]]; then
               # A bare network failure (no HTTP response) never matches the grep above. The CLI
