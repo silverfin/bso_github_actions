@@ -400,10 +400,18 @@ jobs:
           SAMPLER_OK: ${{ steps.sampler.outputs.sampler_ok }}
           REPORT_URL: ${{ steps.sampler.outputs.report_url }}
           ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
           DIFFS_ADDED: ${{ steps.add_diffs.outputs.diffs_added }}
           COMPACT: ${{ steps.sampler.outputs.compact }}
           PR_NUMBER: ${{ inputs.pull_request_number }}
+          HEAD_SHA: ${{ inputs.ref }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # github.* here resolves to the CALLER's workflow run, which is exactly the provenance a
+          # consumer needs: the repo, run and event the sampled diff actually came from.
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          EVENT_NAME: ${{ github.event_name }}
         with:
           script: |
             const marker = `<!-- silverfin-sampler-result-${process.env.PARTNER} -->`;
@@ -461,7 +469,27 @@ jobs:
             } else if (ok) {
               lines.push("_No compact diff was produced (see the run log)._");
             }
-            lines.push("", marker);
+            // Machine-readable origin data, invisible to human readers. Without it a consumer has
+            // to scrape the artifact id out of a markdown link and has nothing at all stating
+            // which PR/run produced this diff — an agent that guesses from branch resemblance
+            // reports confidently on the wrong PR. JSON, so the shape can grow without reparsing.
+            const provenance = {
+              schema: 1,
+              repository: process.env.REPOSITORY,
+              run_id: process.env.RUN_ID,
+              run_attempt: process.env.RUN_ATTEMPT,
+              event_name: process.env.EVENT_NAME,
+              workflow_dispatch: process.env.EVENT_NAME === "workflow_dispatch",
+              partner: process.env.PARTNER,
+              pr_number: process.env.PR_NUMBER || null,
+              head_sha: process.env.HEAD_SHA || null,
+              artifact_id: process.env.ARTIFACT_ID || null,
+              sampler_ok: ok,
+            };
+            // Escape every "--" so no value (a branch name, a template name) can close the HTML
+            // comment early; the escaped form parses back to a plain hyphen, so nothing is lost.
+            const provenanceComment = `<!-- silverfin-sampler-provenance ${JSON.stringify(provenance).replace(/--/g, "\\u002d\\u002d")} -->`;
+            lines.push("", provenanceComment, marker);
             const body = lines.join("\n");
 
             const { owner, repo } = context.repo;

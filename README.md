@@ -291,6 +291,7 @@ _Steps:_
 * Downloads `results.zip`, best-effort adds a `diffs/` folder of before/after `view.html` for the entries the compact diff flagged, and uploads it as a 7-day workflow artifact.
   * The artifact is uploaded with `compression-level: 0`. GitHub re-zips every upload, and `results.zip` is already per-file deflated, so a second DEFLATE pass saves ~nothing while turning the outer entry into one compressed stream spanning the whole file — which makes the inner zip's central directory unreachable by HTTP Range and forces a consumer to download all 20+ MB to read a handful of `view.html` files. Storing it keeps the inner offsets intact so partial fetches work.
 * Posts (or updates) a result comment on the PR with the compact diff and a link to the workflow artifact (kept 7 days; GitHub sign-in required) as the primary way to open the full report; falls back to the presigned report URL (short-lived, ~5 min) only if the artifact upload did not happen.
+  * The comment ends with a machine-readable `<!-- silverfin-sampler-provenance {...} -->` footer (invisible when rendered) carrying `repository`, `run_id`, `run_attempt`, `event_name`/`workflow_dispatch`, `partner`, `pr_number`, `head_sha`, `artifact_id` and `sampler_ok`, so a tool can resolve the artifact and the originating PR without scraping links. The `<!-- silverfin-sampler-result-<partner> -->` marker that identifies the comment for updates is unchanged and still last.
 * Fails the job if the sampler run did not complete successfully.
 
 _Authentication note:_
