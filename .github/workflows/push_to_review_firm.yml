@@ -171,8 +171,8 @@ jobs:
       # no matter where checkout runs. Confirmed the hard way: moving checkout earlier alone
       # still fails with "Can't find action.yml" - only a fully-qualified remote reference
       # works here, same as be_market's own run_tests.yml already does for this action.
-      # Pinned to this repo's own tip since action.yml hasn't changed since - bump alongside any
-      # future action.yml edit.
+      # Pin to a full commit SHA; bump it whenever
+      # .github/actions/refresh-config-json/action.yml changes.
       - name: Refresh CONFIG_JSON
         id: refresh
         uses: silverfin/bso_github_actions/.github/actions/refresh-config-json@513df744094600d1230a463fb8124e1406e7eeea
