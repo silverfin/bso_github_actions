@@ -183,10 +183,13 @@ jobs:
         with:
           node-version: 22
       - name: Load Silverfin config file from secrets
+        # Via env, not spliced into the script body: otherwise the secret is materialised into
+        # the rendered run:, and a single quote anywhere in the JSON ends the quoting.
+        env:
+          CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
         run: |
-          mkdir -p $HOME/.silverfin/
-          touch $HOME/.silverfin/config.json
-          echo '${{ secrets.CONFIG_JSON }}' > $HOME/.silverfin/config.json
+          mkdir -p "$HOME/.silverfin"
+          printf '%s\n' "${CONFIG_JSON}" > "$HOME/.silverfin/config.json"
       - name: Add silverfin-cli package latest version
         run: |
           npm install https://github.com/silverfin/silverfin-cli.git
