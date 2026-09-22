@@ -243,18 +243,41 @@ jobs:
             echo "$OUTPUT"
             echo "--------------------------------------------"
 
-            # The CLI gives up polling long before the backend gives up running. Restarting from
-            # scratch then hits the one-run-per-partner 422 (the original run is still going) and
-            # burns the retry budget on a run that was about to finish — re-attach instead.
-            if [[ ${RC} -ne 0 && -n "${SAMPLER_ID}" ]] && printf '%s' "${OUTPUT}" | grep -q 'Timeout'; then
+            # The CLI stops polling long before the backend stops running, and abandoning the run
+            # here costs the whole result: the next attempt then collides with the still-running
+            # original on the one-run-per-partner 422. Re-attach to it instead.
+            #
+            # Matched on the CLI's own timeout sentence, not on ${RC}: $? above is `tr`'s status,
+            # not node's, so an exit-code gate would never fire. The full sentence is specific
+            # enough that a sampled template's rendered content can't trip it.
+            #
+            # `--id` is a single status read, not a poll, and the CLI only times out while the run
+            # is still going — so one read would always come back "still in progress". Keep
+            # re-reading on its own budget (the loop's DEADLINE is long gone by now).
+            if [[ -n "${SAMPLER_ID}" ]] && printf '%s' "${OUTPUT}" | grep -qF 'Timeout. Try to fetch the status by using the --id flag'; then
               echo "::notice::Polling timed out; re-attaching to sampler run ${SAMPLER_ID} rather than starting a new one."
-              set +e
-              OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-sampler -p "${SAMPLER_PARTNER}" --id "${SAMPLER_ID}" --compact 2>&1 | tr -d '\r')
-              RC=$?
-              set -e
-              echo "----- run-sampler --id output (exit ${RC}) -----"
-              echo "$OUTPUT"
-              echo "-----------------------------------------------"
+              REATTACH_DEADLINE=$(( $(date +%s) + 30*60 ))
+              while true; do
+                set +e
+                # Not piped into `tr` here, so ${RC} is node's own status; stripped afterwards.
+                OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-sampler -p "${SAMPLER_PARTNER}" --id "${SAMPLER_ID}" --compact 2>&1)
+                RC=$?
+                set -e
+                OUTPUT=$(tr -d '\r' <<< "${OUTPUT}")
+                echo "----- run-sampler --id output (exit ${RC}) -----"
+                echo "$OUTPUT"
+                echo "-----------------------------------------------"
+                if ! printf '%s' "${OUTPUT}" | grep -q 'still in progress'; then
+                  break
+                fi
+                if (( $(date +%s) >= REATTACH_DEADLINE )); then
+                  # A still-running status read exits 0; don't let that read as success.
+                  echo "::error::Sampler run ${SAMPLER_ID} is still running 30 minutes after the CLI stopped polling. Giving up — the backend run is not cancelled."
+                  RC=1
+                  break
+                fi
+                sleep 60
+              done
             fi
 
             if echo "$OUTPUT" | grep -qi "already in progress"; then
@@ -404,7 +427,7 @@ jobs:
           DIFFS_ADDED: ${{ steps.add_diffs.outputs.diffs_added }}
           COMPACT: ${{ steps.sampler.outputs.compact }}
           PR_NUMBER: ${{ inputs.pull_request_number }}
-          HEAD_SHA: ${{ inputs.ref }}
+          SAMPLED_REF: ${{ inputs.ref }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # github.* here resolves to the CALLER's workflow run, which is exactly the provenance a
           # consumer needs: the repo, run and event the sampled diff actually came from.
@@ -476,14 +499,17 @@ jobs:
             const provenance = {
               schema: 1,
               repository: process.env.REPOSITORY,
-              run_id: process.env.RUN_ID,
-              run_attempt: process.env.RUN_ATTEMPT,
+              // Numbers, not strings: these are compared against the Actions API's own numeric ids.
+              run_id: Number(process.env.RUN_ID),
+              run_attempt: Number(process.env.RUN_ATTEMPT),
               event_name: process.env.EVENT_NAME,
               workflow_dispatch: process.env.EVENT_NAME === "workflow_dispatch",
               partner: process.env.PARTNER,
-              pr_number: process.env.PR_NUMBER || null,
-              head_sha: process.env.HEAD_SHA || null,
-              artifact_id: process.env.ARTIFACT_ID || null,
+              pr_number: process.env.PR_NUMBER ? Number(process.env.PR_NUMBER) : null,
+              // The ref the sampled templates were read from. Named `ref`, not `head_sha`: the
+              // input accepts any git ref, and callers are the ones promising it is a PR head SHA.
+              ref: process.env.SAMPLED_REF || null,
+              artifact_id: process.env.ARTIFACT_ID ? Number(process.env.ARTIFACT_ID) : null,
               sampler_ok: ok,
             };
             // Escape every "--" so no value (a branch name, a template name) can close the HTML
