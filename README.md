@@ -286,6 +286,7 @@ _Steps:_
 * Checks out the repo at `ref` and installs `silverfin-cli`.
 * Loads the partner's credentials from the `PARTNER_CONFIG_JSON` secret and captures the token on disk before the run.
 * Runs `run-sampler`, retrying on a cross-repo "already in progress" 422 (the backend allows only one sampler run per partner at a time; retries for up to 90 minutes).
+  * If the CLI stops polling and exits with `Timeout`, the job re-attaches to the same run with `run-sampler --id <id>` (the id is read from the CLI's own `Sampler run started with ID:` line) instead of starting a new one. A restart would collide with the still-running original on that same one-run-per-partner 422 and spend the retry budget on a run that was about to finish.
 * Captures the token again after the run and writes it back to `PARTNER_CONFIG_JSON_<partner>` via `gh secret set` only if it rotated (401 refresh mid-run).
 * Downloads `results.zip`, best-effort adds a `diffs/` folder of before/after `view.html` for the entries the compact diff flagged, and uploads it as a 7-day workflow artifact.
 * Posts (or updates) a result comment on the PR with the compact diff and a link to the workflow artifact (kept 7 days; GitHub sign-in required) as the primary way to open the full report; falls back to the presigned report URL (short-lived, ~5 min) only if the artifact upload did not happen.

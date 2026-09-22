@@ -238,9 +238,24 @@ jobs:
             OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1 | tr -d '\r')
             RC=$?
             set -e
+            SAMPLER_ID=$(printf '%s\n' "${OUTPUT}" | sed -n 's/.*Sampler run started with ID: \([0-9][0-9]*\).*/\1/p' | tail -n 1)
             echo "----- run-sampler output (exit ${RC}) -----"
             echo "$OUTPUT"
             echo "--------------------------------------------"
+
+            # The CLI gives up polling long before the backend gives up running. Restarting from
+            # scratch then hits the one-run-per-partner 422 (the original run is still going) and
+            # burns the retry budget on a run that was about to finish — re-attach instead.
+            if [[ ${RC} -ne 0 && -n "${SAMPLER_ID}" ]] && printf '%s' "${OUTPUT}" | grep -q 'Timeout'; then
+              echo "::notice::Polling timed out; re-attaching to sampler run ${SAMPLER_ID} rather than starting a new one."
+              set +e
+              OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-sampler -p "${SAMPLER_PARTNER}" --id "${SAMPLER_ID}" --compact 2>&1 | tr -d '\r')
+              RC=$?
+              set -e
+              echo "----- run-sampler --id output (exit ${RC}) -----"
+              echo "$OUTPUT"
+              echo "-----------------------------------------------"
+            fi
 
             if echo "$OUTPUT" | grep -qi "already in progress"; then
               NOW=$(date +%s)
