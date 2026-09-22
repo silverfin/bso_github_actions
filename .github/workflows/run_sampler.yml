@@ -383,6 +383,11 @@ jobs:
           name: sampler-results-partner-${{ inputs.partner }}
           path: results.zip
           retention-days: 7
+          # STORE, not DEFLATE: the action re-zips whatever it uploads, and results.zip is already
+          # per-file deflated. Compressing it again saves ~nothing and makes the outer entry one
+          # DEFLATE stream spanning the whole file, so the inner zip's central directory is
+          # unreachable by Range request and a consumer must download all 20+ MB for a few files.
+          compression-level: 0
 
       - name: Post result comment on the PR
         if: always() && inputs.pull_request_number != ''
