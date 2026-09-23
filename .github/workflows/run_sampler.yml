@@ -91,8 +91,8 @@ concurrency:
 jobs:
   run-sampler:
     runs-on: ubuntu-latest
-    # Generous ceiling: a single run is ~30-60 min, plus up to ~90 min of poll-and-retry on a
-    # cross-repo 422 collision (see the retry loop below).
+    # Generous ceiling: a single run is ~30-60 min, plus poll-and-retry on a cross-repo 422
+    # collision; STEP_DEADLINE in the sampler step keeps ~45 min of it for the tail.
     timeout-minutes: 180
     # Job-level (not just on the sampler step): the CLI checks for these at process startup for
     # every command, including a bare `-V` version probe - confirmed live (the "Install
@@ -101,6 +101,10 @@ jobs:
       SF_API_CLIENT_ID: ${{ secrets.SF_API_CLIENT_ID }}
       SF_API_SECRET: ${{ secrets.SF_API_SECRET }}
     steps:
+      # STEP_DEADLINE below is measured from here, so the setup steps' time counts against it.
+      - name: Record job start
+        run: echo "JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Validate inputs
         env:
           HANDLES: ${{ inputs.handles }}
@@ -131,10 +135,16 @@ jobs:
       # in the tree redirecting the registry.
       - name: Install silverfin-cli
         run: |
-          # Pinned to a commit on silverfin-cli's sampler-compact-diff-v2 branch, since
-          # --compact/--from-zip/--add-diffs-folder (used below) are not yet on main. Switch back
-          # to installing unpinned main, matching every other production workflow's convention,
-          # once that branch's PR (silverfin-cli#265) merges.
+          # Pinned to silverfin-cli's `sampler-cli-integration` branch: the tested merge of the
+          # two open sampler PRs (#276 visual tier + budget-driven caps, #275 payload attrs +
+          # flagged-entry extraction). Neither is on main, and no single PR branch carries both,
+          # which is why this points at an integration branch rather than at a PR head. That
+          # branch exists to keep this SHA reachable - do NOT delete it while anything pins to
+          # it. Switch to unpinned main, matching every other production workflow, once both
+          # PRs merge.
+          #
+          # Same SHA as be_market's inlined copy pins, deliberately: the two must not drift, or
+          # a run's output depends on which repo triggered it.
           #
           # Re-pin to the branch tip whenever that branch gains fixes — a commit pin silently goes
           # stale, and a rebase can orphan it entirely. The previous pin (5accd6b) was exactly
@@ -145,7 +155,7 @@ jobs:
           INSTALL_DIR="${RUNNER_TEMP}/silverfin-cli-install"
           mkdir -p "${INSTALL_DIR}"
           npm install --prefix "${INSTALL_DIR}" --ignore-scripts \
-            https://github.com/silverfin/silverfin-cli.git#1ba5a0f
+            https://github.com/silverfin/silverfin-cli.git#ec85206167741663370b28250f67ef53ff96db98
           # Exported via $GITHUB_ENV (not job-level `env:`, which can't use $RUNNER_TEMP or the
           # `runner` context) so every later step in this job gets the resolved absolute path.
           echo "SILVERFIN_CLI_BIN=${INSTALL_DIR}/node_modules/silverfin-cli/bin/cli.js" >> "$GITHUB_ENV"
@@ -238,9 +248,30 @@ jobs:
           # GitHub Actions concurrency (group + queue: max) serializes runs within THIS repo, but
           # concurrency groups do not span repositories — two market repos sharing this partner id
           # can still collide. The backend's own one-run-per-partner 422 is the real cross-repo
-          # mutex, so treat it as a "try again shortly" signal, not a hard failure. Bounded to
-          # match the worst-case run length (~60 min) plus margin.
-          DEADLINE=$(( $(date +%s) + 90*60 ))
+          # mutex, so treat it as a "try again shortly" signal, not a hard failure. Bounded by
+          # DEADLINE below.
+          # Separate, harder bound. The job is capped by `timeout-minutes`, and a cancellation at
+          # that cap kills the `if: always()` write-back, artifact and PR-comment steps outright -
+          # so the rotated partner token would be lost and nothing would be reported. Everything
+          # below must finish with enough margin left for those steps to run.
+          #
+          # Sized against the tail, not against `timeout-minutes`: after this step come a
+          # ~150 MB download (up to 5 min on its own `--max-time`), a full re-zip for the diffs/
+          # folder, the flagged-entry extraction, an artifact upload of that same ~150 MB, and
+          # the PR comment. Measured from job start, so 135 leaves ~45 min for that tail
+          # whatever the setup steps cost. Raising `timeout-minutes` instead would not help: the
+          # point is the margin between the two, not the absolute cap.
+          #
+          # Every CLI call runs under `timeout` to what is left of it: the CLI polls for up to
+          # 2 h on its own, so an attempt started late (a 422 retry) would otherwise run past
+          # the job cap regardless of any check between attempts.
+          STEP_DEADLINE=$(( ${JOB_STARTED_AT:-$(date +%s)} + 135*60 ))
+          # Floored at 1: `timeout 0` means no timeout at all.
+          remaining() { local r=$(( STEP_DEADLINE - $(date +%s) )); echo $(( r > 1 ? r : 1 )); }
+          # Last moment a 422 retry may start: a run takes up to ~60 min, and an attempt that
+          # can't finish is killed at STEP_DEADLINE and orphans a backend run that 422s every
+          # repo using this partner.
+          DEADLINE=$(( STEP_DEADLINE - 60*60 ))
           ATTEMPT=1
           while true; do
             # %q-quoted so a name containing spaces is visibly one argument in the log.
@@ -249,33 +280,113 @@ jobs:
             printf ' --firm-ids %s --compact\n' "${SAMPLER_FIRM_IDS}"
             set +e
             # shellcheck disable=SC2086 # SAMPLER_FIRM_IDS is intentionally word-split (space-separated ids -> separate args)
-            # RC must come straight from `node`, not from a pipeline: this step has no explicit
-            # `shell: bash`, so GitHub Actions runs it as plain `bash -e {0}` - NOT `-o pipefail`
-            # (that only applies when `shell: bash` is set explicitly). Piping into `tr` before
-            # capturing $? would silently make RC reflect tr's (always 0) exit status instead of
-            # node's, breaking the RC-gated retry check below.
-            OUTPUT=$(node "${SILVERFIN_CLI_BIN}" run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1)
+            # Not piped into `tr` here: this step has no explicit `shell: bash`, so it runs as
+            # `bash -e {0}` with no pipefail, and `$?` after a pipeline is the LAST command's
+            # status - `tr`'s, which is always 0. That silently kills every RC-gated branch
+            # below, the stale-auth re-dispatch included. Strip the CRs after capturing.
+            OUTPUT=$(timeout --kill-after=30 "$(remaining)" node "${SILVERFIN_CLI_BIN}" run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1)
             RC=$?
             set -e
-            # Restore -e before stripping CRs so a failed `tr` cannot empty OUTPUT while
-            # leaving RC as node's status (that would skip the 422-text retry below).
             OUTPUT=$(tr -d '\r' <<< "${OUTPUT}")
+            # head, not tail: the CLI prints this line exactly once, before it renders anything,
+            # so the first match is its own. Taking the last would let sampled template content
+            # spoof the id.
+            SAMPLER_ID=$(printf '%s\n' "${OUTPUT}" | sed -n 's/.*Sampler run started with ID: \([0-9][0-9]*\).*/\1/p' | head -n 1)
+            REATTACHED=false
             echo "----- run-sampler output (exit ${RC}) -----"
             echo "$OUTPUT"
             echo "--------------------------------------------"
+            # 124 on SIGTERM, 137 when --kill-after had to escalate to SIGKILL - but 137 is also
+            # any other SIGKILL (the OOM killer), so only past the deadline.
+            if [[ "${RC}" -eq 124 ]] || { [[ "${RC}" -eq 137 ]] && (( $(date +%s) >= STEP_DEADLINE )); }; then
+              echo "::error::run-sampler was stopped at the step deadline so the write-back and PR comment still run. The backend run${SAMPLER_ID:+ ${SAMPLER_ID}} is NOT cancelled and will 422 the next attempt${SAMPLER_ID:+; re-read it with: run-sampler -p ${SAMPLER_PARTNER} --id ${SAMPLER_ID} --compact}. If the kill landed mid-refresh, the stored partner credential may now be spent - re-authorize partner ${SAMPLER_PARTNER} if the next run 401s."
+              break
+            elif [[ "${RC}" -eq 137 ]]; then
+              echo "::error::run-sampler was SIGKILLed before the step deadline (likely out of memory). The backend run${SAMPLER_ID:+ ${SAMPLER_ID}} is NOT cancelled and may 422 the next attempt."
+            fi
 
-            # RC check first: grepping the whole $OUTPUT for this phrase without it would also
-            # match a SUCCESSFUL run whose compact diff happens to contain that text somewhere in
-            # a sampled entry's own rendered content, sending a clean run into the retry loop.
-            if [[ "${RC}" -ne 0 ]] && echo "$OUTPUT" | grep -qi "already in progress"; then
+            # The CLI stops polling long before the backend stops running, and abandoning the run
+            # here costs the whole result: the next attempt then collides with the still-running
+            # original on the one-run-per-partner 422. Re-attach to it instead.
+            #
+            # Matched on the CLI's own timeout sentence, not on ${RC}: the CLI exits 1 for this and
+            # for a failed run alike. The full sentence is specific enough that a sampled
+            # template's rendered content can't trip it.
+            #
+            # `--id` is a single status read, not a poll, and the CLI only times out while the run
+            # is still going — so one read would always come back "still in progress". Keep
+            # re-reading on whatever STEP_DEADLINE leaves (the loop's DEADLINE is long gone by now).
+            if printf '%s' "${OUTPUT}" | grep -qF 'Timeout. Try to fetch the status by using the --id flag'; then
+              if [[ -z "${SAMPLER_ID}" ]]; then
+                # Without an id there is nothing to re-attach to, and the run keeps going
+                # server-side regardless - say so, or the next attempt's 422 looks unexplained.
+                echo "::error::Polling timed out but no sampler run id could be parsed from the output, so this run cannot be re-attached to. It is still running for partner ${SAMPLER_PARTNER} and will 422 the next attempt."
+              else
+                echo "::notice::Polling timed out; re-attaching to sampler run ${SAMPLER_ID} rather than starting a new one."
+                REATTACHED=true
+                REATTACH_DEADLINE=${STEP_DEADLINE}
+                while true; do
+                  set +e
+                  # Not piped into `tr` here, so ${RC} is node's own status; stripped afterwards.
+                  OUTPUT=$(timeout --kill-after=30 "$(remaining)" node "${SILVERFIN_CLI_BIN}" run-sampler -p "${SAMPLER_PARTNER}" --id "${SAMPLER_ID}" --compact 2>&1)
+                  RC=$?
+                  set -e
+                  OUTPUT=$(tr -d '\r' <<< "${OUTPUT}")
+                  echo "----- run-sampler --id output (exit ${RC}) -----"
+                  echo "$OUTPUT"
+                  echo "-----------------------------------------------"
+                  # Break only on a verdict the backend actually reached. Matched on the CLI's own
+                  # sentences rather than on ${RC}, because it exits 1 for two very different
+                  # things: a run that failed, and a status read that failed. Treating the latter
+                  # as terminal - which "anything that isn't still-in-progress" does - abandons a
+                  # live run on one network blip, which is the exact collision this block exists
+                  # to prevent.
+                  #
+                  # 'Unexpected sampler status:' is deliberately NOT in this list. The CLI prints
+                  # it when the backend returns a status string it does not recognise, which says
+                  # nothing about whether the run finished - a new or renamed status on a run
+                  # that is still going reads exactly the same. Breaking on it abandons a live
+                  # run and hands the next attempt the 422 this whole block exists to avoid, so
+                  # keep polling and let REATTACH_DEADLINE below bound it instead.
+                  if printf '%s' "${OUTPUT}" | grep -qF \
+                       -e 'Sampler run completed successfully' \
+                       -e 'Sampler run failed:' \
+                       -e 'Sampler completed but no result URL was returned'; then
+                    break
+                  fi
+                  # Checked with room for the sleep and one more read, so the last read never
+                  # gets a 1-second `timeout` and misreports a still-running run as unreadable.
+                  if (( $(date +%s) + 90 >= REATTACH_DEADLINE )); then
+                    if printf '%s' "${OUTPUT}" | grep -qF 'Sampler run is still in progress'; then
+                      echo "::error::Sampler run ${SAMPLER_ID} was still running at the re-attach deadline. The backend run is NOT cancelled and will 422 the next attempt; re-read it with: run-sampler -p ${SAMPLER_PARTNER} --id ${SAMPLER_ID} --compact"
+                    elif printf '%s' "${OUTPUT}" | grep -qF 'Unexpected sampler status:'; then
+                      echo "::error::Sampler run ${SAMPLER_ID} kept reporting a status this CLI does not recognise until the re-attach deadline ($(printf '%s' "${OUTPUT}" | grep -F 'Unexpected sampler status:' | head -n 1 | cut -c1-200)). The backend run may still be going."
+                    else
+                      echo "::error::Could not read the status of sampler run ${SAMPLER_ID} before the re-attach deadline (last exit ${RC}). The backend run is NOT cancelled."
+                    fi
+                    # A still-in-progress read exits 0; don't let that read as success.
+                    RC=1
+                    break
+                  fi
+                  sleep 60
+                done
+              fi
+            fi
+
+            # Skipped after a re-attach: OUTPUT then holds a status read for the run this job is
+            # deliberately attached to, including (once it completes) the rendered compact diff.
+            # Matching that as a collision would start a brand-new run against the one just waited
+            # for.
+            if [[ "${REATTACHED}" != "true" ]] && [[ "${RC}" -ne 0 ]] && echo "$OUTPUT" | grep -qi "already in progress"; then
               NOW=$(date +%s)
-              if (( NOW >= DEADLINE )); then
+              # +60 for the sleep below, so the next attempt never starts past DEADLINE.
+              if (( NOW + 60 >= DEADLINE )); then
                 # Don't exit here: fall through to the normal output-setting logic below (which
                 # will correctly record sampler_ok=false / no report_url) so downstream steps
                 # (write-back, PR comment) still run via their own `if:` conditions instead of
                 # being skipped by a hard step failure. The final "Fail job" step still fails
                 # the job overall.
-                echo "::error::Partner ${SAMPLER_PARTNER} still has a sampler run in progress after 90 minutes of retrying. Giving up — check whether a previous run is stuck (§2.3/2.4c: no CLI cancel exists for a backend run)."
+                echo "::error::Partner ${SAMPLER_PARTNER} still has a sampler run in progress, and the step deadline leaves too little time to start a full run. Giving up — check whether a previous run is stuck (§2.3/2.4c: no CLI cancel exists for a backend run)."
                 break
               fi
               echo "[$(date -u +%H:%M:%S)] partner ${SAMPLER_PARTNER} has a run in progress elsewhere (cross-repo or stale) — retrying in 60s..."
@@ -298,6 +409,31 @@ jobs:
             echo "sampler_ok=false" >> "$GITHUB_OUTPUT"
           fi
 
+          # A stale partner credential, told apart from every other failure.
+          #
+          # `secrets.*` is snapshotted when the RUN is created, not when the job starts, so a
+          # run that was queued while a sibling run refreshed this partner's token is holding a
+          # credential that has since been spent - refresh_api_key consumes the old key to mint
+          # the new one, so there is exactly one live value at a time. The CLI then fails its
+          # own refresh with a 401, which is what this matches.
+          #
+          # Nothing in-run can fix it: the snapshot is fixed for the job's lifetime and GitHub
+          # secrets cannot be read back through the API. Only a NEW run gets a fresh snapshot,
+          # which is what the re-dispatch step below is for.
+          #
+          # Both lines required: the CLI prints "Error refreshing credentials" for every refresh
+          # failure, network errors and 5xx included, and those must not spend the PR's one retry.
+          # Matched outside the compact diff, which is PR-rendered content and could otherwise
+          # fake both lines to spend the retry. Whole-line markers: the CLI escapes only the
+          # `<!--`, so the marker text itself can still appear inside the diff.
+          CLI_LINES=$(printf '%s\n' "$OUTPUT" | awk '$0=="<!-- SAMPLER_COMPACT_START -->"{f=1} !f; $0=="<!-- SAMPLER_COMPACT_END -->"{f=0}')
+          if [[ "${RC}" -ne 0 ]] && grep -qF 'Error refreshing credentials' <<< "${CLI_LINES}" \
+             && grep -qF 'Response Status: 401' <<< "${CLI_LINES}"; then
+            echo "stale_auth=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "stale_auth=false" >> "$GITHUB_OUTPUT"
+          fi
+
           # Report URL: "Sampler report: https://..." (strip ANSI first).
           # `|| true`: under `set -eo pipefail`, grep finding no match (a failed/timed-out run
           # never prints this line) makes the whole pipeline's exit status non-zero even though
@@ -309,7 +445,7 @@ jobs:
           echo "report_url=${REPORT_URL}" >> "$GITHUB_OUTPUT"
 
           # Compact named_results diff, between the CLI's own markers.
-          COMPACT=$(echo "$OUTPUT" | sed 's/\x1b\[[0-9;]*m//g' | awk '/SAMPLER_COMPACT_START/{f=1;next} /SAMPLER_COMPACT_END/{f=0} f')
+          COMPACT=$(echo "$OUTPUT" | sed 's/\x1b\[[0-9;]*m//g' | awk '$0=="<!-- SAMPLER_COMPACT_START -->"{f=1;next} $0=="<!-- SAMPLER_COMPACT_END -->"{f=0} f')
 
           # A fixed delimiter would corrupt $GITHUB_OUTPUT's multiline parsing if that exact
           # string ever appeared inside a sampled template's own rendered content. Generate a
@@ -407,6 +543,9 @@ jobs:
           # run completion, not the long-lived link it was originally assumed to be — see
           # silverfin-cli's CI_AUTH_SAMPLER_PLAN.md §10.4). A failure here means the human-facing
           # PR comment link below falls back to that presigned URL, which may already be dead.
+          # The workspace is the untrusted PR tree: drop a committed results.zip (or a symlink
+          # curl would write through) before downloading.
+          rm -rf results.zip
           if curl -sL --fail --max-time 300 -o results.zip "${REPORT_URL}"; then
             echo "downloaded=true" >> "$GITHUB_OUTPUT"
           else
@@ -429,6 +568,47 @@ jobs:
             echo "diffs_added=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Extract the flagged entries for a small companion artifact
+        id: flagged
+        # results.zip runs to ~150 MB for what is usually a handful of interesting pairs, so a
+        # consumer that only wants those still pays for the whole archive. Same selection as the
+        # diffs/ folder above, written as loose files. Best-effort, for the same reason.
+        if: always() && steps.download.outputs.downloaded == 'true'
+        continue-on-error: true
+        run: |
+          # The flag ships in silverfin-cli 1.59.3; the install above is pinned to a commit that
+          # may predate it. Detect rather than fail - this step then starts working on its own
+          # once the pin moves, instead of warning on every run until someone notices.
+          if ! node "${SILVERFIN_CLI_BIN}" run-sampler --help 2>&1 | grep -q -- '--extract-flagged-only'; then
+            echo "::notice::The pinned silverfin-cli has no --extract-flagged-only yet; skipping the flagged-entries artifact."
+            echo "flagged_extracted=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Outside the workspace: the PR tree is untrusted, and a committed `flagged-entries`
+          # directory (or a symlink to $HOME/.silverfin) would otherwise be uploaded as-is.
+          OUT_DIR="${RUNNER_TEMP}/flagged-entries"
+          rm -rf "${OUT_DIR}"
+          if node "${SILVERFIN_CLI_BIN}" run-sampler --from-zip results.zip --extract-flagged-only "${OUT_DIR}" \
+             && [[ -d "${OUT_DIR}" && ! -L "${OUT_DIR}" ]]; then
+            echo "flagged_extracted=true" >> "$GITHUB_OUTPUT"
+            echo "dir=${OUT_DIR}" >> "$GITHUB_OUTPUT"
+          else
+            # Also the "nothing flagged, or nothing whose render differs" case: the CLI exits 0
+            # and writes no directory, and there is genuinely no artifact to upload.
+            echo "flagged_extracted=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload flagged-entries artifact
+        if: always() && steps.flagged.outputs.flagged_extracted == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sampler-flagged-partner-${{ inputs.partner }}
+          path: ${{ steps.flagged.outputs.dir }}
+          retention-days: 7
+          # Compressed, unlike results.zip below: these are loose HTML files, so the action's own
+          # zip is the only one and DEFLATE is a straight win. The reason to store results.zip
+          # uncompressed is that it is already a zip, which does not apply here.
+
       - name: Upload results.zip artifact
         id: upload
         if: always() && steps.download.outputs.downloaded == 'true'
@@ -437,6 +617,11 @@ jobs:
           name: sampler-results-partner-${{ inputs.partner }}
           path: results.zip
           retention-days: 7
+          # STORE, not DEFLATE: the action re-zips whatever it uploads, and results.zip is already
+          # per-file deflated. Compressing it again saves ~nothing and makes the outer entry one
+          # DEFLATE stream spanning the whole file, so the inner zip's central directory is
+          # unreachable by Range request and a consumer must download all 20+ MB for a few files.
+          compression-level: 0
 
       - name: Post result comment on the PR
         if: always() && inputs.pull_request_number != ''
@@ -449,10 +634,18 @@ jobs:
           SAMPLER_OK: ${{ steps.sampler.outputs.sampler_ok }}
           REPORT_URL: ${{ steps.sampler.outputs.report_url }}
           ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
           DIFFS_ADDED: ${{ steps.add_diffs.outputs.diffs_added }}
           COMPACT: ${{ steps.sampler.outputs.compact }}
           PR_NUMBER: ${{ inputs.pull_request_number }}
+          SAMPLED_REF: ${{ inputs.ref }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # github.* here resolves to the CALLER's workflow run, which is exactly the provenance a
+          # consumer needs: the repo, run and event the sampled diff actually came from.
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          EVENT_NAME: ${{ github.event_name }}
         with:
           script: |
             const marker = `<!-- silverfin-sampler-result-${process.env.PARTNER} -->`;
@@ -489,7 +682,13 @@ jobs:
               const pad = s.startsWith("`") || s.endsWith("`") ? " " : "";
               return `${fence}${pad}${s}${pad}${fence}`;
             };
-            const fmtNames = v => (v || "").split("\n").map(s => s.trim()).filter(Boolean).map(codeSpan).join(", ");
+            // A code span only changes how text RENDERS; the raw characters stay in the body, and
+            // both the update-in-place lookup and any provenance consumer read the raw body. So a
+            // directory named `<!-- silverfin-sampler-result-9 -->` would plant another partner's
+            // marker in this comment and let their next run overwrite it. U+2011 renders as a
+            // hyphen but cannot delimit an HTML comment.
+            const neutraliseComments = (s) => s.replace(/<!--/g, "<!‑‑").replace(/--!?>/g, "‑‑>");
+            const fmtNames = v => (v || "").split("\n").map(s => s.trim()).filter(Boolean).map(codeSpan).map(neutraliseComments).join(", ");
             if (process.env.HANDLES) lines.push(`- Reconciliation handles: ${fmtNames(process.env.HANDLES)}`);
             if (process.env.ACCOUNT_TEMPLATES) lines.push(`- Account templates: ${fmtNames(process.env.ACCOUNT_TEMPLATES)}`);
             lines.push(`- Firm(s): \`${process.env.FIRM_IDS}\``);
@@ -506,11 +705,41 @@ jobs:
             lines.push(`- Workflow run: ${runUrl}`);
             lines.push("");
             if (compact) {
-              lines.push(compact);
+              // Rendered output of PR-controlled templates, so it can contain anything - including
+              // a literal copy of one of the HTML-comment markers below. A forged provenance block
+              // would sit ABOVE the real one and win for any consumer taking the first match, and a
+              // forged result marker would redirect the update-in-place lookup to another comment.
+              // Escaping the real block does nothing about a forged one, so neutralise the comment
+              // delimiters at the source. U+2011 renders as a hyphen but cannot open or close an
+              // HTML comment.
+              lines.push(neutraliseComments(compact));
             } else if (ok) {
               lines.push("_No compact diff was produced (see the run log)._");
             }
-            lines.push("", marker);
+            // Machine-readable origin data, invisible to human readers. Without it a consumer has
+            // to scrape the artifact id out of a markdown link and has nothing at all stating
+            // which PR/run produced this diff — an agent that guesses from branch resemblance
+            // reports confidently on the wrong PR. JSON, so the shape can grow without reparsing.
+            const provenance = {
+              schema: 1,
+              repository: process.env.REPOSITORY,
+              // Numbers, not strings: these are compared against the Actions API's own numeric ids.
+              run_id: Number(process.env.RUN_ID),
+              run_attempt: Number(process.env.RUN_ATTEMPT),
+              event_name: process.env.EVENT_NAME,
+              workflow_dispatch: process.env.EVENT_NAME === "workflow_dispatch",
+              partner: process.env.PARTNER,
+              pr_number: process.env.PR_NUMBER ? Number(process.env.PR_NUMBER) : null,
+              // The ref the sampled templates were read from. Named `ref`, not `head_sha`: the
+              // input accepts any git ref, and callers are the ones promising it is a PR head SHA.
+              ref: process.env.SAMPLED_REF || null,
+              artifact_id: process.env.ARTIFACT_ID ? Number(process.env.ARTIFACT_ID) : null,
+              sampler_ok: ok,
+            };
+            // Escape every "--" so no value (a branch name, a template name) can close the HTML
+            // comment early; the escaped form parses back to a plain hyphen, so nothing is lost.
+            const provenanceComment = `<!-- silverfin-sampler-provenance ${JSON.stringify(provenance).replace(/--/g, "\\u002d\\u002d")} -->`;
+            lines.push("", provenanceComment, marker);
             const body = lines.join("\n");
 
             const { owner, repo } = context.repo;
@@ -523,10 +752,122 @@ jobs:
               await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
             }
 
+      - name: Re-dispatch once if the partner credential was stale
+        id: autoretry
+        # Needs the PR number for both the re-dispatch input and the loop guard; without one
+        # there is nothing to key the guard on, so fail normally instead of risking a loop.
+        if: always() && steps.sampler.outputs.stale_auth == 'true' && inputs.pull_request_number != ''
+        continue-on-error: true
+        uses: actions/github-script@v8
+        env:
+          PARTNER: ${{ inputs.partner }}
+          PR_NUMBER: ${{ inputs.pull_request_number }}
+          # Resolves to the CALLER's top-level workflow, e.g.
+          # silverfin/be_market/.github/workflows/run_sampler.yml@refs/heads/main
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          # Needs a token that can dispatch a workflow; the default GITHUB_TOKEN cannot.
+          github-token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = parseInt(process.env.PR_NUMBER, 10);
+            const partner = process.env.PARTNER;
+            // One marker per partner per PR: a second stale-auth failure for the same pair has
+            // a cause this retry cannot fix, and retrying it forever would pin the partner.
+            const marker = `<!-- silverfin-sampler-autoretry-${partner} -->`;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: prNumber, per_page: 100,
+            });
+            if (comments.some((c) => c.body && c.body.includes(marker))) {
+              core.warning(`Already auto-retried partner ${partner} on this PR once; not retrying again.`);
+              core.setOutput("retried", "false");
+              return;
+            }
+
+            // "owner/repo/.github/workflows/<file>@<ref>" -> "<file>" and "<ref>".
+            const ref = process.env.WORKFLOW_REF.split("@").slice(1).join("@");
+            const workflowFile = process.env.WORKFLOW_REF.split("@")[0].split("/.github/workflows/")[1];
+            if (!workflowFile || !ref) {
+              core.warning(`Could not parse a workflow file and ref from '${process.env.WORKFLOW_REF}' - not retrying.`);
+              core.setOutput("retried", "false");
+              return;
+            }
+
+            // Checked BEFORE the marker is written, not after: createWorkflowDispatch only accepts
+            // a branch or a tag, and a caller triggered by `pull_request` resolves to
+            // `refs/pull/<n>/merge`, which 422s. Since the marker is deliberately written first
+            // (see below), discovering that afterwards would spend this PR's one retry on a
+            // dispatch that never happened - and `continue-on-error` would hide it.
+            if (ref.startsWith("refs/") && !/^refs\/(heads|tags)\//.test(ref)) {
+              core.warning(`Caller ref '${ref}' is neither a branch nor a tag, so it cannot be dispatched (a pull_request-triggered caller resolves to refs/pull/<n>/merge). Not retrying; re-run this workflow manually.`);
+              core.setOutput("retried", "false");
+              return;
+            }
+
+            // Marker first: if the dispatch succeeds but this write then fails, the next stale
+            // failure would retry again. Writing first can only ever under-retry, never loop.
+            // The dispatch below therefore rolls the marker back on failure, so a retry is only
+            // consumed when a run was actually created.
+            const { data: markerComment } = await github.rest.issues.createComment({
+              owner, repo, issue_number: prNumber,
+              body: [
+                `### ♻️ Sampler auto-retry · partner \`${partner}\``,
+                "",
+                "The previous run held a partner credential that another run had already spent, so it",
+                `could not authenticate ([run](${process.env.RUN_URL})). GitHub snapshots secrets when a run is *created*, so a`,
+                "queued run cannot see a token refreshed after it was queued - only a new run can.",
+                "",
+                "Re-dispatching once. This comment is also the loop guard: no further automatic retry",
+                "will fire for this partner on this PR.",
+                "",
+                marker,
+              ].join("\n"),
+            });
+
+            try {
+              await github.rest.actions.createWorkflowDispatch({
+                owner, repo, workflow_id: workflowFile, ref,
+                inputs: { pull_request_number: String(prNumber) },
+              });
+            } catch (e) {
+              // The marker is already posted, so without this rollback a failed dispatch would
+              // silently spend this PR's one retry on a run that never existed - and
+              // `continue-on-error` would hide it. Seen live: a 403 "Resource not accessible by
+              // personal access token", because dispatching a workflow needs Actions: write on
+              // REPO_ACCESS_TOKEN, which writing a secret does not.
+              //
+              // Deleting can only under-retry (if the delete also fails, we are back to the old
+              // behaviour), never loop, so it is safe to attempt unconditionally.
+              try {
+                await github.rest.issues.deleteComment({ owner, repo, comment_id: markerComment.id });
+              } catch (delErr) {
+                core.warning(`Could not roll back the auto-retry marker (${delErr.status || delErr.message}); this PR will not auto-retry for partner ${partner} again.`);
+              }
+              core.error(`Could not re-dispatch ${workflowFile} on ${ref} for PR #${prNumber}: ${e.status || ""} ${e.message}. If this is a 403, REPO_ACCESS_TOKEN needs Actions: write (a repo-scoped token that can set secrets still cannot dispatch a workflow). Re-run the sampler manually.`);
+              core.setOutput("retried", "false");
+              return;
+            }
+            core.notice(`Re-dispatched ${workflowFile} on ${ref} for PR #${prNumber} (partner ${partner}).`);
+            core.setOutput("retried", "true");
+
       - name: Fail job if the sampler run did not complete successfully
         if: always() && steps.sampler.outputs.sampler_ok != 'true'
         env:
           PARTNER: ${{ inputs.partner }}
+          STALE_AUTH: ${{ steps.sampler.outputs.stale_auth }}
+          RETRIED: ${{ steps.autoretry.outputs.retried }}
         run: |
-          echo "::error::Sampler run for partner ${PARTNER} did not complete successfully — see the run-sampler step output above."
+          if [[ "${STALE_AUTH}" == "true" ]]; then
+            # Reports what actually happened rather than what was attempted: the re-dispatch is
+            # `continue-on-error`, and it declines outright on a non-dispatchable caller ref.
+            if [[ "${RETRIED}" == "true" ]]; then
+              echo "::error::Partner ${PARTNER}'s stored credential was already spent by another run, so this run could not authenticate. This job still fails (its results are gone), but a fresh run has been dispatched — see the auto-retry comment."
+            else
+              echo "::error::Partner ${PARTNER}'s stored credential was already spent by another run, so this run could not authenticate. No automatic retry was dispatched (already retried once on this PR, no PR number, a caller ref that cannot be dispatched, or the dispatch itself failed) — re-run this workflow manually."
+            fi
+          else
+            echo "::error::Sampler run for partner ${PARTNER} did not complete successfully — see the run-sampler step output above."
+          fi
           exit 1
