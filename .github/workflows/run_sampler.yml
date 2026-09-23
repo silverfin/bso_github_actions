@@ -278,7 +278,8 @@ jobs:
             echo "----- run-sampler output (exit ${RC}) -----"
             echo "$OUTPUT"
             echo "--------------------------------------------"
-            if [[ "${RC}" -eq 124 ]]; then
+            # 124 on SIGTERM, 137 when --kill-after had to escalate to SIGKILL.
+            if [[ "${RC}" -eq 124 || "${RC}" -eq 137 ]]; then
               echo "::error::run-sampler was stopped at the step deadline so the write-back and PR comment still run. The backend run${SAMPLER_ID:+ ${SAMPLER_ID}} is NOT cancelled and will 422 the next attempt${SAMPLER_ID:+; re-read it with: run-sampler -p ${SAMPLER_PARTNER} --id ${SAMPLER_ID} --compact}. If the kill landed mid-refresh, the stored partner credential may now be spent - re-authorize partner ${SAMPLER_PARTNER} if the next run 401s."
               break
             fi
