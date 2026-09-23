@@ -91,8 +91,8 @@ concurrency:
 jobs:
   run-sampler:
     runs-on: ubuntu-latest
-    # Generous ceiling: a single run is ~30-60 min, plus up to ~90 min of poll-and-retry on a
-    # cross-repo 422 collision (see the retry loop below).
+    # Generous ceiling: a single run is ~30-60 min, plus poll-and-retry on a cross-repo 422
+    # collision; STEP_DEADLINE in the sampler step keeps ~45 min of it for the tail.
     timeout-minutes: 180
     # Job-level (not just on the sampler step): the CLI checks for these at process startup for
     # every command, including a bare `-V` version probe - confirmed live (the "Install
@@ -233,9 +233,8 @@ jobs:
           # GitHub Actions concurrency (group + queue: max) serializes runs within THIS repo, but
           # concurrency groups do not span repositories — two market repos sharing this partner id
           # can still collide. The backend's own one-run-per-partner 422 is the real cross-repo
-          # mutex, so treat it as a "try again shortly" signal, not a hard failure. Bounded to
-          # match the worst-case run length (~60 min) plus margin.
-          DEADLINE=$(( $(date +%s) + 90*60 ))
+          # mutex, so treat it as a "try again shortly" signal, not a hard failure. Bounded by
+          # DEADLINE below.
           # Separate, harder bound. The job is capped by `timeout-minutes`, and a cancellation at
           # that cap kills the `if: always()` write-back, artifact and PR-comment steps outright -
           # so the rotated partner token would be lost and nothing would be reported. Everything
@@ -254,6 +253,10 @@ jobs:
           STEP_DEADLINE=$(( ${JOB_STARTED_AT:-$(date +%s)} + 135*60 ))
           # Floored at 1: `timeout 0` means no timeout at all.
           remaining() { local r=$(( STEP_DEADLINE - $(date +%s) )); echo $(( r > 1 ? r : 1 )); }
+          # Last moment a 422 retry may start: a run takes up to ~60 min, and an attempt that
+          # can't finish is killed at STEP_DEADLINE and orphans a backend run that 422s every
+          # repo using this partner.
+          DEADLINE=$(( STEP_DEADLINE - 60*60 ))
           ATTEMPT=1
           while true; do
             # %q-quoted so a name containing spaces is visibly one argument in the log.
@@ -278,8 +281,9 @@ jobs:
             echo "----- run-sampler output (exit ${RC}) -----"
             echo "$OUTPUT"
             echo "--------------------------------------------"
-            # 124 on SIGTERM, 137 when --kill-after had to escalate to SIGKILL.
-            if [[ "${RC}" -eq 124 || "${RC}" -eq 137 ]]; then
+            # 124 on SIGTERM, 137 when --kill-after had to escalate to SIGKILL - but 137 is also
+            # any other SIGKILL (the OOM killer), so only past the deadline.
+            if [[ "${RC}" -eq 124 ]] || { [[ "${RC}" -eq 137 ]] && (( $(date +%s) >= STEP_DEADLINE )); }; then
               echo "::error::run-sampler was stopped at the step deadline so the write-back and PR comment still run. The backend run${SAMPLER_ID:+ ${SAMPLER_ID}} is NOT cancelled and will 422 the next attempt${SAMPLER_ID:+; re-read it with: run-sampler -p ${SAMPLER_PARTNER} --id ${SAMPLER_ID} --compact}. If the kill landed mid-refresh, the stored partner credential may now be spent - re-authorize partner ${SAMPLER_PARTNER} if the next run 401s."
               break
             fi
@@ -362,13 +366,7 @@ jobs:
                 # (write-back, PR comment) still run via their own `if:` conditions instead of
                 # being skipped by a hard step failure. The final "Fail job" step still fails
                 # the job overall.
-                echo "::error::Partner ${SAMPLER_PARTNER} still has a sampler run in progress after 90 minutes of retrying. Giving up — check whether a previous run is stuck (§2.3/2.4c: no CLI cancel exists for a backend run)."
-                break
-              fi
-              # A run takes up to ~60 min; an attempt that can't finish is killed at the deadline
-              # and orphans a backend run that 422s every repo using this partner.
-              if (( $(remaining) < 60*60 )); then
-                echo "::error::Partner ${SAMPLER_PARTNER} still has a sampler run in progress and the step deadline leaves too little time for a full run. Giving up."
+                echo "::error::Partner ${SAMPLER_PARTNER} still has a sampler run in progress, and the step deadline leaves too little time to start a full run. Giving up — check whether a previous run is stuck (§2.3/2.4c: no CLI cancel exists for a backend run)."
                 break
               fi
               echo "[$(date -u +%H:%M:%S)] partner ${SAMPLER_PARTNER} has a run in progress elsewhere (cross-repo or stale) — retrying in 60s..."
@@ -427,7 +425,7 @@ jobs:
           echo "report_url=${REPORT_URL}" >> "$GITHUB_OUTPUT"
 
           # Compact named_results diff, between the CLI's own markers.
-          COMPACT=$(echo "$OUTPUT" | sed 's/\x1b\[[0-9;]*m//g' | awk '/SAMPLER_COMPACT_START/{f=1;next} /SAMPLER_COMPACT_END/{f=0} f')
+          COMPACT=$(echo "$OUTPUT" | sed 's/\x1b\[[0-9;]*m//g' | awk '$0=="<!-- SAMPLER_COMPACT_START -->"{f=1;next} $0=="<!-- SAMPLER_COMPACT_END -->"{f=0} f')
           {
             echo "compact<<SAMPLER_COMPACT_EOF_9c2a"
             echo "$COMPACT"
