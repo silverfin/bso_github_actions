@@ -240,9 +240,14 @@ jobs:
             printf ' --firm-ids %s --compact\n' "${SAMPLER_FIRM_IDS}"
             set +e
             # shellcheck disable=SC2086 # SAMPLER_FIRM_IDS is intentionally word-split (space-separated ids -> separate args)
-            OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1 | tr -d '\r')
+            # Not piped into `tr` here: this step has no explicit `shell: bash`, so it runs as
+            # `bash -e {0}` with no pipefail, and `$?` after a pipeline is the LAST command's
+            # status - `tr`'s, which is always 0. That silently kills every RC-gated branch
+            # below, the stale-auth re-dispatch included. Strip the CRs after capturing.
+            OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1)
             RC=$?
             set -e
+            OUTPUT=$(tr -d '\r' <<< "${OUTPUT}")
             # head, not tail: the CLI prints this line exactly once, before it renders anything,
             # so the first match is its own. Taking the last would let sampled template content
             # spoof the id.
@@ -523,7 +528,13 @@ jobs:
               const pad = s.startsWith("`") || s.endsWith("`") ? " " : "";
               return `${fence}${pad}${s}${pad}${fence}`;
             };
-            const fmtNames = v => (v || "").split("\n").map(s => s.trim()).filter(Boolean).map(codeSpan).join(", ");
+            // A code span only changes how text RENDERS; the raw characters stay in the body, and
+            // both the update-in-place lookup and any provenance consumer read the raw body. So a
+            // directory named `<!-- silverfin-sampler-result-9 -->` would plant another partner's
+            // marker in this comment and let their next run overwrite it. U+2011 renders as a
+            // hyphen but cannot delimit an HTML comment.
+            const neutraliseComments = (s) => s.replace(/<!--/g, "<!‑‑").replace(/--!?>/g, "‑‑>");
+            const fmtNames = v => (v || "").split("\n").map(s => s.trim()).filter(Boolean).map(codeSpan).map(neutraliseComments).join(", ");
             if (process.env.HANDLES) lines.push(`- Reconciliation handles: ${fmtNames(process.env.HANDLES)}`);
             if (process.env.ACCOUNT_TEMPLATES) lines.push(`- Account templates: ${fmtNames(process.env.ACCOUNT_TEMPLATES)}`);
             lines.push(`- Firm(s): \`${process.env.FIRM_IDS}\``);
@@ -547,7 +558,7 @@ jobs:
               // Escaping the real block does nothing about a forged one, so neutralise the comment
               // delimiters at the source. U+2011 renders as a hyphen but cannot open or close an
               // HTML comment.
-              lines.push(compact.replace(/<!--/g, "<!‑‑").replace(/--!?>/g, "‑‑>"));
+              lines.push(neutraliseComments(compact));
             } else if (ok) {
               lines.push("_No compact diff was produced (see the run log)._");
             }
@@ -630,6 +641,17 @@ jobs:
               return;
             }
 
+            // Checked BEFORE the marker is written, not after: createWorkflowDispatch only accepts
+            // a branch or a tag, and a caller triggered by `pull_request` resolves to
+            // `refs/pull/<n>/merge`, which 422s. Since the marker is deliberately written first
+            // (see below), discovering that afterwards would spend this PR's one retry on a
+            // dispatch that never happened - and `continue-on-error` would hide it.
+            if (ref.startsWith("refs/") && !/^refs\/(heads|tags)\//.test(ref)) {
+              core.warning(`Caller ref '${ref}' is neither a branch nor a tag, so it cannot be dispatched (a pull_request-triggered caller resolves to refs/pull/<n>/merge). Not retrying; re-run this workflow manually.`);
+              core.setOutput("retried", "false");
+              return;
+            }
+
             // Marker first: if the dispatch succeeds but this write then fails, the next stale
             // failure would retry again. Writing first can only ever under-retry, never loop.
             await github.rest.issues.createComment({
@@ -660,9 +682,16 @@ jobs:
         env:
           PARTNER: ${{ inputs.partner }}
           STALE_AUTH: ${{ steps.sampler.outputs.stale_auth }}
+          RETRIED: ${{ steps.autoretry.outputs.retried }}
         run: |
           if [[ "${STALE_AUTH}" == "true" ]]; then
-            echo "::error::Partner ${PARTNER}'s stored credential was already spent by another run, so this run could not authenticate. This job still fails (its results are gone), but a fresh run has been dispatched if this was the first such failure on this PR — see the auto-retry comment."
+            # Reports what actually happened rather than what was attempted: the re-dispatch is
+            # `continue-on-error`, and it declines outright on a non-dispatchable caller ref.
+            if [[ "${RETRIED}" == "true" ]]; then
+              echo "::error::Partner ${PARTNER}'s stored credential was already spent by another run, so this run could not authenticate. This job still fails (its results are gone), but a fresh run has been dispatched — see the auto-retry comment."
+            else
+              echo "::error::Partner ${PARTNER}'s stored credential was already spent by another run, so this run could not authenticate. No automatic retry was dispatched (already retried once on this PR, no PR number, a caller ref that cannot be dispatched, or the dispatch itself failed) — re-run this workflow manually."
+            fi
           else
             echo "::error::Sampler run for partner ${PARTNER} did not complete successfully — see the run-sampler step output above."
           fi
