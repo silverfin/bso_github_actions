@@ -227,6 +227,11 @@ jobs:
           # mutex, so treat it as a "try again shortly" signal, not a hard failure. Bounded to
           # match the worst-case run length (~60 min) plus margin.
           DEADLINE=$(( $(date +%s) + 90*60 ))
+          # Separate, harder bound. The job is capped by `timeout-minutes`, and a cancellation at
+          # that cap kills the `if: always()` write-back, artifact and PR-comment steps outright -
+          # so the rotated partner token would be lost and nothing would be reported. Everything
+          # below must finish with enough margin left for those steps to run.
+          STEP_DEADLINE=$(( $(date +%s) + 160*60 ))
           ATTEMPT=1
           while true; do
             # %q-quoted so a name containing spaces is visibly one argument in the log.
@@ -238,7 +243,11 @@ jobs:
             OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1 | tr -d '\r')
             RC=$?
             set -e
-            SAMPLER_ID=$(printf '%s\n' "${OUTPUT}" | sed -n 's/.*Sampler run started with ID: \([0-9][0-9]*\).*/\1/p' | tail -n 1)
+            # head, not tail: the CLI prints this line exactly once, before it renders anything,
+            # so the first match is its own. Taking the last would let sampled template content
+            # spoof the id.
+            SAMPLER_ID=$(printf '%s\n' "${OUTPUT}" | sed -n 's/.*Sampler run started with ID: \([0-9][0-9]*\).*/\1/p' | head -n 1)
+            REATTACHED=false
             echo "----- run-sampler output (exit ${RC}) -----"
             echo "$OUTPUT"
             echo "--------------------------------------------"
@@ -254,33 +263,59 @@ jobs:
             # `--id` is a single status read, not a poll, and the CLI only times out while the run
             # is still going — so one read would always come back "still in progress". Keep
             # re-reading on its own budget (the loop's DEADLINE is long gone by now).
-            if [[ -n "${SAMPLER_ID}" ]] && printf '%s' "${OUTPUT}" | grep -qF 'Timeout. Try to fetch the status by using the --id flag'; then
-              echo "::notice::Polling timed out; re-attaching to sampler run ${SAMPLER_ID} rather than starting a new one."
-              REATTACH_DEADLINE=$(( $(date +%s) + 30*60 ))
-              while true; do
-                set +e
-                # Not piped into `tr` here, so ${RC} is node's own status; stripped afterwards.
-                OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-sampler -p "${SAMPLER_PARTNER}" --id "${SAMPLER_ID}" --compact 2>&1)
-                RC=$?
-                set -e
-                OUTPUT=$(tr -d '\r' <<< "${OUTPUT}")
-                echo "----- run-sampler --id output (exit ${RC}) -----"
-                echo "$OUTPUT"
-                echo "-----------------------------------------------"
-                if ! printf '%s' "${OUTPUT}" | grep -q 'still in progress'; then
-                  break
-                fi
-                if (( $(date +%s) >= REATTACH_DEADLINE )); then
-                  # A still-running status read exits 0; don't let that read as success.
-                  echo "::error::Sampler run ${SAMPLER_ID} is still running 30 minutes after the CLI stopped polling. Giving up — the backend run is not cancelled."
-                  RC=1
-                  break
-                fi
-                sleep 60
-              done
+            if printf '%s' "${OUTPUT}" | grep -qF 'Timeout. Try to fetch the status by using the --id flag'; then
+              if [[ -z "${SAMPLER_ID}" ]]; then
+                # Without an id there is nothing to re-attach to, and the run keeps going
+                # server-side regardless - say so, or the next attempt's 422 looks unexplained.
+                echo "::error::Polling timed out but no sampler run id could be parsed from the output, so this run cannot be re-attached to. It is still running for partner ${SAMPLER_PARTNER} and will 422 the next attempt."
+              else
+                echo "::notice::Polling timed out; re-attaching to sampler run ${SAMPLER_ID} rather than starting a new one."
+                REATTACHED=true
+                REATTACH_DEADLINE=$(( $(date +%s) + 30*60 ))
+                if (( REATTACH_DEADLINE > STEP_DEADLINE )); then REATTACH_DEADLINE=${STEP_DEADLINE}; fi
+                while true; do
+                  set +e
+                  # Not piped into `tr` here, so ${RC} is node's own status; stripped afterwards.
+                  OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-sampler -p "${SAMPLER_PARTNER}" --id "${SAMPLER_ID}" --compact 2>&1)
+                  RC=$?
+                  set -e
+                  OUTPUT=$(tr -d '\r' <<< "${OUTPUT}")
+                  echo "----- run-sampler --id output (exit ${RC}) -----"
+                  echo "$OUTPUT"
+                  echo "-----------------------------------------------"
+                  # Break only on a verdict the backend actually reached. Matched on the CLI's own
+                  # sentences rather than on ${RC}, because it exits 1 for two very different
+                  # things: a run that failed, and a status read that failed. Treating the latter
+                  # as terminal - which "anything that isn't still-in-progress" does - abandons a
+                  # live run on one network blip, which is the exact collision this block exists
+                  # to prevent.
+                  if printf '%s' "${OUTPUT}" | grep -qF \
+                       -e 'Sampler run completed successfully' \
+                       -e 'Sampler run failed:' \
+                       -e 'Sampler completed but no result URL was returned' \
+                       -e 'Unexpected sampler status:'; then
+                    break
+                  fi
+                  if (( $(date +%s) >= REATTACH_DEADLINE )); then
+                    if printf '%s' "${OUTPUT}" | grep -qF 'Sampler run is still in progress'; then
+                      echo "::error::Sampler run ${SAMPLER_ID} was still running at the re-attach deadline. The backend run is NOT cancelled and will 422 the next attempt; re-read it with: run-sampler -p ${SAMPLER_PARTNER} --id ${SAMPLER_ID} --compact"
+                    else
+                      echo "::error::Could not read the status of sampler run ${SAMPLER_ID} before the re-attach deadline (last exit ${RC}). The backend run is NOT cancelled."
+                    fi
+                    # A still-in-progress read exits 0; don't let that read as success.
+                    RC=1
+                    break
+                  fi
+                  sleep 60
+                done
+              fi
             fi
 
-            if echo "$OUTPUT" | grep -qi "already in progress"; then
+            # Skipped after a re-attach: OUTPUT then holds a status read for the run this job is
+            # deliberately attached to, including (once it completes) the rendered compact diff.
+            # Matching that as a collision would start a brand-new run against the one just waited
+            # for.
+            if [[ "${REATTACHED}" != "true" ]] && echo "$OUTPUT" | grep -qi "already in progress"; then
               NOW=$(date +%s)
               if (( NOW >= DEADLINE )); then
                 # Don't exit here: fall through to the normal output-setting logic below (which
@@ -488,7 +523,14 @@ jobs:
             lines.push(`- Workflow run: ${runUrl}`);
             lines.push("");
             if (compact) {
-              lines.push(compact);
+              // Rendered output of PR-controlled templates, so it can contain anything - including
+              // a literal copy of one of the HTML-comment markers below. A forged provenance block
+              // would sit ABOVE the real one and win for any consumer taking the first match, and a
+              // forged result marker would redirect the update-in-place lookup to another comment.
+              // Escaping the real block does nothing about a forged one, so neutralise the comment
+              // delimiters at the source. U+2011 renders as a hyphen but cannot open or close an
+              // HTML comment.
+              lines.push(compact.replace(/<!--/g, "<!‑‑").replace(/--!?>/g, "‑‑>"));
             } else if (ok) {
               lines.push("_No compact diff was produced (see the run log)._");
             }
