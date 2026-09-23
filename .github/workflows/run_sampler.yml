@@ -149,7 +149,7 @@ jobs:
           # and a rebase can orphan it entirely. The pin before last (5accd6b) was exactly that:
           # a pre-rebase copy of "Make --add-diffs-folder's zip write atomic", no longer an
           # ancestor of its branch, and missing five later compact-diff fixes.
-          npm install https://github.com/silverfin/silverfin-cli.git#f6e20ba8ac60611a8426b60b0ba5fe6fd37b3ac8
+          npm install https://github.com/silverfin/silverfin-cli.git#7833b43e8a47dab93d9ff5bcafb6f0cd1cb39d8e
           echo "SILVERFIN_CLI_BIN=${GITHUB_WORKSPACE}/node_modules/silverfin-cli/bin/cli.js" >> "$GITHUB_ENV"
           VERSION=$(node "${GITHUB_WORKSPACE}/node_modules/silverfin-cli/bin/cli.js" -V)
           echo "CLI version: ${VERSION}"
