@@ -406,8 +406,9 @@ jobs:
           # Both lines required: the CLI prints "Error refreshing credentials" for every refresh
           # failure, network errors and 5xx included, and those must not spend the PR's one retry.
           # Matched outside the compact diff, which is PR-rendered content and could otherwise
-          # fake both lines to spend the retry.
-          CLI_LINES=$(printf '%s\n' "$OUTPUT" | awk '/SAMPLER_COMPACT_START/{f=1} !f; /SAMPLER_COMPACT_END/{f=0}')
+          # fake both lines to spend the retry. Whole-line markers: the CLI escapes only the
+          # `<!--`, so the marker text itself can still appear inside the diff.
+          CLI_LINES=$(printf '%s\n' "$OUTPUT" | awk '$0=="<!-- SAMPLER_COMPACT_START -->"{f=1} !f; $0=="<!-- SAMPLER_COMPACT_END -->"{f=0}')
           if [[ "${RC}" -ne 0 ]] && grep -qF 'Error refreshing credentials' <<< "${CLI_LINES}" \
              && grep -qF 'Response Status: 401' <<< "${CLI_LINES}"; then
             echo "stale_auth=true" >> "$GITHUB_OUTPUT"
@@ -482,7 +483,7 @@ jobs:
           # PR comment link below falls back to that presigned URL, which may already be dead.
           # The workspace is the untrusted PR tree: drop a committed results.zip (or a symlink
           # curl would write through) before downloading.
-          rm -f results.zip
+          rm -rf results.zip
           if curl -sL --fail --max-time 300 -o results.zip "${REPORT_URL}"; then
             echo "downloaded=true" >> "$GITHUB_OUTPUT"
           else
