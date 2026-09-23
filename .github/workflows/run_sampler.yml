@@ -705,7 +705,9 @@ jobs:
 
             // Marker first: if the dispatch succeeds but this write then fails, the next stale
             // failure would retry again. Writing first can only ever under-retry, never loop.
-            await github.rest.issues.createComment({
+            // The dispatch below therefore rolls the marker back on failure, so a retry is only
+            // consumed when a run was actually created.
+            const { data: markerComment } = await github.rest.issues.createComment({
               owner, repo, issue_number: prNumber,
               body: [
                 `### ♻️ Sampler auto-retry · partner \`${partner}\``,
@@ -721,10 +723,29 @@ jobs:
               ].join("\n"),
             });
 
-            await github.rest.actions.createWorkflowDispatch({
-              owner, repo, workflow_id: workflowFile, ref,
-              inputs: { pull_request_number: String(prNumber) },
-            });
+            try {
+              await github.rest.actions.createWorkflowDispatch({
+                owner, repo, workflow_id: workflowFile, ref,
+                inputs: { pull_request_number: String(prNumber) },
+              });
+            } catch (e) {
+              // The marker is already posted, so without this rollback a failed dispatch would
+              // silently spend this PR's one retry on a run that never existed - and
+              // `continue-on-error` would hide it. Seen live: a 403 "Resource not accessible by
+              // personal access token", because dispatching a workflow needs Actions: write on
+              // REPO_ACCESS_TOKEN, which writing a secret does not.
+              //
+              // Deleting can only under-retry (if the delete also fails, we are back to the old
+              // behaviour), never loop, so it is safe to attempt unconditionally.
+              try {
+                await github.rest.issues.deleteComment({ owner, repo, comment_id: markerComment.id });
+              } catch (delErr) {
+                core.warning(`Could not roll back the auto-retry marker (${delErr.status || delErr.message}); this PR will not auto-retry for partner ${partner} again.`);
+              }
+              core.error(`Could not re-dispatch ${workflowFile} on ${ref} for PR #${prNumber}: ${e.status || ""} ${e.message}. If this is a 403, REPO_ACCESS_TOKEN needs Actions: write (a repo-scoped token that can set secrets still cannot dispatch a workflow). Re-run the sampler manually.`);
+              core.setOutput("retried", "false");
+              return;
+            }
             core.notice(`Re-dispatched ${workflowFile} on ${ref} for PR #${prNumber} (partner ${partner}).`);
             core.setOutput("retried", "true");
 
