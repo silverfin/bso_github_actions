@@ -336,7 +336,11 @@ jobs:
               [ -z "${DIR}" ] && continue
               if [ -n "${PUSHED[$DIR]+x}" ]; then
                 echo "Skip ${DIR} — already pushed (PR #${FIRST_PR[$DIR]})."
-                DUP_WARNINGS+=("\`${DIR}\` was changed in PR #${FIRST_PR[$DIR]} and PR #${NUM} — kept PR #${FIRST_PR[$DIR]}'s version.")
+                # Stripped, not fenced - same technique already used below for ${OUT} - since DIR
+                # is a repo-tree directory name and a backtick in it would otherwise break out of
+                # this markdown code span.
+                SAFE_DIR=$(tr -d '`|' <<< "${DIR}")
+                DUP_WARNINGS+=("\`${SAFE_DIR}\` was changed in PR #${FIRST_PR[$DIR]} and PR #${NUM} — kept PR #${FIRST_PR[$DIR]}'s version.")
                 continue
               fi
               ORDER+=("${DIR}")
@@ -424,7 +428,10 @@ jobs:
               echo "| Template | PR | Result |"
               echo "|---|---|---|"
               for D in "${ORDER[@]}"; do
-                echo "| \`${D}\` | #${FIRST_PR[$D]} | ${PUSHED[$D]} |"
+                # A pipe in D would also break this table's own column structure, not just the
+                # code span - stripped for the same reason as the DUP_WARNINGS case above.
+                SAFE_D=$(tr -d '`|' <<< "${D}")
+                echo "| \`${SAFE_D}\` | #${FIRST_PR[$D]} | ${PUSHED[$D]} |"
               done
               if [ -n "${SHARED_PART_LINK_NOTE}" ]; then
                 echo ""
