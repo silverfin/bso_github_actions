@@ -346,6 +346,23 @@ jobs:
             echo "sampler_ok=false" >> "$GITHUB_OUTPUT"
           fi
 
+          # A stale partner credential, told apart from every other failure.
+          #
+          # `secrets.*` is snapshotted when the RUN is created, not when the job starts, so a
+          # run that was queued while a sibling run refreshed this partner's token is holding a
+          # credential that has since been spent - refresh_api_key consumes the old key to mint
+          # the new one, so there is exactly one live value at a time. The CLI then fails its
+          # own refresh with a 401, which is what this matches.
+          #
+          # Nothing in-run can fix it: the snapshot is fixed for the job's lifetime and GitHub
+          # secrets cannot be read back through the API. Only a NEW run gets a fresh snapshot,
+          # which is what the re-dispatch step below is for.
+          if [[ "${RC}" -ne 0 ]] && echo "$OUTPUT" | grep -qF 'Error refreshing credentials'; then
+            echo "stale_auth=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "stale_auth=false" >> "$GITHUB_OUTPUT"
+          fi
+
           # Report URL: "Sampler report: https://..." (strip ANSI first).
           # `|| true`: under `set -eo pipefail`, grep finding no match (a failed/timed-out run
           # never prints this line) makes the whole pipeline's exit status non-zero even though
@@ -570,10 +587,83 @@ jobs:
               await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
             }
 
+      - name: Re-dispatch once if the partner credential was stale
+        id: autoretry
+        # Needs the PR number for both the re-dispatch input and the loop guard; without one
+        # there is nothing to key the guard on, so fail normally instead of risking a loop.
+        if: always() && steps.sampler.outputs.stale_auth == 'true' && inputs.pull_request_number != ''
+        continue-on-error: true
+        uses: actions/github-script@v8
+        env:
+          PARTNER: ${{ inputs.partner }}
+          PR_NUMBER: ${{ inputs.pull_request_number }}
+          # Resolves to the CALLER's top-level workflow, e.g.
+          # silverfin/be_market/.github/workflows/run_sampler.yml@refs/heads/main
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          # Needs a token that can dispatch a workflow; the default GITHUB_TOKEN cannot.
+          github-token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = parseInt(process.env.PR_NUMBER, 10);
+            const partner = process.env.PARTNER;
+            // One marker per partner per PR: a second stale-auth failure for the same pair has
+            // a cause this retry cannot fix, and retrying it forever would pin the partner.
+            const marker = `<!-- silverfin-sampler-autoretry-${partner} -->`;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: prNumber, per_page: 100,
+            });
+            if (comments.some((c) => c.body && c.body.includes(marker))) {
+              core.warning(`Already auto-retried partner ${partner} on this PR once; not retrying again.`);
+              core.setOutput("retried", "false");
+              return;
+            }
+
+            // "owner/repo/.github/workflows/<file>@<ref>" -> "<file>" and "<ref>".
+            const ref = process.env.WORKFLOW_REF.split("@").slice(1).join("@");
+            const workflowFile = process.env.WORKFLOW_REF.split("@")[0].split("/.github/workflows/")[1];
+            if (!workflowFile || !ref) {
+              core.warning(`Could not parse a workflow file and ref from '${process.env.WORKFLOW_REF}' - not retrying.`);
+              core.setOutput("retried", "false");
+              return;
+            }
+
+            // Marker first: if the dispatch succeeds but this write then fails, the next stale
+            // failure would retry again. Writing first can only ever under-retry, never loop.
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: prNumber,
+              body: [
+                `### ♻️ Sampler auto-retry · partner \`${partner}\``,
+                "",
+                "The previous run held a partner credential that another run had already spent, so it",
+                `could not authenticate ([run](${process.env.RUN_URL})). GitHub snapshots secrets when a run is *created*, so a`,
+                "queued run cannot see a token refreshed after it was queued - only a new run can.",
+                "",
+                "Re-dispatching once. This comment is also the loop guard: no further automatic retry",
+                "will fire for this partner on this PR.",
+                "",
+                marker,
+              ].join("\n"),
+            });
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner, repo, workflow_id: workflowFile, ref,
+              inputs: { pull_request_number: String(prNumber) },
+            });
+            core.notice(`Re-dispatched ${workflowFile} on ${ref} for PR #${prNumber} (partner ${partner}).`);
+            core.setOutput("retried", "true");
+
       - name: Fail job if the sampler run did not complete successfully
         if: always() && steps.sampler.outputs.sampler_ok != 'true'
         env:
           PARTNER: ${{ inputs.partner }}
+          STALE_AUTH: ${{ steps.sampler.outputs.stale_auth }}
         run: |
-          echo "::error::Sampler run for partner ${PARTNER} did not complete successfully — see the run-sampler step output above."
+          if [[ "${STALE_AUTH}" == "true" ]]; then
+            echo "::error::Partner ${PARTNER}'s stored credential was already spent by another run, so this run could not authenticate. This job still fails (its results are gone), but a fresh run has been dispatched if this was the first such failure on this PR — see the auto-retry comment."
+          else
+            echo "::error::Sampler run for partner ${PARTNER} did not complete successfully — see the run-sampler step output above."
+          fi
           exit 1
