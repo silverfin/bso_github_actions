@@ -1,0 +1,468 @@
+---
+name: writing-bso-workflows
+description: Use when creating or editing a .github/workflows/*.yml file (or scripts/*.sh it calls) in bso_github_actions - distilled from repeated /review-pr findings, so the same mistakes don't get re-flagged on every new workflow.
+---
+
+# Writing bso_github_actions workflows
+
+## Overview
+
+This repo's `/review-pr` history (`.cursor/review-learnings/`) shows the same ~8 mistakes
+getting introduced in new workflow files, then caught in review, over and over - often in a
+file that gets the pattern right in one step and wrong in the next step of the *same* diff.
+This skill is the checklist to apply BEFORE writing, so the reviewer doesn't have to.
+
+**Also read `.cursor/review-learnings/_syntax.md` in full** - it holds the platform-mechanics
+facts (GITHUB_OUTPUT limits, workflow_call boundaries, etc.) this skill builds on, kept there
+instead of duplicated here. If you're editing a workflow that already has its own topic file
+under `.cursor/review-learnings/` (check `INDEX.md`), read that file too - it has the specific
+history for that exact file.
+
+## The checklist
+
+1. **Never splice `${{ }}` directly into a `run:` script body.** Always pass through `env:`
+   and reference `$VAR`. This is the single most-repeated finding in this repo's history -
+   check EVERY `${{ }}` in the step, not just the obvious one (a step can fix 4 of 5
+   occurrences and miss the 5th, e.g. the right side of a comparison).
+   ```yaml
+   # Wrong: a filename/title with backticks or $(...) executes as shell code
+   run: echo "Changed: ${{ steps.x.outputs.all_changed_files }}"
+   # Right
+   env:
+     CHANGED: ${{ steps.x.outputs.all_changed_files }}
+   run: echo "Changed: ${CHANGED}"
+   ```
+
+2. **Repo-tree/PR-derived names (handles, template dirs, filenames) need three guards:**
+   - Split newline-separated, never space-separated (`mapfile -t`, not `arr=($(cmd))`) -
+     account template names contain spaces.
+   - Reject a name starting with `-` before passing it to a variadic CLI flag (`-h`/`-at`/
+     `--handle`) - commander reads it as a flag, not a value. `run_sampler.yml`'s
+     `reject_option_like_names` is the reference implementation.
+   - Before embedding in a markdown PR comment: CommonMark-safe backtick fencing (one more
+     backtick than the longest run in the name, space-pad if it starts/ends with a backtick) -
+     NOT backslash-escaping (a backslash is literal inside a code span, doesn't escape
+     anything). Inside a markdown *table cell*, also strip `|` (breaks the column structure) -
+     `tr -d '\`|'` is simpler and acceptable there since exact fidelity doesn't matter as much
+     as in a comment body.
+
+3. **Know which of the two default shells you're getting - they are NOT the same.** An
+   **unspecified** `run:` (no `shell:` key anywhere) runs as plain `bash -e {0}` - no
+   `pipefail`. Only an **explicit** `shell: bash` gets `bash --noprofile --norc -eo pipefail
+   {0}`. Verified directly against GitHub's own docs; every workflow this skill was written
+   from has no explicit `shell:` on its steps, so treat `pipefail` as ABSENT unless you've
+   confirmed otherwise for the specific step.
+   - **With `-e` alone (the common case here):** `VAR=$(cmd | grep ...)` still aborts the step
+     when `grep` finds no match (that part doesn't need pipefail - `grep`/`sort`/etc failing is
+     what aborts, and the pipeline's own reported status is its LAST command's either way) -
+     add `|| true` whenever zero-match is a valid outcome. Process substitution
+     (`done < <(cmd)`) hides a failing command's exit status entirely regardless of pipefail -
+     only use it for best-effort/warn-and-skip logic.
+   - **The dangerous mistake this causes:** `RC=$?` right after `X=$(cmd1 | cmd2)` captures
+     `cmd2`'s exit status, not `cmd1`'s, whenever pipefail is absent - a real bug shipped in
+     this repo's own `run_sampler.yml` (`node ... | tr -d '\r'`, `RC=$?` silently reading
+     `tr`'s always-zero status instead of the CLI's). If you need `cmd1`'s exit code and the
+     step has no explicit `shell: bash`, capture it BEFORE piping - and note a bare
+     `X=$(cmd1)` on its own line still aborts the step under plain `-e` the instant `cmd1`
+     fails, before a following `RC=$?` ever runs, so wrap the capture so `-e` can't fire:
+     ```bash
+     set +e
+     X=$(cmd1)
+     RC=$?
+     set -e
+     X=$(tr ... <<< "$X")
+     ```
+     Put `set -e` **immediately** after `RC=$?`. A follow-up `tr`/`sed` still inside the
+     `set +e` block (the residual after `run_sampler.yml`'s first RC-capture fix, be_market#3178
+     / this repo's #53) can fail silently, empty `X`, and skip a later text match while `RC`
+     still looks like `cmd1`'s. A single capture can use `RC=0; X=$(cmd1) || RC=$?` instead of
+     the `set +e`/`set -e` pair - use `set +e ... set -e` only when you capture or check every
+     command's status before re-enabling `-e`, not just the one you care about.
+     Don't rely on pipefail unless you've added `shell: bash` yourself.
+   - **A guard placed *after* a bare capture never runs for the failure it describes.**
+     `VAR=$(gh ...)` followed by `if [[ -z "${VAR}" ]]; then echo "::error::..."` only covers
+     the case where the command *succeeded* and printed nothing - under `-e` a real API, auth
+     or rate-limit failure aborts at the assignment itself and the carefully-worded message
+     never prints, leaving a bare exit code. When you want a **diagnostic** rather than a
+     status, capture with `if !` and keep the emptiness check as a separate second case:
+     ```bash
+     if ! VAR=$(gh run view "${RUN_ID}" --json createdAt --jq '.createdAt // empty'); then
+       echo "::error::could not query ... (check the PAT's actions:read scope)"
+       exit 1
+     fi
+     if [[ -z "${VAR}" ]]; then echo "::error::... came back empty"; exit 1; fi
+     ```
+
+4. **`$GITHUB_OUTPUT` multiline values need a `key<<DELIMITER` heredoc** - `echo "key=$val"`
+   truncates at the first newline. If the value can contain arbitrary/untrusted content
+   (template output, PR text), don't use a fixed delimiter string - generate one and verify
+   it doesn't collide with the content first.
+
+5. **Repository/organization `secrets.*` are snapshotted when the run is CREATED** - not when
+   its jobs start, and not re-read mid-run (environment secrets are read when a job referencing
+   that environment starts - this repo doesn't use environments, so run-creation is what applies
+   here). Measured on be_market's `experiment_secret_snapshot`: run B was created seconds
+   *before* run A's write landed and started its job two minutes *after* it, and still read the
+   pre-write value. "Queue time" is the same moment loosely, but the precision matters - see the
+   dispatch note at the end of this point. A job that `gh secret set`s a
+   refreshed value does NOT change what a later job in the *same run* reads via
+   `${{ secrets.X }}`. **Merge the writer and the consumer into one job** - this repo's actual
+   fix for this exact problem (`push_to_review_firm.yml`'s refresh-then-push). Don't hand off a
+   secret value via a job output or artifact instead: GitHub can redact/omit an output
+   containing a recognized secret value, and artifacts are plaintext-persisted, readable by
+   anyone with run access - neither is a safe substitute for same-job handling. Being in the
+   same job isn't the whole fix either: `push_to_review_firm.yml`'s refresh action writes the
+   refreshed value to `$HOME/.silverfin/config.json`, and the consumer step reads *that local
+   file* - it never re-reads `${{ secrets.CONFIG_JSON }}`, which is still the queue-time
+   snapshot even within the same job. The secret context itself doesn't update mid-run; only a
+   local write-back does. `needs: some-refresher-job` does NOT imply your job reads the
+   refreshed value either, even if that job runs first - `run_tests.yml`'s `test-templates`
+   job `needs: check-auth` but is a genuinely separate job, and still loads
+   `${{ secrets.CONFIG_JSON }}` (the queue-time snapshot) directly, not a same-run refresh.
+   Whether that's actually safe depends on whether the consumer can tolerate a secret that's
+   at most as stale as the queue-time snapshot (e.g. an access token still well inside its
+   normal validity window) - know which case you're in before assuming `needs:` bought you
+   freshness.
+
+   **A `concurrency:` group does NOT fix a stale-snapshot race between two runs** - it is the
+   obvious-looking fix and it does not work. Serializing makes the second run *wait*, but its
+   snapshot was already taken when it was **queued**, so it still writes back a blob predating
+   the first run's write. The winner's write is reverted just as silently, only later. For a
+   read-whole-blob/write-whole-blob secret the workable pattern is **detect and refuse**: check
+   for other writers and fail loudly, rather than queueing behind them.
+
+   **A guard that looks for other writers has to count its own workflow.** A run-listing check
+   that names the *other* writers but not itself lets two dispatches of the same workflow pass
+   each other, and the second reverts the first. Match on `$GITHUB_WORKFLOW` (not a hand-copied
+   literal name) and exclude only your own run id. Two shapes are fatal, not one: a writer still
+   in flight, **and** a writer that already completed *after* your run was queued - the latter is
+   the one a naive `status != "completed"` filter misses, and it is precisely the write you are
+   about to revert. Size any `gh run list --limit` against the longest writer's wall-clock, not a
+   run count (in a busy repo 30 runs can be well under an hour, while a single test run has taken
+   ~52m).
+
+   **Dispatching a fresh run is the only way to pick up another job's secret write, and it is
+   not a guarantee.** Because the snapshot is taken at run creation, the `gh workflow run` call
+   *is* the snapshot point. So a deliberate delay before dispatching is load-bearing for
+   freshness, not just anti-collision jitter - dispatch instantly and the new run can snapshot
+   the same stale value and fail identically. Don't write "guaranteed to see the winner's
+   write"; it is the only option that *can* see it.
+
+6. **`tj-actions/changed-files` needs `safe_output: false` and `quotepath: false`** when
+   piping its output through `jq`. The default `safe_output: true` backslash-escapes shell
+   metacharacters *inside* the JSON string values (`\&`, `\(`, `\)` are invalid JSON, jq
+   aborts). Git's default `core.quotepath` double-quotes and octal-escapes non-ASCII paths
+   (e.g. a curly apostrophe) - `quotepath: false` on the action's own input is the fix; a
+   global git-config attempt does not override the action's default.
+
+7. **CLI install stays unpinned (`npm install https://github.com/silverfin/silverfin-cli.git`)
+   by default** - unpinned-from-`main` is the deliberate, repo-wide convention; don't "fix" it
+   on an unrelated PR. Pin to an exact commit only for a specific, time-boxed reason, always
+   with a comment saying when to revert:
+   - **This workflow needs a flag not yet on `main`** - revert once that CLI PR merges.
+     While a pin is in force, check any *new* flag you add against **the pinned commit**, not
+     against `main` - "the CLI has supported this since #236" is about `main` and says nothing
+     about what the workflow actually installs.
+   - **A currently-open, unmerged CLI PR touches credential-handling code this workflow relies
+     on**, so an ordinary `@main` merge elsewhere could change how secrets are handled here
+     with zero visible diff in *this* repo. `push_to_review_firm.yml` pins for this reason
+     (against open silverfin-cli#273), reverting once it merges. This is NOT "every
+     secret-writing workflow must always pin" - `check_auth.yml` also writes a secret
+     (`CONFIG_JSON`) and stays deliberately unpinned, because at the time of writing there's
+     no open CLI PR whose unmerged state it needs shielding from. Pin against a specific named
+     risk, not against the general category of "handles credentials."
+   - **This file's design is itself mid-migration** (e.g. the CI-auth pilot currently piloted
+     in `be_market` is expected to become the standard auth flow repo-wide) - treat any
+     specific-file example in this skill about auth/credential workflows as time-bound. Verify
+     against the current file rather than assuming `check_auth.yml`'s shape described here
+     still matches once that migration lands.
+
+8. **A new reusable workflow needs a README.md entry** (Individual Action Documentation
+   section) - repo convention since #24, and README drift on this file is treated as a real
+   regression here, not a nit.
+
+9. **A market repo consumes this repo's workflows one of three ways - know which before
+   assuming a merge here reaches it:**
+   - **`uses: .../X.yml@main`** - the default. Confirmed across all 4 market repos (be/nl/lu/uk)
+     for every wrapper except the two cases below. **A merge to `main` reaches this caller on
+     its very next run** - no gradual rollout, no opt-out short of the caller pinning itself.
+   - **`uses: .../X.yml@<sha>`** - pinned. Only be_market's `check_auth.yml`/
+     `refresh-config-json`, deliberately isolating the CI-auth pilot (see silverfin-cli's
+     `CI_AUTH_SAMPLER_PLAN.md`). A merge here does NOT reach that caller until its pin is
+     bumped.
+   - **Fully forked/inlined - no `uses:` reference at all.** Two shapes, both live: a permanent
+     local reimplementation (be_market's `run_tests.yml`) and a *temporary* inlined copy carried
+     while something upstream settles (`run_sampler.yml`, inlined in be/nl/lu - so that file
+     currently has **zero** `uses:` consumers and a merge to it changes nothing at runtime).
+     A merge here never reaches either automatically - only a human re-syncing does.
+
+   **Don't state the census from memory - it goes stale.** `push_to_review_firm.yml` was
+   "be_market only" in this repo's own learnings until uk_market added a wrapper. Re-derive it
+   per PR, and against each market's **default branch** (a local checkout can be behind):
+   ```bash
+   for R in be_market nl_market lu_market uk_market; do
+     gh api "repos/silverfin/$R/contents/.github/workflows" --jq '.[].name' | while read -r F; do
+       gh api "repos/silverfin/$R/contents/.github/workflows/$F" --jq .content |
+         base64 --decode | grep -Hn "bso_github_actions" | sed "s|^|$R/$F |"
+     done
+   done
+   ```
+
+   Design changes to an *existing* `uses:`-consumed workflow to be backward-compatible for
+   `@main` callers, or coordinate the merge explicitly; this is why this repo's own merge
+   policy restricts changes to "non-breaking for the non-pilot markets."
+
+10. **Workflow commands are line-based - a newline ends the command.** Verified directly:
+    `echo "::add-mask::${VAL}"` on a two-line value registers **only the first line** as a mask
+    and `echo` prints the second line into the log verbatim. `inputs.*` is never auto-masked
+    (unlike `secrets.*`), so a one-time credential arriving as a `workflow_dispatch` input is
+    exactly the value most at risk. Mask line by line - but **guard what you register**, because
+    `::add-mask::` on a whitespace-only or 1-2 character value makes the runner replace that text
+    *everywhere* for the rest of the job, redacting the very `::error::` diagnostics you rely on.
+    `[[ -n "${LINE}" ]]` is not a sufficient guard: a line of spaces passes it.
+    ```bash
+    while IFS= read -r LINE; do
+      # Non-blank after stripping whitespace, AND long enough to be a real secret.
+      if [[ -n "${LINE//[[:space:]]/}" && "${#LINE}" -ge 8 ]]; then
+        echo "::add-mask::${LINE}"
+      fi
+    done <<< "${VAL}"
+    ```
+    Apply the same loop to *every* secret in the step, not just the input one - a token read back
+    from an API response deserves it as much as a pasted code does.
+    The same line-orientation applies to `::error::`/`::warning::`: interpolating
+    server-controlled text (an API `error_description`, a CLI's stderr) that contains a newline
+    pushes everything after it out of the annotation and into the raw log, so the operator sees
+    a message that trails off mid-sentence. Flatten before interpolating, and strip a bare
+    **carriage return** too - the runner breaks lines on `\r` as well as `\n`, so stripping only
+    `\n` still lets a hostile response start its own line and open a `::stop-commands::`:
+    `"${MSG//[$'\n'$'\r']/ }"`.
+    Separately: **a `workflow_dispatch` input is retained in the run's metadata** and stays
+    readable by anyone with repo read access. Masking hides it from the *log*, not from that
+    record - so a guard that aborts before spending a one-time code should tell the operator to
+    discard it, not to re-run with it.
+
+11. **Validate a JSON field's type before writing it into a credential - `jq -r` is not a
+    validator.** Two distinct traps, both of which pass a naive non-empty check:
+    - `jq -r '.x // "default"'` on an **empty** body exits 0 printing **nothing**, so the `//`
+      alternative never fires and your default silently doesn't apply (an empty body is a normal
+      proxy 502/504). Check `-z` on the result as well as relying on `//`.
+    - `jq -r` renders *any* JSON type as text, so `true`, `123` or `{}` all produce non-empty
+      output and sail through `[[ -z ... ]]`. Before storing a token, assert the type:
+      ```bash
+      jq -e '(.access_token | (type == "string" and length > 0))
+         and (.refresh_token | (type == "string" and length > 0))' response.json > /dev/null
+      ```
+
+12. **A SKIPPED job satisfies a required status check - so `needs:` alone turns an upstream
+    failure into a green gate.** A job with `needs: upstream` and no job-level `if:` is
+    *skipped*, not failed, when `upstream` fails, and branch protection counts `skipped` (and
+    `neutral`) as passing. Verified on be_market, where `test-templates` is the only required
+    check: PRs #3174 and #3124 both merged with it skipped. (Those two skipped via a job-level
+    `if:` on a changed-files output, not via an upstream failure - they prove that skipped passes
+    protection, which is the load-bearing half, not that the upstream-failure path has fired. When
+    citing a merged PR as evidence, read the workflow *as of that PR*, not as of `main`.) Any job
+    that backs a required check must run and fail on its own:
+    ```yaml
+    my-required-job:
+      needs: upstream
+      if: ${{ always() }}   # NOT the implicit default, and NOT !cancelled()
+      steps:
+        - name: Fail if upstream did not succeed
+          # `cancelled()` too - see below
+          if: ${{ cancelled() || needs.upstream.result != 'success' }}
+          run: |
+            echo "::error::upstream did not succeed - failing so the required check stays red"
+            exit 1
+    ```
+    **`always()` hands the cancel window back to you, so pay it in the guard.** `always()` runs
+    the job even when the workflow is cancelled, so a cancel landing *after* the upstream already
+    succeeded would start the job's real work on a run someone deliberately killed - on a long
+    job that is expensive. Adding `cancelled()` to the guard keeps the blocking-not-skipped
+    property (the job still reports `failure`) while stopping the work from starting. Only the
+    clean success-and-not-cancelled path should reach the real steps.
+
+    **`cancelled()` is only available in `jobs.<id>.if` and `jobs.<id>.steps.if`** - you cannot
+    pass it through `env:` into a script, and a plain YAML parse won't tell you (actionlint will).
+    So use two steps rather than one step with a branching message:
+    ```yaml
+    - name: Stop a cancelled run before the work starts
+      if: ${{ cancelled() }}
+      run: echo "::error::run cancelled"; exit 1
+    - name: Fail if upstream did not succeed
+      if: ${{ !cancelled() && needs.upstream.result != 'success' }}
+      run: echo "::error::upstream did not succeed"; exit 1
+    ```
+    A downstream job that needs to know the run was cancelled has the same restriction - key off
+    `needs.<up>.result == 'cancelled'`, which *is* allowed in `env:`.
+    **`!cancelled()` looks like the polite choice here and is the wrong one.** A job whose `if:`
+    evaluates false on a cancelled run reports **skipped** - which passes protection - where the
+    same job with no `if:` at all would have reported **cancelled**, which blocks. So
+    `!cancelled()` reopens the hole for the window between a cancel and the job starting. Use
+    `always()` and let the guard step turn a non-success upstream into a real failure. Keep the
+    guard's predicate (`!= 'success'`) identical to whatever a downstream alert branches on -
+    guarding on `!= 'success'` while the alert tests `== 'failure'` sends `cancelled` and
+    `skipped` down the wrong branch.
+
+    **Watch the `needs` outputs you read in job-level `env:` once the job runs on `always()`.**
+    An upstream failure yields an *empty* output, and `'' != '[]'` is **true** - a condition like
+    `env: HAS_X: ${{ needs.up.outputs.list != '[]' }}` then gates every dependent step OPEN, with
+    only the guard step's ordering stopping the job from proceeding on nothing. Add the `!= ''`
+    half to the condition rather than relying on step order.
+
+    **The corollary bites any dispatch-based retry.** A `workflow_dispatch` run's check runs
+    anchor to the dispatched ref's commit - the PR head SHA - and required checks match by name
+    with the latest winning. So a retry run supersedes the original red check. If anything in
+    that retry can skip or no-op the required job, the retry is a way to turn the gate green
+    having tested nothing. Check that before adding a retry, not after.
+
+13. **Give any job a downstream alert `needs:` an explicit `timeout-minutes`.** The default is
+    360. A job whose real work is a sleep plus two `gh` calls will, on one hung API call, hold
+    back the alert that `needs:` it for six hours - and the alert is usually the thing you added
+    the job to protect.
+
+14. **A `workflow_dispatch` input that selects a diff range cannot be validated by shape.** If a
+    dispatched input picks what a run compares against (a `base_sha` for
+    `tj-actions/changed-files`, a tag, a range), a well-formed value is not a safe one: any base
+    that already *contains* the dispatched commit yields an empty changed-file list by
+    construction - the default branch's tip once the branch has merged, a same-tree branch or tag,
+    a later commit on the same branch. The run then passes having tested nothing, and if that job
+    backs a required check (see 12) the gate goes green. Assert reachability, in this direction:
+    ```bash
+    # The head must not already be reachable FROM the base.
+    if git merge-base --is-ancestor "${GITHUB_SHA}" "${BASE_SHA}"; then
+      echo "::error::base already contains the dispatched commit - the diff would be empty"
+      exit 1
+    fi
+    ```
+    The opposite assertion is a bug: `pull_request.base.sha` is the base-*branch tip* and
+    legitimately is **not** an ancestor of the head, so `--is-ancestor BASE HEAD` rejects
+    legitimate runs. Run the check inside `if` so a base missing from the checkout doesn't abort
+    under `-e`; `fail_on_initial_diff_error: true` catches that case downstream. Note also that
+    `required: true` on a dispatch input is a *presence* check, not a non-empty one.
+
+15. **`gh run list` is a window sized in RUNS, not time - and it is repo-wide.** If you are
+    listing runs to detect another workflow that might be writing the same thing you are, a bare
+    `--limit N` is the wrong tool: unrelated high-frequency workflows crowd the ones you care
+    about out of the window. Measured in `be_market`: the last 100 runs spanned **1h51m**, 54 of
+    them a single label workflow - against a job timeout of 120m, so a long-running writer could
+    sit entirely outside the window and the check would pass while it was still about to write.
+    Query **per workflow** instead, which gives each one its own window (the same 50-run limit
+    reached back days per writer):
+    ```bash
+    for WF in run_tests.yml refresh_token.yml push_to_review_firm.yml; do
+      gh run list --workflow "${WF}" --limit 50 --json databaseId,status,url,updatedAt
+    done
+    ```
+    Three traps in that loop, all verified:
+    - **Identify the workflow by filename, not display name.** `gh run list`'s `workflowName` is
+      the workflow's `name:` key, while the run's `name`/`displayTitle` carry the evaluated
+      `run-name:`. So matching a run against `$GITHUB_WORKFLOW` is unsafe wherever `run-name:` is
+      set - it can silently never match, leaving the guard inert with no signal. A filename can't
+      drift that way (`workflowDatabaseId` also works).
+    - **Do NOT add a tolerant branch for a name that fails to resolve.** It is tempting, because
+      an unmerged workflow really does 404 on its own file - but that symptom is an artefact of
+      testing from a branch, not something a real run can hit. Two measured facts close it:
+      `workflow_dispatch` only triggers from the **default branch**, so such a workflow cannot run
+      before it merges; and a workflow present on the default branch with **zero runs** lists as
+      `rc=0` + empty, *not* 404. Only an absent workflow 404s. So at runtime every name resolves,
+      and a tolerant branch can only ever fire on a renamed/mistyped entry or a descoped token -
+      both of which it would then wave through while silently watching nothing. Fail on any name
+      that does not resolve, and say in the message that the cause is either a wrong name or an
+      unreachable repo, because `gh` reports both as 404 and they are indistinguishable there.
+    - **Include your own workflow in the watch list, excluding only your own run id.** A guard that
+      watches the *other* writers but not itself lets two dispatches pass each other. Name it by
+      filename like the rest - never a hardcoded `SELF=` literal compared against the loop
+      variable, which a rename leaves stale and silently unmatched. If you genuinely need the
+      running workflow's own identity, derive it from `github.workflow_ref`
+      (`owner/repo/.github/workflows/<file>@<ref>`), never a literal.
+
+16. **`npm install` inside a checked-out PR tree runs that PR's code with your job secrets.**
+    `npm install <git-url>` still treats the **current directory** as a project, so a PR-added
+    root `package.json`'s `preinstall`/`postinstall` executes with whatever is in the job env at
+    that moment. In a workflow that samples/tests untrusted PR content with real credentials this
+    is the whole ballgame. Install **before** `actions/checkout`, **outside** `$GITHUB_WORKSPACE`:
+    ```yaml
+    - uses: actions/setup-node@v6        # no checkout yet - workspace is empty
+    - name: Install silverfin-cli
+      run: |
+        INSTALL_DIR="${RUNNER_TEMP}/silverfin-cli-install"
+        mkdir -p "${INSTALL_DIR}"
+        npm install --prefix "${INSTALL_DIR}" --ignore-scripts https://github.com/silverfin/silverfin-cli.git
+        echo "SILVERFIN_CLI_BIN=${INSTALL_DIR}/node_modules/silverfin-cli/bin/cli.js" >> "$GITHUB_ENV"
+    - uses: actions/checkout@v6          # now the untrusted tree lands, with npm already done
+    ```
+    `$RUNNER_TEMP` survives checkout's `clean: true`, and `$GITHUB_ENV` is how you carry the
+    resolved path (job-level `env:` cannot use `$RUNNER_TEMP`). **`--ignore-scripts` alone is not
+    the fix** - it suppresses npm's own lifecycle hooks but not a tree `.npmrc` redirecting the
+    registry; the location change is what closes it, and `--ignore-scripts` is depth on top.
+    When you write the rationale comment, name only the secrets that really are **job**-scoped -
+    a step-scoped secret was never reachable, and naming it weakens a correct argument.
+
+17. **Two open PRs can both say MERGEABLE and still conflict with each other.** GitHub computes
+    mergeability against the **base branch only** - it never compares one PR to another. Two PRs
+    branched from the same commit that rewrite the same lines will both show CLEAN, and the
+    second to merge gets the conflict. That matters most when one of them carries a security or
+    correctness fix on the contested line: resolving toward the other side silently reverts it,
+    with no red CI to say so. Before merging either, check the pair directly and state the order:
+    ```bash
+    git merge-tree "$(git merge-base origin/branch-a origin/branch-b)" origin/branch-a origin/branch-b |
+      grep -c '<<<<<<<'
+    ```
+
+## Common mistakes (from review history, don't re-litigate)
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| CI green but a template was silently skipped | `jq` failure inside `<( )` process substitution swallowed by `set -e` | Capture via `x=$(jq ...)`, check exit status explicitly |
+| Job fails on an empty match, not a real failure | `VAR=$(cmd \| grep pattern)` with no match | Append `\|\| true` to the assignment |
+| Later job doesn't see a secret another job just wrote | `secrets.*` queue-time snapshot | Merge writer and consumer into one job |
+| `actionlint` flags `concurrency.queue: max` as an unknown key | actionlint's schema predates this real GitHub Actions beta feature | Known false positive - don't "fix" it, don't downgrade to `queue: single`. `queue: max` and `cancel-in-progress: true` are mutually exclusive - don't add the latter alongside it |
+| PR comment markdown breaks on one specific template | Raw backtick/pipe interpolated into a code span or table cell | CommonMark fencing, or `tr -d` in table cells |
+| A workflow_call output looks empty even though the step set it | Caller didn't use `if: always()` to read it after a later step failed | Add `if: always()` on the consuming step |
+| Only the first line of a multi-line secret ends up masked | `::add-mask::` is a line-based command; `inputs.*` isn't auto-masked | Register one mask per line |
+| An `::error::` annotation trails off mid-sentence | Server-controlled text contained a newline; the rest fell out of the annotation | Flatten to one line before interpolating |
+| A `jq -r '.x // "fallback"'` fallback silently didn't apply | Empty response body - jq exits 0 printing nothing, so `//` never fires | Also `-z`-check the captured result |
+| Two runs of the same workflow reverted each other's secret write | The writer-guard listed the *other* writers but not itself | Match `$GITHUB_WORKFLOW` too, excluding only your own run id |
+| A required check went green on a run that tested nothing | A job feeding it was `skipped` (upstream failed), and `skipped` passes branch protection | `if: !cancelled()` plus a fail-if-upstream-failed first step - see checklist 12 |
+| A `workflow_dispatch` input arrived empty despite `required: true` | `required` is a presence check, not a non-empty one; empty then falls through an `&&/||` ternary to the next branch | Validate the input's shape in a first step (e.g. `^[0-9a-f]{40}$` for a SHA) |
+| `tj-actions/changed-files` started hard-failing on `push`/`pull_request` after a retry fix | `fail_on_initial_diff_error` is global, not per-event - a force-pushed `event.before` or a rebased PR base is now fatal too | Intended, but document it and test both paths, not just the one you added it for |
+| Cancelling a run left a required check *passing* | The job carried `if: !cancelled()`, so it reported `skipped` (passes) instead of `cancelled` (blocks) | `always()` plus a guard step - see checklist 12 |
+| A dependent step ran even though its upstream job failed | Job-level `env:` read an empty `needs.*.outputs.*`, and `'' != '[]'` is **true** | Add the `!= ''` half to the condition; don't rely on a guard step's ordering |
+| A dispatched input appeared in the log as its own `::error::`/`::add-mask::` | The value was echoed into a workflow command *before* being validated; a newline plus `::` injects | Report `${#VAR}` or a sanitised form until the value is known well-formed |
+| Every space in the job log became `***` | `::add-mask::` registered a whitespace-only line | Guard the mask loop on `${LINE//[[:space:]]/}` and a minimum length |
+| A writer-detection guard never fires | Matched `$GITHUB_WORKFLOW` against gh's `workflowName`, which is the `name:` key, not the `run-name:` | Match by workflow filename or `workflowDatabaseId` |
+| A writer-check waves through a descoped token | A "workflow not found" tolerance added to work around a 404 seen while testing from an unmerged branch | Don't add it: `workflow_dispatch` needs the default branch, and a zero-run workflow lists empty rather than 404, so at runtime every name resolves |
+| Rotated credential lost after one failed `gh secret set` | Retry loop only matched HTTP 5xx | Also retry HTTP 429 and HTTP 403 *with* rate-limit/`retry-after` text; a plain 403 is a permanent auth/scope failure. Name the secret and that re-authorization is required on final failure. |
+| Rotated credential lost on a network blip despite a retry loop | The predicate classified by **HTTP status**, and a connection-level `gh` failure (`dial tcp`, `connection reset`, `no such host`, `i/o timeout`, TLS handshake, `context deadline exceeded`) carries no status at all | Add a third arm matching connection-level text - it is the likeliest transient case, not the rarest |
+| The operator read the annotation and missed "needs manual re-authorization" | Raw multi-line tool stderr was interpolated *before* the actionable sentence, and a newline ends the `::error::` command | Flatten (`tr '\n\r' '  '`) **and** put the instruction first, tool output last |
+| A PR's `postinstall` ran with `SF_API_SECRET` in env | `npm install` ran with cwd inside the checked-out PR tree | Install before checkout into `$RUNNER_TEMP` - see checklist 16 |
+| A merge silently reverted another PR's fix to the same line | Both PRs showed MERGEABLE; GitHub only checks each branch against `main` | `git merge-tree` the pair and fix the merge order - see checklist 17 |
+
+## Also worth knowing
+
+- **The 5xx-only retry predicate in `check_auth.yml` and `refresh-config-json/action.yml` has not
+  caught up with the rule above.** Both are `grep -qE 'HTTP 5[0-9]{2}'` with `MAX_ATTEMPTS=3`, so
+  the rate-limit 403 / 429 guidance in this skill is currently ahead of those two implementations.
+  Worth knowing before you cite either as the reference to copy - copy the rule, not the file.
+- **`github.run_started_at` does not exist.** It reads like it should, and it is a real field -
+  but on the REST *run object*, not in the `github` context (whose properties stop at `run_id`,
+  `run_number`, `run_attempt`). Interpolated it yields an empty string silently. Get a run's
+  timestamps from `gh run view "${GITHUB_RUN_ID}" --json createdAt,startedAt` instead; prefer
+  `createdAt` when you want the conservative anchor, since the two diverge on a re-run.
+  More generally: **actionlint validates context properties**, so it catches an invented one
+  immediately - run it before trusting any suggested `${{ github.* }}` expression, including one
+  from a reviewer.
+- `permissions: contents: write` is usually unnecessary - checkout needs `read`, and
+  `gh secret set` authenticates via `GH_TOKEN`/`GITHUB_TOKEN` (`gh`'s recognized env vars) -
+  map `secrets.REPO_ACCESS_TOKEN` to `GH_TOKEN` in the step's `env:`, not the implicit token.
+- A local `uses: ./.github/actions/...` only resolves when the reusable workflow runs in its
+  own repo's checkout - a reusable workflow called from a different repo runs in the caller's
+  checkout, so a local relative path there needs a fully-qualified `owner/repo/path@ref`.
+- Squash-merges don't produce a SHA match on `git log origin/main..branch` - `git fetch` +
+  content-diff before trusting a commit list, and remember a self-referencing pin needs its
+  own bump after a squash-merge.
+- After a token has already rotated server-side, a single failed `gh secret set` strands a
+  dead stored credential. Retry transient GitHub errors (5xx, 429, and 403 only when the body
+  says rate-limit/`retry-after`); fail immediately on a plain 403. `check_auth.yml` and
+  `run_sampler.yml` are the reference write-backs.
