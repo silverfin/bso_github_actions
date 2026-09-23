@@ -455,6 +455,42 @@ jobs:
             echo "diffs_added=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Extract the flagged entries for a small companion artifact
+        id: flagged
+        # results.zip runs to ~150 MB for what is usually a handful of interesting pairs, so a
+        # consumer that only wants those still pays for the whole archive. Same selection as the
+        # diffs/ folder above, written as loose files. Best-effort, for the same reason.
+        if: always() && steps.download.outputs.downloaded == 'true'
+        continue-on-error: true
+        run: |
+          # The flag ships in silverfin-cli 1.59.3; the install above is pinned to a commit that
+          # may predate it. Detect rather than fail - this step then starts working on its own
+          # once the pin moves, instead of warning on every run until someone notices.
+          if ! node ./node_modules/silverfin-cli/bin/cli.js run-sampler --help 2>&1 | grep -q -- '--extract-flagged-only'; then
+            echo "::notice::The pinned silverfin-cli has no --extract-flagged-only yet; skipping the flagged-entries artifact."
+            echo "flagged_extracted=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if node ./node_modules/silverfin-cli/bin/cli.js run-sampler --from-zip results.zip --extract-flagged-only flagged-entries \
+             && [[ -d flagged-entries ]]; then
+            echo "flagged_extracted=true" >> "$GITHUB_OUTPUT"
+          else
+            # Also the "nothing flagged, or nothing whose render differs" case: the CLI exits 0
+            # and writes no directory, and there is genuinely no artifact to upload.
+            echo "flagged_extracted=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload flagged-entries artifact
+        if: always() && steps.flagged.outputs.flagged_extracted == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sampler-flagged-partner-${{ inputs.partner }}
+          path: flagged-entries
+          retention-days: 7
+          # Compressed, unlike results.zip below: these are loose HTML files, so the action's own
+          # zip is the only one and DEFLATE is a straight win. The reason to store results.zip
+          # uncompressed is that it is already a zip, which does not apply here.
+
       - name: Upload results.zip artifact
         id: upload
         if: always() && steps.download.outputs.downloaded == 'true'
