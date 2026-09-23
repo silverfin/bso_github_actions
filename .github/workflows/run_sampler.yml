@@ -130,18 +130,22 @@ jobs:
 
       - name: Install silverfin-cli
         run: |
-          # Pinned to a commit on silverfin-cli's sampler-compact-diff-v2 branch, since
-          # --compact/--from-zip/--add-diffs-folder (used below) are not yet on main. Switch back
-          # to installing unpinned main, matching every other production workflow's convention,
-          # once that branch's PR (silverfin-cli#265) merges.
+          # Pinned to silverfin-cli's `sampler-cli-integration` branch: the tested merge of the
+          # two open sampler PRs (#276 visual tier + budget-driven caps, #275 payload attrs +
+          # flagged-entry extraction). Neither is on main, and no single PR branch carries both,
+          # which is why this points at an integration branch rather than at a PR head. That
+          # branch exists to keep this SHA reachable - do NOT delete it while anything pins to
+          # it. Switch to unpinned main, matching every other production workflow, once both
+          # PRs merge.
           #
-          # Re-pin to the branch tip whenever that branch gains fixes — a commit pin silently goes
-          # stale, and a rebase can orphan it entirely. The previous pin (5accd6b) was exactly
-          # that: a pre-rebase copy of "Make --add-diffs-folder's zip write atomic", no longer an
-          # ancestor of the branch, and missing five later fixes to the compact diff (flag-array
-          # flip direction, radio-checked attribute boundary, flag-flip suffix side, the
-          # no-view.html rewrite skip, and the identical-render diffs/ skip).
-          npm install https://github.com/silverfin/silverfin-cli.git#1ba5a0f
+          # Same SHA as be_market's inlined copy pins, deliberately: the two must not drift, or
+          # a run's output depends on which repo triggered it.
+          #
+          # Re-pin to the branch tip whenever it gains fixes — a commit pin silently goes stale,
+          # and a rebase can orphan it entirely. The pin before last (5accd6b) was exactly that:
+          # a pre-rebase copy of "Make --add-diffs-folder's zip write atomic", no longer an
+          # ancestor of its branch, and missing five later compact-diff fixes.
+          npm install https://github.com/silverfin/silverfin-cli.git#f6e20ba8ac60611a8426b60b0ba5fe6fd37b3ac8
           VERSION=$(node ./node_modules/silverfin-cli/bin/cli.js -V)
           echo "CLI version: ${VERSION}"
 
