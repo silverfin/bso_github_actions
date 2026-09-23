@@ -231,7 +231,16 @@ jobs:
           # that cap kills the `if: always()` write-back, artifact and PR-comment steps outright -
           # so the rotated partner token would be lost and nothing would be reported. Everything
           # below must finish with enough margin left for those steps to run.
-          STEP_DEADLINE=$(( $(date +%s) + 160*60 ))
+          #
+          # Sized against the tail, not against `timeout-minutes`: after this step come a
+          # ~150 MB download (up to 5 min on its own `--max-time`), a full re-zip for the diffs/
+          # folder, the flagged-entry extraction, an artifact upload of that same ~150 MB, and
+          # the PR comment. 160 min left roughly 15 of the job's 180 for all of that - and the
+          # steps before this one (checkout, node, npm install) have already spent some of it,
+          # so the real tail was smaller still. 130 leaves ~45 min, which the tail comfortably
+          # fits. Raising `timeout-minutes` instead would not help: the point is the margin
+          # between the two, not the absolute cap.
+          STEP_DEADLINE=$(( $(date +%s) + 130*60 ))
           ATTEMPT=1
           while true; do
             # %q-quoted so a name containing spaces is visibly one argument in the log.
@@ -294,11 +303,17 @@ jobs:
                   # as terminal - which "anything that isn't still-in-progress" does - abandons a
                   # live run on one network blip, which is the exact collision this block exists
                   # to prevent.
+                  #
+                  # 'Unexpected sampler status:' is deliberately NOT in this list. The CLI prints
+                  # it when the backend returns a status string it does not recognise, which says
+                  # nothing about whether the run finished - a new or renamed status on a run
+                  # that is still going reads exactly the same. Breaking on it abandons a live
+                  # run and hands the next attempt the 422 this whole block exists to avoid, so
+                  # keep polling and let REATTACH_DEADLINE below bound it instead.
                   if printf '%s' "${OUTPUT}" | grep -qF \
                        -e 'Sampler run completed successfully' \
                        -e 'Sampler run failed:' \
-                       -e 'Sampler completed but no result URL was returned' \
-                       -e 'Unexpected sampler status:'; then
+                       -e 'Sampler completed but no result URL was returned'; then
                     break
                   fi
                   if (( $(date +%s) >= REATTACH_DEADLINE )); then
