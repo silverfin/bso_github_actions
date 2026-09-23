@@ -286,6 +286,8 @@ jobs:
             if [[ "${RC}" -eq 124 ]] || { [[ "${RC}" -eq 137 ]] && (( $(date +%s) >= STEP_DEADLINE )); }; then
               echo "::error::run-sampler was stopped at the step deadline so the write-back and PR comment still run. The backend run${SAMPLER_ID:+ ${SAMPLER_ID}} is NOT cancelled and will 422 the next attempt${SAMPLER_ID:+; re-read it with: run-sampler -p ${SAMPLER_PARTNER} --id ${SAMPLER_ID} --compact}. If the kill landed mid-refresh, the stored partner credential may now be spent - re-authorize partner ${SAMPLER_PARTNER} if the next run 401s."
               break
+            elif [[ "${RC}" -eq 137 ]]; then
+              echo "::error::run-sampler was SIGKILLed before the step deadline (likely out of memory). The backend run${SAMPLER_ID:+ ${SAMPLER_ID}} is NOT cancelled and may 422 the next attempt."
             fi
 
             # The CLI stops polling long before the backend stops running, and abandoning the run
@@ -342,6 +344,8 @@ jobs:
                   if (( $(date +%s) + 90 >= REATTACH_DEADLINE )); then
                     if printf '%s' "${OUTPUT}" | grep -qF 'Sampler run is still in progress'; then
                       echo "::error::Sampler run ${SAMPLER_ID} was still running at the re-attach deadline. The backend run is NOT cancelled and will 422 the next attempt; re-read it with: run-sampler -p ${SAMPLER_PARTNER} --id ${SAMPLER_ID} --compact"
+                    elif printf '%s' "${OUTPUT}" | grep -qF 'Unexpected sampler status:'; then
+                      echo "::error::Sampler run ${SAMPLER_ID} kept reporting a status this CLI does not recognise until the re-attach deadline ($(printf '%s' "${OUTPUT}" | grep -F 'Unexpected sampler status:' | head -n 1 | cut -c1-200)). The backend run may still be going."
                     else
                       echo "::error::Could not read the status of sampler run ${SAMPLER_ID} before the re-attach deadline (last exit ${RC}). The backend run is NOT cancelled."
                     fi
@@ -360,7 +364,8 @@ jobs:
             # for.
             if [[ "${REATTACHED}" != "true" ]] && echo "$OUTPUT" | grep -qi "already in progress"; then
               NOW=$(date +%s)
-              if (( NOW >= DEADLINE )); then
+              # +60 for the sleep below, so the next attempt never starts past DEADLINE.
+              if (( NOW + 60 >= DEADLINE )); then
                 # Don't exit here: fall through to the normal output-setting logic below (which
                 # will correctly record sampler_ok=false / no report_url) so downstream steps
                 # (write-back, PR comment) still run via their own `if:` conditions instead of
