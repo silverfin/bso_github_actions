@@ -101,6 +101,10 @@ jobs:
       SF_API_CLIENT_ID: ${{ secrets.SF_API_CLIENT_ID }}
       SF_API_SECRET: ${{ secrets.SF_API_SECRET }}
     steps:
+      # STEP_DEADLINE below is measured from here, so the setup steps' time counts against it.
+      - name: Record job start
+        run: echo "JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Validate inputs
         env:
           HANDLES: ${{ inputs.handles }}
@@ -146,7 +150,8 @@ jobs:
           # a pre-rebase copy of "Make --add-diffs-folder's zip write atomic", no longer an
           # ancestor of its branch, and missing five later compact-diff fixes.
           npm install https://github.com/silverfin/silverfin-cli.git#f6e20ba8ac60611a8426b60b0ba5fe6fd37b3ac8
-          VERSION=$(node ./node_modules/silverfin-cli/bin/cli.js -V)
+          echo "SILVERFIN_CLI_BIN=${GITHUB_WORKSPACE}/node_modules/silverfin-cli/bin/cli.js" >> "$GITHUB_ENV"
+          VERSION=$(node "${GITHUB_WORKSPACE}/node_modules/silverfin-cli/bin/cli.js" -V)
           echo "CLI version: ${VERSION}"
 
       - name: Load PARTNER_CONFIG_JSON (host + partnerCredentials)
@@ -239,12 +244,16 @@ jobs:
           # Sized against the tail, not against `timeout-minutes`: after this step come a
           # ~150 MB download (up to 5 min on its own `--max-time`), a full re-zip for the diffs/
           # folder, the flagged-entry extraction, an artifact upload of that same ~150 MB, and
-          # the PR comment. 160 min left roughly 15 of the job's 180 for all of that - and the
-          # steps before this one (checkout, node, npm install) have already spent some of it,
-          # so the real tail was smaller still. 130 leaves ~45 min, which the tail comfortably
-          # fits. Raising `timeout-minutes` instead would not help: the point is the margin
-          # between the two, not the absolute cap.
-          STEP_DEADLINE=$(( $(date +%s) + 130*60 ))
+          # the PR comment. Measured from job start, so 135 leaves ~45 min for that tail
+          # whatever the setup steps cost. Raising `timeout-minutes` instead would not help: the
+          # point is the margin between the two, not the absolute cap.
+          #
+          # Every CLI call runs under `timeout` to what is left of it: the CLI polls for up to
+          # 2 h on its own, so an attempt started late (a 422 retry) would otherwise run past
+          # the job cap regardless of any check between attempts.
+          STEP_DEADLINE=$(( ${JOB_STARTED_AT:-$(date +%s)} + 135*60 ))
+          # Floored at 1: `timeout 0` means no timeout at all.
+          remaining() { local r=$(( STEP_DEADLINE - $(date +%s) )); echo $(( r > 1 ? r : 1 )); }
           ATTEMPT=1
           while true; do
             # %q-quoted so a name containing spaces is visibly one argument in the log.
@@ -257,7 +266,7 @@ jobs:
             # `bash -e {0}` with no pipefail, and `$?` after a pipeline is the LAST command's
             # status - `tr`'s, which is always 0. That silently kills every RC-gated branch
             # below, the stale-auth re-dispatch included. Strip the CRs after capturing.
-            OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1)
+            OUTPUT=$(timeout "$(remaining)" node "${SILVERFIN_CLI_BIN}" run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1)
             RC=$?
             set -e
             OUTPUT=$(tr -d '\r' <<< "${OUTPUT}")
@@ -269,18 +278,22 @@ jobs:
             echo "----- run-sampler output (exit ${RC}) -----"
             echo "$OUTPUT"
             echo "--------------------------------------------"
+            if [[ "${RC}" -eq 124 ]]; then
+              echo "::error::run-sampler was stopped at the step deadline so the write-back and PR comment still run. The backend run${SAMPLER_ID:+ ${SAMPLER_ID}} is NOT cancelled and will 422 the next attempt${SAMPLER_ID:+; re-read it with: run-sampler -p ${SAMPLER_PARTNER} --id ${SAMPLER_ID} --compact}."
+              break
+            fi
 
             # The CLI stops polling long before the backend stops running, and abandoning the run
             # here costs the whole result: the next attempt then collides with the still-running
             # original on the one-run-per-partner 422. Re-attach to it instead.
             #
-            # Matched on the CLI's own timeout sentence, not on ${RC}: $? above is `tr`'s status,
-            # not node's, so an exit-code gate would never fire. The full sentence is specific
-            # enough that a sampled template's rendered content can't trip it.
+            # Matched on the CLI's own timeout sentence, not on ${RC}: the CLI exits 1 for this and
+            # for a failed run alike. The full sentence is specific enough that a sampled
+            # template's rendered content can't trip it.
             #
             # `--id` is a single status read, not a poll, and the CLI only times out while the run
             # is still going — so one read would always come back "still in progress". Keep
-            # re-reading on its own budget (the loop's DEADLINE is long gone by now).
+            # re-reading on whatever STEP_DEADLINE leaves (the loop's DEADLINE is long gone by now).
             if printf '%s' "${OUTPUT}" | grep -qF 'Timeout. Try to fetch the status by using the --id flag'; then
               if [[ -z "${SAMPLER_ID}" ]]; then
                 # Without an id there is nothing to re-attach to, and the run keeps going
@@ -289,12 +302,11 @@ jobs:
               else
                 echo "::notice::Polling timed out; re-attaching to sampler run ${SAMPLER_ID} rather than starting a new one."
                 REATTACHED=true
-                REATTACH_DEADLINE=$(( $(date +%s) + 30*60 ))
-                if (( REATTACH_DEADLINE > STEP_DEADLINE )); then REATTACH_DEADLINE=${STEP_DEADLINE}; fi
+                REATTACH_DEADLINE=${STEP_DEADLINE}
                 while true; do
                   set +e
                   # Not piped into `tr` here, so ${RC} is node's own status; stripped afterwards.
-                  OUTPUT=$(node ./node_modules/silverfin-cli/bin/cli.js run-sampler -p "${SAMPLER_PARTNER}" --id "${SAMPLER_ID}" --compact 2>&1)
+                  OUTPUT=$(timeout "$(remaining)" node "${SILVERFIN_CLI_BIN}" run-sampler -p "${SAMPLER_PARTNER}" --id "${SAMPLER_ID}" --compact 2>&1)
                   RC=$?
                   set -e
                   OUTPUT=$(tr -d '\r' <<< "${OUTPUT}")
@@ -350,6 +362,10 @@ jobs:
                 echo "::error::Partner ${SAMPLER_PARTNER} still has a sampler run in progress after 90 minutes of retrying. Giving up — check whether a previous run is stuck (§2.3/2.4c: no CLI cancel exists for a backend run)."
                 break
               fi
+              if (( $(remaining) < 5*60 )); then
+                echo "::error::Partner ${SAMPLER_PARTNER} still has a sampler run in progress and the step deadline leaves no room for another attempt. Giving up."
+                break
+              fi
               echo "[$(date -u +%H:%M:%S)] partner ${SAMPLER_PARTNER} has a run in progress elsewhere (cross-repo or stale) — retrying in 60s..."
               sleep 60
               ATTEMPT=$((ATTEMPT+1))
@@ -381,7 +397,11 @@ jobs:
           # Nothing in-run can fix it: the snapshot is fixed for the job's lifetime and GitHub
           # secrets cannot be read back through the API. Only a NEW run gets a fresh snapshot,
           # which is what the re-dispatch step below is for.
-          if [[ "${RC}" -ne 0 ]] && echo "$OUTPUT" | grep -qF 'Error refreshing credentials'; then
+          #
+          # Both lines required: the CLI prints "Error refreshing credentials" for every refresh
+          # failure, network errors and 5xx included, and those must not spend the PR's one retry.
+          if [[ "${RC}" -ne 0 ]] && echo "$OUTPUT" | grep -qF 'Error refreshing credentials' \
+             && echo "$OUTPUT" | grep -qF 'Response Status: 401'; then
             echo "stale_auth=true" >> "$GITHUB_OUTPUT"
           else
             echo "stale_auth=false" >> "$GITHUB_OUTPUT"
@@ -467,7 +487,7 @@ jobs:
         if: always() && steps.download.outputs.downloaded == 'true'
         continue-on-error: true
         run: |
-          if node ./node_modules/silverfin-cli/bin/cli.js run-sampler --from-zip results.zip --add-diffs-folder; then
+          if node "${SILVERFIN_CLI_BIN}" run-sampler --from-zip results.zip --add-diffs-folder; then
             echo "diffs_added=true" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::Failed to add diffs/ folder to results.zip — the uploaded artifact is the plain sampler output for this run."
@@ -485,14 +505,19 @@ jobs:
           # The flag ships in silverfin-cli 1.59.3; the install above is pinned to a commit that
           # may predate it. Detect rather than fail - this step then starts working on its own
           # once the pin moves, instead of warning on every run until someone notices.
-          if ! node ./node_modules/silverfin-cli/bin/cli.js run-sampler --help 2>&1 | grep -q -- '--extract-flagged-only'; then
+          if ! node "${SILVERFIN_CLI_BIN}" run-sampler --help 2>&1 | grep -q -- '--extract-flagged-only'; then
             echo "::notice::The pinned silverfin-cli has no --extract-flagged-only yet; skipping the flagged-entries artifact."
             echo "flagged_extracted=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if node ./node_modules/silverfin-cli/bin/cli.js run-sampler --from-zip results.zip --extract-flagged-only flagged-entries \
-             && [[ -d flagged-entries ]]; then
+          # Outside the workspace: the PR tree is untrusted, and a committed `flagged-entries`
+          # directory (or a symlink to $HOME/.silverfin) would otherwise be uploaded as-is.
+          OUT_DIR="${RUNNER_TEMP}/flagged-entries"
+          rm -rf "${OUT_DIR}"
+          if node "${SILVERFIN_CLI_BIN}" run-sampler --from-zip results.zip --extract-flagged-only "${OUT_DIR}" \
+             && [[ -d "${OUT_DIR}" && ! -L "${OUT_DIR}" ]]; then
             echo "flagged_extracted=true" >> "$GITHUB_OUTPUT"
+            echo "dir=${OUT_DIR}" >> "$GITHUB_OUTPUT"
           else
             # Also the "nothing flagged, or nothing whose render differs" case: the CLI exits 0
             # and writes no directory, and there is genuinely no artifact to upload.
@@ -504,7 +529,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sampler-flagged-partner-${{ inputs.partner }}
-          path: flagged-entries
+          path: ${{ steps.flagged.outputs.dir }}
           retention-days: 7
           # Compressed, unlike results.zip below: these are loose HTML files, so the action's own
           # zip is the only one and DEFLATE is a straight win. The reason to store results.zip
