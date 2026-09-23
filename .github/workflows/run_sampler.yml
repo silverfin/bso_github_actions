@@ -266,7 +266,7 @@ jobs:
             # `bash -e {0}` with no pipefail, and `$?` after a pipeline is the LAST command's
             # status - `tr`'s, which is always 0. That silently kills every RC-gated branch
             # below, the stale-auth re-dispatch included. Strip the CRs after capturing.
-            OUTPUT=$(timeout "$(remaining)" node "${SILVERFIN_CLI_BIN}" run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1)
+            OUTPUT=$(timeout --kill-after=30 "$(remaining)" node "${SILVERFIN_CLI_BIN}" run-sampler -p "${SAMPLER_PARTNER}" "${HANDLE_ARGS[@]}" "${ACCOUNT_ARGS[@]}" --firm-ids ${SAMPLER_FIRM_IDS} --compact 2>&1)
             RC=$?
             set -e
             OUTPUT=$(tr -d '\r' <<< "${OUTPUT}")
@@ -279,7 +279,7 @@ jobs:
             echo "$OUTPUT"
             echo "--------------------------------------------"
             if [[ "${RC}" -eq 124 ]]; then
-              echo "::error::run-sampler was stopped at the step deadline so the write-back and PR comment still run. The backend run${SAMPLER_ID:+ ${SAMPLER_ID}} is NOT cancelled and will 422 the next attempt${SAMPLER_ID:+; re-read it with: run-sampler -p ${SAMPLER_PARTNER} --id ${SAMPLER_ID} --compact}."
+              echo "::error::run-sampler was stopped at the step deadline so the write-back and PR comment still run. The backend run${SAMPLER_ID:+ ${SAMPLER_ID}} is NOT cancelled and will 422 the next attempt${SAMPLER_ID:+; re-read it with: run-sampler -p ${SAMPLER_PARTNER} --id ${SAMPLER_ID} --compact}. If the kill landed mid-refresh, the stored partner credential may now be spent - re-authorize partner ${SAMPLER_PARTNER} if the next run 401s."
               break
             fi
 
@@ -306,7 +306,7 @@ jobs:
                 while true; do
                   set +e
                   # Not piped into `tr` here, so ${RC} is node's own status; stripped afterwards.
-                  OUTPUT=$(timeout "$(remaining)" node "${SILVERFIN_CLI_BIN}" run-sampler -p "${SAMPLER_PARTNER}" --id "${SAMPLER_ID}" --compact 2>&1)
+                  OUTPUT=$(timeout --kill-after=30 "$(remaining)" node "${SILVERFIN_CLI_BIN}" run-sampler -p "${SAMPLER_PARTNER}" --id "${SAMPLER_ID}" --compact 2>&1)
                   RC=$?
                   set -e
                   OUTPUT=$(tr -d '\r' <<< "${OUTPUT}")
@@ -332,7 +332,9 @@ jobs:
                        -e 'Sampler completed but no result URL was returned'; then
                     break
                   fi
-                  if (( $(date +%s) >= REATTACH_DEADLINE )); then
+                  # Checked with room for the sleep and one more read, so the last read never
+                  # gets a 1-second `timeout` and misreports a still-running run as unreadable.
+                  if (( $(date +%s) + 90 >= REATTACH_DEADLINE )); then
                     if printf '%s' "${OUTPUT}" | grep -qF 'Sampler run is still in progress'; then
                       echo "::error::Sampler run ${SAMPLER_ID} was still running at the re-attach deadline. The backend run is NOT cancelled and will 422 the next attempt; re-read it with: run-sampler -p ${SAMPLER_PARTNER} --id ${SAMPLER_ID} --compact"
                     else
@@ -362,8 +364,10 @@ jobs:
                 echo "::error::Partner ${SAMPLER_PARTNER} still has a sampler run in progress after 90 minutes of retrying. Giving up — check whether a previous run is stuck (§2.3/2.4c: no CLI cancel exists for a backend run)."
                 break
               fi
-              if (( $(remaining) < 5*60 )); then
-                echo "::error::Partner ${SAMPLER_PARTNER} still has a sampler run in progress and the step deadline leaves no room for another attempt. Giving up."
+              # A run takes up to ~60 min; an attempt that can't finish is killed at the deadline
+              # and orphans a backend run that 422s every repo using this partner.
+              if (( $(remaining) < 60*60 )); then
+                echo "::error::Partner ${SAMPLER_PARTNER} still has a sampler run in progress and the step deadline leaves too little time for a full run. Giving up."
                 break
               fi
               echo "[$(date -u +%H:%M:%S)] partner ${SAMPLER_PARTNER} has a run in progress elsewhere (cross-repo or stale) — retrying in 60s..."
@@ -400,8 +404,11 @@ jobs:
           #
           # Both lines required: the CLI prints "Error refreshing credentials" for every refresh
           # failure, network errors and 5xx included, and those must not spend the PR's one retry.
-          if [[ "${RC}" -ne 0 ]] && echo "$OUTPUT" | grep -qF 'Error refreshing credentials' \
-             && echo "$OUTPUT" | grep -qF 'Response Status: 401'; then
+          # Matched outside the compact diff, which is PR-rendered content and could otherwise
+          # fake both lines to spend the retry.
+          CLI_LINES=$(printf '%s\n' "$OUTPUT" | awk '/SAMPLER_COMPACT_START/{f=1} !f; /SAMPLER_COMPACT_END/{f=0}')
+          if [[ "${RC}" -ne 0 ]] && grep -qF 'Error refreshing credentials' <<< "${CLI_LINES}" \
+             && grep -qF 'Response Status: 401' <<< "${CLI_LINES}"; then
             echo "stale_auth=true" >> "$GITHUB_OUTPUT"
           else
             echo "stale_auth=false" >> "$GITHUB_OUTPUT"
@@ -472,6 +479,9 @@ jobs:
           # run completion, not the long-lived link it was originally assumed to be — see
           # silverfin-cli's CI_AUTH_SAMPLER_PLAN.md §10.4). A failure here means the human-facing
           # PR comment link below falls back to that presigned URL, which may already be dead.
+          # The workspace is the untrusted PR tree: drop a committed results.zip (or a symlink
+          # curl would write through) before downloading.
+          rm -f results.zip
           if curl -sL --fail --max-time 300 -o results.zip "${REPORT_URL}"; then
             echo "downloaded=true" >> "$GITHUB_OUTPUT"
           else
