@@ -1,0 +1,159 @@
+name: sync-notion-docs
+
+on:
+  workflow_call:
+    inputs:
+      market:
+        required: true
+        type: string
+    secrets:
+      NOTION_TOKEN:
+        required: true
+      SLACK_CI_ALERTS_WEBHOOK_URL:
+        required: false
+
+jobs:
+  sync-notion-docs:
+    runs-on: ubuntu-latest
+    # This job only reads the repository and talks to external HTTP APIs
+    # (Notion, Slack) - it never writes anything back to the repo - so it gets
+    # read-only contents and none of the other default token permissions.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          # Full history, matching every other changed-files workflow in this
+          # repo. Depth 2 is not enough for a multi-commit push, a merge
+          # commit, or a github.event.before that sits outside the fetched
+          # history: changed-files then resolves no diff and the job silently
+          # syncs nothing.
+          fetch-depth: 0
+          # This job never pushes anything; leaving the checkout's git
+          # credentials on the runner's disk afterwards is an avoidable
+          # hardening gap (flagged by zizmor's artipacked check).
+          persist-credentials: false
+
+      - name: Get changed README files in this push
+        id: changed-files
+        uses: tj-actions/changed-files@24d32ffd492484c1d75e0c0b894501ddb9d30d62 # v47
+        with:
+          base_sha: ${{ github.event.before }}
+          dir_names: false
+          # Emit the file list as a JSON array so paths containing spaces (e.g.
+          # account_templates/Dubieuze debiteuren/README.md) survive the
+          # hand-off between steps intact. escape_json: false keeps it valid
+          # JSON for jq (the default double-escapes the quotes). safe_output:
+          # false stops backslash-escaping of shell metacharacters (& ( ) ...)
+          # inside the JSON values, which is invalid JSON and would silently
+          # empty the list - safe here, the list is passed via env and parsed
+          # with jq, never eval'd by the shell. quotepath: false emits paths
+          # with non-ASCII characters as-is; the action defaults it to true,
+          # which octal-escapes them so they no longer match the globs below
+          # and the template is silently dropped.
+          json: true
+          escape_json: false
+          safe_output: false
+          quotepath: false
+          files: |
+            reconciliation_texts/**/README.md
+            account_templates/**/README.md
+
+      - name: Write changed READMEs to a plain list
+        env:
+          # Passed via env (not inlined into the shell body), so a path with
+          # quotes/spaces/metacharacters cannot break the script or be
+          # interpreted as shell syntax.
+          ALL_CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
+        run: |
+          # Fail loudly if the changed-files output is not valid JSON. A silent
+          # jq failure here would empty the list and sync nothing at all, while
+          # the job still reports success.
+          if ! printf '%s' "${ALL_CHANGED_FILES:-[]}" | jq -e . > /dev/null; then
+            echo "::error::changed-files output is not valid JSON, refusing to sync nothing silently"
+            exit 1
+          fi
+          printf '%s' "${ALL_CHANGED_FILES:-[]}" | jq -r '.[]' > /tmp/changed_readmes.txt
+
+      - name: Fetch sync-notion-docs.sh and notion-config.json
+        env:
+          # Pinned to an immutable commit SHA, not `main`: this workflow
+          # already holds NOTION_TOKEN by the time it runs these fetched
+          # files, and a caller pinning `uses: .../sync_notion_docs.yml@<sha>`
+          # gets none of that protection back if the SCRIPT it downloads can
+          # still move out from under it. Bump REF to the actual merged SHA
+          # in a follow-up commit once this change lands on main - the exact
+          # two-step convention this repo already uses for
+          # push_to_review_firm.yml's own self-reference (see e0cb6b2/#50):
+          # this PR cannot know its own post-merge SHA in advance.
+          REF: 509e2d85ffa042aa1815d5c3b665c15a6810014b
+        run: |
+          # Same bounded timeouts as notion_request's curl calls: a stalled
+          # raw.githubusercontent.com transfer must not block the whole job
+          # until the runner limit.
+          curl -fsSL --connect-timeout 10 --max-time 60 -o /tmp/sync-notion-docs.sh \
+            "https://raw.githubusercontent.com/silverfin/bso_github_actions/${REF}/scripts/sync-notion-docs.sh"
+          curl -fsSL --connect-timeout 10 --max-time 60 -o /tmp/notion-config.json \
+            "https://raw.githubusercontent.com/silverfin/bso_github_actions/${REF}/scripts/notion-config.json"
+
+      - name: Sync to Notion
+        id: sync
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          # Every dynamic value reaches the script through env and is
+          # referenced as a quoted shell variable. Interpolating ${{ }} into a
+          # run: body substitutes it into the script text itself, where a
+          # backtick, $( or a quote in the value would break the command or
+          # execute.
+          WORKSPACE: ${{ github.workspace }}
+          MARKET: ${{ inputs.market }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          bash /tmp/sync-notion-docs.sh /tmp/changed_readmes.txt "$WORKSPACE" \
+            "$MARKET" "$COMMIT_SHA" /tmp/notion-config.json
+
+      - name: Notify Slack about newly created pages
+        if: ${{ steps.sync.outputs.created_handles != '' }}
+        env:
+          CREATED_HANDLES: ${{ steps.sync.outputs.created_handles }}
+          MARKET: ${{ inputs.market }}
+          SLACK: ${{ secrets.SLACK_CI_ALERTS_WEBHOOK_URL }}
+        run: |
+          # SLACK_CI_ALERTS_WEBHOOK_URL is documented as optional
+          # (docs/notion-market-setup.md step 6). The `secrets` context isn't
+          # usable in a step's `if:`, so the empty-webhook case is handled
+          # here instead: without this check, curl would get called with an
+          # empty URL, error out, and paint the step red - masked only by
+          # continue-on-error below, and for the wrong reason (a documented,
+          # supported configuration, not a real failure).
+          if [[ -z "$SLACK" ]]; then
+            echo "SLACK_CI_ALERTS_WEBHOOK_URL not set, skipping Slack notification"
+            exit 0
+          fi
+          TEXT="Notion sync CREATED new pages for: ${CREATED_HANDLES} (market: ${MARKET}). If these are not genuinely new templates, check for a handle mismatch in config.json."
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg text "$TEXT" '{text: $text}')" \
+            "$SLACK"
+        continue-on-error: true
+
+      - name: Alert Slack on failed handles
+        if: ${{ steps.sync.outputs.failed_handles != '' }}
+        env:
+          FAILED_HANDLES: ${{ steps.sync.outputs.failed_handles }}
+          MARKET: ${{ inputs.market }}
+          COMMIT_SHA: ${{ github.sha }}
+          SLACK: ${{ secrets.SLACK_CI_ALERTS_WEBHOOK_URL }}
+        run: |
+          # Same reasoning as the "Notify Slack about newly created pages"
+          # step above: the empty-webhook case has to be handled in-script,
+          # not via `if:` (the `secrets` context isn't usable there).
+          if [[ -z "$SLACK" ]]; then
+            echo "SLACK_CI_ALERTS_WEBHOOK_URL not set, skipping Slack alert"
+            exit 0
+          fi
+          TEXT="Notion sync failed for: ${FAILED_HANDLES} (market: ${MARKET}, commit: ${COMMIT_SHA})"
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg text "$TEXT" '{text: $text}')" \
+            "$SLACK"
+        continue-on-error: true
