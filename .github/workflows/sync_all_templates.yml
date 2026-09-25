@@ -177,6 +177,55 @@ jobs:
               END { exit !found }' "${LOG}"
           }
 
+          has_id() { jq -e --arg f "${FIRM_ID}" '.id[$f] // empty' "$1" > /dev/null 2>&1; }
+
+          # Only templates without an id for this firm are looked up and, if not found, created.
+          # create/get-id --all look every template up by paging through the firm's whole list,
+          # which took ~15 of a firm's ~21 minutes. A stale id instead surfaces as an update error.
+          ensure_phase() {
+            local LABEL="$1" KIND="$2" DIR FLAG
+            case "${KIND}" in
+              shared-part) DIR=shared_parts; FLAG=--shared-part ;;
+              reconciliation) DIR=reconciliation_texts; FLAG=--handle ;;
+              export-file) DIR=export_files; FLAG=--name ;;
+              account-template) DIR=account_templates; FLAG=--name ;;
+            esac
+            [[ "${AUTH_FAILED}" -eq 1 ]] && return 0
+            [[ -d "${DIR}" ]] || return 0
+            N=$((N + 1))
+            LOG="${FIRM_DIR}/$(printf '%02d' "${N}")-${LABEL// /_}.log"
+            : > "${LOG}"
+            echo "::group::[${FIRM_ID}] ${LABEL}"
+            local MISSING=() FAILED_ITEMS=() NAME NAME_PATH BEFORE
+            for NAME_PATH in "${DIR}"/*/config.json; do
+              has_id "${NAME_PATH}" || MISSING+=("$(basename "$(dirname "${NAME_PATH}")")")
+            done
+            echo "${#MISSING[@]} template(s) without an id for firm ${FIRM_ID}"
+            for NAME in "${MISSING[@]}"; do
+              NAME_PATH="${DIR}/${NAME}/config.json"
+              BEFORE=$(errors_in_log)
+              cli "get-${KIND}-id" "${FLAG}=${NAME}" --yes
+              if [[ "${AUTH_FAILED}" -eq 0 && "${RC}" -eq 0 ]] && ! has_id "${NAME_PATH}"; then
+                cli "create-${KIND}" "${FLAG}=${NAME}"
+              fi
+              if [[ "${RC}" -ne 0 || "$(errors_in_log)" -gt "${BEFORE}" ]] || ! has_id "${NAME_PATH}"; then
+                FAILED_ITEMS+=("${NAME}")
+              fi
+              [[ "${AUTH_FAILED}" -eq 1 ]] && break
+            done
+            echo "::endgroup::"
+            if [[ ${#FAILED_ITEMS[@]} -gt 0 ]]; then
+              printf '%s\n' "${FAILED_ITEMS[@]}" > "${LOG%.log}.failed"
+            fi
+            if [[ "${AUTH_FAILED}" -eq 1 ]]; then
+              record "${LABEL}" failed "credential rejected"
+            elif [[ ${#FAILED_ITEMS[@]} -gt 0 ]]; then
+              record "${LABEL}" failed "${#FAILED_ITEMS[@]} of ${#MISSING[@]} missing templates could not be found or created"
+            else
+              record "${LABEL}" ok "${#MISSING[@]} missing, all found or created"
+            fi
+          }
+
           # The CLI's --all loops stop at the first 422/403/5xx (process.exit), skipping every
           # template after it. When that happens, finish the phase one template at a time.
           phase() {
@@ -189,8 +238,7 @@ jobs:
               account-template) DIR=account_templates; FLAG=--name ;;
             esac
             local CMD="${VERB}-${KIND}"
-            [[ "${VERB}" == "get" ]] && CMD="get-${KIND}-id"
-            [[ "${VERB}" != "create" ]] && ALL_ARGS=(--yes)
+            ALL_ARGS=(--yes)
 
             [[ "${AUTH_FAILED}" -eq 1 ]] && return 0
             [[ -d "${DIR}" ]] || return 0
@@ -301,8 +349,9 @@ jobs:
           JS
           }
 
-          # A link that can't be made is only a [warn] in the CLI.
-          LINK_PROBLEM='^\[error\]|^\[warn\] (Shared part .* (has no id associated|not found in [a-z]+ [0-9]+)|Adding shared part .* failed|Template .* (wasn.t found|not found in local repository))'
+          # A link that can't be made is only a [warn] in the CLI. A used_in entry for a template
+          # that isn't in the repo is stale config, listed separately in the summary instead.
+          LINK_PROBLEM='^\[error\]|^\[warn\] (Shared part .* (has no id associated|not found in [a-z]+ [0-9]+)|Adding shared part .* failed|Template .* wasn.t found \()'
 
           link_phase() {
             [[ "${AUTH_FAILED}" -eq 1 ]] && return 0
@@ -352,16 +401,12 @@ jobs:
             fi
 
             # Shared parts first, so templates never reference a shared part that isn't on the firm.
-            phase "create shared parts" create shared-part
-            phase "fetch shared part ids" get shared-part
+            ensure_phase "ensure shared parts" shared-part
             phase "update shared parts" update shared-part
 
-            phase "create reconciliations" create reconciliation
-            phase "create export files" create export-file
-            phase "create account templates" create account-template
-            phase "fetch reconciliation ids" get reconciliation
-            phase "fetch export file ids" get export-file
-            phase "fetch account template ids" get account-template
+            ensure_phase "ensure reconciliations" reconciliation
+            ensure_phase "ensure export files" export-file
+            ensure_phase "ensure account templates" account-template
 
             # Link before pushing template code, so the final save compiles against its shared parts.
             link_phase
@@ -419,8 +464,15 @@ jobs:
                 echo
               done
 
-              # Skips of templates that already exist are expected, not worth flagging.
-              ISSUES=$(cat "${FIRM_DIR}"/[0-9]*.log 2>/dev/null | grep -E '^\[(error|warn)\]' | grep -v 'already exists on' | sort -u || true)
+              STALE=$(cat "${FIRM_DIR}"/*link_shared_parts.log 2>/dev/null |
+                sed -nE 's/^\[warn\] Template [A-Za-z]+ (.*) not found in local repository\. Skipping\.$/\1/p' | sort -u || true)
+              if [[ -n "${STALE}" ]]; then
+                echo "**Stale used_in entries** (templates not in the repository, clean up the shared parts' config.json): $(clean "$(paste -sd, - <<< "${STALE}")")"
+                echo
+              fi
+
+              # Expected skips (already exists, stale used_in) aren't worth flagging again.
+              ISSUES=$(cat "${FIRM_DIR}"/[0-9]*.log 2>/dev/null | grep -E '^\[(error|warn)\]' | grep -vE 'already exists on|not found in local repository' | sort -u || true)
               if [[ -n "${ISSUES}" ]]; then
                 echo "<details><summary>Errors and warnings</summary>"
                 echo
