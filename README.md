@@ -48,6 +48,7 @@ The document will go over all the Github Actions that currently automate a coupl
     * [Automated slack update (slack_changelog.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf862cf4257e68475d8b47891c6)
   * [Review firm deployment](#review-firm-deployment)
     * [Push templates to review firm (push_to_review_firm.yml)](#push-templates-to-review-firm-push_to_review_firmyml)
+    * [Sync all templates to firms (sync_all_templates.yml)](#sync-all-templates-to-firms-sync_all_templatesyml)
   * [Liquid sampler](#liquid-sampler)
     * [Run liquid sampler (run_sampler.yml)](#run-liquid-sampler-run_sampleryml)
     * [Authorizing a partner for staging (scripts/authorize-partner-secret.sh)](#authorizing-a-partner-for-staging-scriptsauthorize-partner-secretsh)
@@ -256,6 +257,46 @@ _Prerequisites:_
 * The review firm must already be authorized with the Silverfin CLI (its OAuth tokens present in `CONFIG_JSON`). If it isn't, the run fails with a message asking the developer who implemented the linked development ticket(s) to authorize it.
 * `FIRM_ID_REVIEW` repository variable in the market repo (used as the default when no `firm_id` is supplied).
 
+
+#### Sync all templates to firms `(sync_all_templates.yml)`
+
+_Description_:
+Reusable workflow. Brings one or more firms fully in line with the calling repo's default branch: every reconciliation text, export file, account template and shared part is created if missing and gets its latest code, and every shared part is linked to the templates listed in its `used_in`. Meant for a weekly cron.
+
+_Trigger:_
+
+* Called via `workflow_call` from a market-repo wrapper triggered by `schedule`. The wrapper must also declare `workflow_dispatch` with every input optional: retry-on-race re-dispatches it with no inputs.
+
+_Inputs:_
+
+* `firm_ids` (required) - space-separated firm ids, processed one after another in a single job.
+* `allowed_firm_ids` (required, non-empty) - allowlist; every id in `firm_ids` must be in it. Wrappers pass their `SYNC_FIRM_IDS` variable here so a manual run can't overwrite an unrelated firm.
+
+_Steps (per firm):_
+
+1. `create-shared-part --all`, `get-shared-part-id --all`, `update-shared-part --all`
+2. `create-reconciliation --all`, `create-export-file --all`, `create-account-template --all`
+3. `get-reconciliation-id --all`, `get-export-file-id --all`, `get-account-template-id --all`
+4. `add-shared-part --all` - before the templates' code is pushed, so the final save compiles against linked shared parts. The firm's template ids are first filled into each shared part's `used_in`, so links that already exist are skipped rather than re-posted.
+5. `update-reconciliation --all`, `update-export-file --all`, `update-account-template --all`
+
+The CLI's `--all` loops stop at the first template that gets a 422/403/5xx. When that happens, the phase finishes the remaining templates one at a time; for the link phase, the failing link is dropped and `--all` is rerun. Failing templates and links are named in the summary.
+
+The job summary shows, per firm, the result of each phase, what failed, the CLI's errors and warnings, and the template ids that were missing from the repository's `config.json` files. Those ids are not committed back.
+
+_Authentication note:_
+
+* Follows be_market's pilot flow (its `run_tests.yml`): `CONFIG_JSON` is refreshed as the job's own first step (the `refresh-config-json` action) with `autoRenew` seeded off, so a stale credential makes the CLI exit 2 instead of silently rotating the token; the refresh token is then blanked on disk, and the CLI is pinned to the same autoRenew-branch commit.
+* All firms run on that one refresh, so the whole run has to finish within the 2h access-token lifetime; the job timeout is set just under it.
+* No concurrency group, same as the pilot's long jobs: a queued run would start from a stale snapshot of `CONFIG_JSON`. If the refresh loses a race with another writer, or a credential is rejected mid-run, a scheduled run dispatches one fresh retry after a 20-60s jittered delay. Schedule the cron outside working hours to keep this rare.
+* Any other failure, and a retry that fails in turn, posts to `SLACK_CI_ALERTS_WEBHOOK_URL`.
+
+_Prerequisites:_
+
+* `SF_API_CLIENT_ID`, `SF_API_SECRET`, `CONFIG_JSON` and `REPO_ACCESS_TOKEN` passed by the caller (`SLACK_CI_ALERTS_WEBHOOK_URL` optional).
+* The caller's job grants `actions: write` (for the retry dispatch) and `contents: read`.
+* Every firm in `firm_ids` authorized in `CONFIG_JSON`; the run fails before syncing anything otherwise.
+* Don't list review or production firms: the sync overwrites every template with the default branch's code, including code pushed there for functional review.
 
 
 ### Liquid sampler

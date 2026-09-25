@@ -1,0 +1,558 @@
+# Reusable workflow. Brings one or more firms fully in line with the calling repo's default
+# branch: creates missing templates, pushes the code of every template and links every shared
+# part listed in the shared parts' `used_in`. Meant for a weekly cron in a market repo.
+#
+# Order matters: shared parts exist and carry their latest code before any template is
+# created, and links are added before the templates' code is pushed, so a template's final
+# save never includes a shared part it isn't linked to yet.
+#
+# Template ids fetched or created during the run are only written to the runner's checkout.
+# They are listed in the job summary instead of being committed back.
+#
+# Auth follows be_market's pilot (run_tests.yml): refresh inside the consuming job, autoRenew
+# off so a stale credential exits 2 instead of silently rotating, refresh token blanked on disk,
+# one fresh-dispatch retry when the refresh loses a race, and a Slack alert otherwise.
+#
+# No concurrency group, same as the pilot's long jobs: a run queued behind a ~2h sync would start
+# from a run-creation snapshot of CONFIG_JSON that other writers have rotated since. An overlap
+# instead fails clean (exit 2) and retry-on-race heals it.
+name: sync-all-templates
+run-name: Sync all templates to firm(s) ${{ inputs.firm_ids }}
+on:
+  workflow_call:
+    inputs:
+      firm_ids:
+        description: "Space-separated Silverfin firm ids to sync, processed one after another."
+        required: true
+        type: string
+      allowed_firm_ids:
+        description: "Space-separated allowlist; every id in firm_ids must be in it, so a manual run can't overwrite an unrelated firm. Required to be non-empty."
+        required: true
+        type: string
+    secrets:
+      SF_API_CLIENT_ID:
+        required: true
+      SF_API_SECRET:
+        required: true
+      CONFIG_JSON:
+        description: "silverfin-cli credentials file content. Refreshed and written back by the job's own refresh step before use."
+        required: true
+      REPO_ACCESS_TOKEN:
+        description: "PAT with permission to write this repository's CONFIG_JSON secret."
+        required: true
+      SLACK_CI_ALERTS_WEBHOOK_URL:
+        description: "Optional. Slack webhook for failure alerts. Silently skipped if not supplied."
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  # One job for all firms, not a matrix: each job would refresh CONFIG_JSON from the same
+  # run-creation snapshot, and the rotated refresh tokens would invalidate each other. The one
+  # refresh here has to carry every firm, so the whole loop must fit in the 2h token lifetime.
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 115
+    outputs:
+      failed_firms: ${{ steps.refresh.outputs.failed_firms }}
+      failed_firms_summary: ${{ steps.refresh.outputs.failed_firms_summary }}
+      auto_renew_lost: ${{ steps.refresh.outputs.auto_renew_lost }}
+      refresh_completed: ${{ steps.refresh.outputs.refresh_completed }}
+      write_back_failed: ${{ steps.refresh.outputs.write_back_failed }}
+      auth_failed: ${{ steps.sync.outputs.auth_failed }}
+      auth_failed_firm: ${{ steps.sync.outputs.auth_failed_firm }}
+    env:
+      SF_API_CLIENT_ID: ${{ secrets.SF_API_CLIENT_ID }}
+      SF_API_SECRET: ${{ secrets.SF_API_SECRET }}
+    steps:
+      # Before checkout, like the pilot: the workspace is still empty, so the action's own
+      # npm install can't pick up a market repo's package.json or .npmrc.
+      - name: Refresh CONFIG_JSON
+        id: refresh
+        uses: silverfin/bso_github_actions/.github/actions/refresh-config-json@main
+        with:
+          sf_api_client_id: ${{ secrets.SF_API_CLIENT_ID }}
+          sf_api_secret: ${{ secrets.SF_API_SECRET }}
+          config_json: ${{ secrets.CONFIG_JSON }}
+          repo_access_token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          seed_no_auto_renew: "true"
+
+      # The CLI never renews (autoRenew is off), so this job never needs a refresh token.
+      - name: Blank the refresh token on disk
+        run: |
+          jq 'to_entries | map(if (.key|test("^[0-9]+$")) then .value.refreshToken = "" else . end) | from_entries' \
+            "$HOME/.silverfin/config.json" > "$HOME/.silverfin/config.stripped.json"
+          mv "$HOME/.silverfin/config.stripped.json" "$HOME/.silverfin/config.json"
+
+      # Same pinned autoRenew branch as the pilot (silverfin-cli#273). SHA, not the branch name,
+      # because the branch is mutable. Installed outside the workspace, before checkout.
+      - name: Install silverfin-cli
+        run: |
+          INSTALL_DIR="${RUNNER_TEMP}/silverfin-cli-install"
+          mkdir -p "${INSTALL_DIR}"
+          npm install --prefix "${INSTALL_DIR}" --ignore-scripts https://github.com/silverfin/silverfin-cli.git#b072a6027f447437993728645a39bed2a0f6f5c9
+          echo "SILVERFIN_CLI_BIN=${INSTALL_DIR}/node_modules/silverfin-cli/bin/cli.js" >> "$GITHUB_ENV"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check the firms are authorized
+        id: firms
+        env:
+          FIRM_IDS: ${{ inputs.firm_ids }}
+          ALLOWED_FIRM_IDS: ${{ inputs.allowed_firm_ids }}
+        run: |
+          # CONFIG_JSON is only masked as a whole; mask each token so CLI error output can't leak one.
+          jq -r 'to_entries[] | select(.key | test("^[0-9]+$")) | .value | objects | to_entries[] | select(.key | test("token"; "i")) | .value | strings' "$HOME/.silverfin/config.json" |
+            while IFS= read -r LINE; do
+              if [[ -n "${LINE//[[:space:]]/}" && "${#LINE}" -ge 8 ]]; then
+                echo "::add-mask::${LINE}"
+              fi
+            done
+
+          if [[ -z "${ALLOWED_FIRM_IDS//[[:space:]]/}" ]]; then
+            echo "::error::allowed_firm_ids is empty; refusing to sync without an allowlist (set the caller's SYNC_FIRM_IDS variable)"
+            exit 1
+          fi
+          read -ra IDS <<< "${FIRM_IDS}"
+          if [[ ${#IDS[@]} -eq 0 ]]; then
+            echo "::error::firm_ids is empty"
+            exit 1
+          fi
+          for FIRM_ID in "${IDS[@]}"; do
+            if ! [[ "${FIRM_ID}" =~ ^[0-9]+$ ]]; then
+              echo "::error::firm_ids contains a non-numeric id"
+              exit 1
+            fi
+            if [[ " ${ALLOWED_FIRM_IDS} " != *" ${FIRM_ID} "* ]]; then
+              echo "::error::Firm ${FIRM_ID} is not in allowed_firm_ids"
+              exit 1
+            fi
+            IS_AUTHORIZED=$(jq -r --arg f "${FIRM_ID}" 'del(.defaultFirmIDs, .host) | has($f)' "$HOME/.silverfin/config.json" 2>/dev/null || echo "false")
+            if [[ "${IS_AUTHORIZED}" != "true" ]]; then
+              echo "::error::Firm ${FIRM_ID} has no OAuth tokens in CONFIG_JSON. Authorize it with 'silverfin authorize' and add it to the secret."
+              exit 1
+            fi
+          done
+          echo "firm_ids=${IDS[*]}" >> "$GITHUB_OUTPUT"
+
+      - name: Sync templates
+        id: sync
+        env:
+          FIRM_IDS: ${{ steps.firms.outputs.firm_ids }}
+        run: |
+          shopt -s nullglob
+          CLI=(node "${SILVERFIN_CLI_BIN}")
+          LOG_DIR="${RUNNER_TEMP}/sync-logs"
+          mkdir -p "${LOG_DIR}"
+          echo "log_dir=${LOG_DIR}" >> "$GITHUB_OUTPUT"
+          FAILED=0
+          AUTH_FAILED=0
+          # The CLI exits with this code when a credential is rejected (autoRenew is off).
+          EXIT_AUTH_FAILURE=2
+
+          # Runs one CLI command, streaming to the log and appending to LOG. Sets RC.
+          cli() {
+            "${CLI[@]}" "$@" 2>&1 | tee -a "${LOG}"
+            RC=${PIPESTATUS[0]}
+            if [[ "${RC}" -eq "${EXIT_AUTH_FAILURE}" ]]; then AUTH_FAILED=1; fi
+          }
+
+          record() {
+            printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "${FIRM_DIR}/phases.tsv"
+            if [[ "$2" != "ok" ]]; then FAILED=1; fi
+          }
+
+          errors_in_log() { grep -c '^\[error\]' "${LOG}" || true; }
+
+          # True when the aborted --all run already handled NAME, so the fallback can skip it.
+          handled_in_log() {
+            awk -v n="$1" '
+              index($0, "\"" n "\" created on") || index($0, "\"" n "\" already exists on") ||
+              index($0, "Template " n ": ID updated") ||
+              (substr($0, length($0) - length("updated: " n) + 1) == "updated: " n) { found = 1 }
+              END { exit !found }' "${LOG}"
+          }
+
+          # The CLI's --all loops stop at the first 422/403/5xx (process.exit), skipping every
+          # template after it. When that happens, finish the phase one template at a time.
+          phase() {
+            local LABEL="$1" VERB="$2" KIND="$3"
+            local DIR FLAG ALL_ARGS=()
+            case "${KIND}" in
+              shared-part) DIR=shared_parts; FLAG=--shared-part ;;
+              reconciliation) DIR=reconciliation_texts; FLAG=--handle ;;
+              export-file) DIR=export_files; FLAG=--name ;;
+              account-template) DIR=account_templates; FLAG=--name ;;
+            esac
+            local CMD="${VERB}-${KIND}"
+            [[ "${VERB}" == "get" ]] && CMD="get-${KIND}-id"
+            [[ "${VERB}" != "create" ]] && ALL_ARGS=(--yes)
+
+            [[ "${AUTH_FAILED}" -eq 1 ]] && return 0
+            [[ -d "${DIR}" ]] || return 0
+            N=$((N + 1))
+            LOG="${FIRM_DIR}/$(printf '%02d' "${N}")-${LABEL// /_}.log"
+            echo "::group::[${FIRM_ID}] ${LABEL}"
+            cli "${CMD}" --all "${ALL_ARGS[@]}"
+            local ERRORS
+            ERRORS=$(errors_in_log)
+            if [[ "${RC}" -eq 0 && "${ERRORS}" -eq 0 ]]; then
+              echo "::endgroup::"
+              record "${LABEL}" ok ""
+              return 0
+            fi
+            if [[ "${AUTH_FAILED}" -eq 1 ]]; then
+              echo "::endgroup::"
+              record "${LABEL}" failed "credential rejected"
+              return 0
+            fi
+            # update --all collects its errors and runs to the end; only an abort needs the fallback.
+            if grep -qE '^\[error\] .* update finished with [0-9]+ error' "${LOG}"; then
+              echo "::endgroup::"
+              record "${LABEL}" failed "${ERRORS} error lines, see the log"
+              return 0
+            fi
+
+            echo "--all stopped early (exit ${RC}), finishing the remaining templates one at a time"
+            local FAILED_ITEMS=() NAME BEFORE
+            for NAME_PATH in "${DIR}"/*/config.json; do
+              NAME=$(basename "$(dirname "${NAME_PATH}")")
+              handled_in_log "${NAME}" && continue
+              BEFORE=$(errors_in_log)
+              cli "${CMD}" "${FLAG}=${NAME}" "${ALL_ARGS[@]}"
+              if [[ "${RC}" -ne 0 || "$(errors_in_log)" -gt "${BEFORE}" ]]; then
+                FAILED_ITEMS+=("${NAME}")
+              fi
+              [[ "${AUTH_FAILED}" -eq 1 ]] && break
+            done
+            echo "::endgroup::"
+            if [[ ${#FAILED_ITEMS[@]} -gt 0 ]]; then
+              printf '%s\n' "${FAILED_ITEMS[@]}" > "${LOG%.log}.failed"
+            fi
+            if [[ "${AUTH_FAILED}" -eq 1 ]]; then
+              record "${LABEL}" failed "credential rejected during the one-by-one retry, remaining templates not tried"
+            elif [[ ${#FAILED_ITEMS[@]} -eq 0 ]]; then
+              record "${LABEL}" ok "--all stopped early, the rest passed one by one"
+            else
+              record "${LABEL}" failed "${#FAILED_ITEMS[@]} templates failed"
+            fi
+          }
+
+          # add-shared-part --all only skips links whose template id for this firm is in the
+          # shared part's used_in. Ids aren't committed back, so fill them in from the template
+          # configs first; otherwise every existing link is POSTed again.
+          seed_used_in_ids() {
+            node - "${FIRM_ID}" <<'JS'
+          const fs = require("fs");
+          const firm = process.argv[2];
+          const dirs = { reconciliation: "reconciliation_texts", reconciliationText: "reconciliation_texts", exportFile: "export_files", accountTemplate: "account_templates" };
+          const readJson = (p) => {
+            try { return JSON.parse(fs.readFileSync(p, "utf8")); }
+            catch (e) { console.log(`[warn] could not read ${p}, its links may be POSTed again`); return null; }
+          };
+          for (const sp of fs.readdirSync("shared_parts")) {
+            const path = `shared_parts/${sp}/config.json`;
+            if (!fs.existsSync(path)) continue;
+            const config = readJson(path);
+            if (!config) continue;
+            let changed = false;
+            for (const t of config.used_in || []) {
+              const dir = dirs[t.type];
+              const tPath = `${dir}/${t.handle || t.name}/config.json`;
+              if (!dir || !fs.existsSync(tPath)) continue;
+              const id = readJson(tPath)?.id?.[firm];
+              if (id && t.id?.[firm] !== id) {
+                t.id = { ...(t.id || {}), [firm]: id };
+                changed = true;
+              }
+            }
+            if (changed) fs.writeFileSync(path, JSON.stringify(config, null, 2) + "\n");
+          }
+          JS
+          }
+
+          # Drops the used_in entry behind a failed link POST (from the --verbose URL), so a rerun
+          # of --all can get past it. Prints "<shared part> → <template>" on success.
+          drop_failed_link() {
+            node - "${FIRM_ID}" "$1" <<'JS'
+          const fs = require("fs");
+          const [firm, url] = process.argv.slice(2);
+          const m = url.match(/(reconciliations|export_files|account_templates)\/(\d+)\/shared_parts\/(\d+)/);
+          if (!m) process.exit(1);
+          const [, , templateId, sharedPartId] = m;
+          for (const sp of fs.readdirSync("shared_parts")) {
+            const path = `shared_parts/${sp}/config.json`;
+            if (!fs.existsSync(path)) continue;
+            let config;
+            try { config = JSON.parse(fs.readFileSync(path, "utf8")); } catch { continue; }
+            if (String(config.id?.[firm]) !== sharedPartId) continue;
+            const i = (config.used_in || []).findIndex((t) => String(t.id?.[firm]) === templateId);
+            if (i === -1) process.exit(1);
+            const [entry] = config.used_in.splice(i, 1);
+            fs.writeFileSync(path, JSON.stringify(config, null, 2) + "\n");
+            console.log(`${sp} → ${entry.handle || entry.name}`);
+            process.exit(0);
+          }
+          process.exit(1);
+          JS
+          }
+
+          # A link that can't be made is only a [warn] in the CLI.
+          LINK_PROBLEM='^\[error\]|^\[warn\] (Shared part .* (has no id associated|not found in [a-z]+ [0-9]+)|Adding shared part .* failed|Template .* (wasn.t found|not found in local repository))'
+
+          link_phase() {
+            [[ "${AUTH_FAILED}" -eq 1 ]] && return 0
+            [[ -d shared_parts ]] || return 0
+            N=$((N + 1))
+            LOG="${FIRM_DIR}/$(printf '%02d' "${N}")-link_shared_parts.log"
+            echo "::group::[${FIRM_ID}] link shared parts"
+            seed_used_in_ids >> "${LOG}" 2>&1 || echo "[error] could not fill in used_in ids" | tee -a "${LOG}"
+            local FAILED_LINKS=() URL LINK
+            # --verbose logs each request's URL, which names the link that aborted the run.
+            for _ in $(seq 1 25); do
+              cli --verbose add-shared-part --all --yes
+              [[ "${RC}" -eq 0 || "${AUTH_FAILED}" -eq 1 ]] && break
+              # Only a non-2xx last response names the failing link; a network error has none.
+              URL=$(grep -E '^\[debug\] Response Status: ' "${LOG}" | tail -n 1 | grep -vE 'Response Status: 2[0-9]{2} ' | sed -E 's/.* url: //' || true)
+              if ! LINK=$(drop_failed_link "${URL}"); then
+                echo "[error] add-shared-part --all stopped early and the failing link could not be identified" | tee -a "${LOG}"
+                break
+              fi
+              FAILED_LINKS+=("${LINK}")
+              echo "Link ${LINK} failed, retrying the rest"
+            done
+            echo "::endgroup::"
+            if [[ ${#FAILED_LINKS[@]} -gt 0 ]]; then
+              printf '%s\n' "${FAILED_LINKS[@]}" > "${LOG%.log}.failed"
+            fi
+            local ERRORS
+            ERRORS=$(grep -cE "${LINK_PROBLEM}" "${LOG}" || true)
+            if [[ "${AUTH_FAILED}" -eq 1 ]]; then
+              record "link shared parts" failed "credential rejected"
+            elif [[ "${RC}" -eq 0 && "${ERRORS}" -eq 0 ]]; then
+              record "link shared parts" ok ""
+            else
+              record "link shared parts" failed "exit ${RC}, ${ERRORS} link problems"
+            fi
+          }
+
+          read -ra IDS <<< "${FIRM_IDS}"
+          for FIRM_ID in "${IDS[@]}"; do
+            FIRM_DIR="${LOG_DIR}/${FIRM_ID}"
+            mkdir -p "${FIRM_DIR}"
+            N=0
+            if ! "${CLI[@]}" config --set-firm="${FIRM_ID}"; then
+              echo "::error::firm ${FIRM_ID}: could not set it as the default firm"
+              record "set default firm" failed ""
+              continue
+            fi
+
+            # Shared parts first, so templates never reference a shared part that isn't on the firm.
+            phase "create shared parts" create shared-part
+            phase "fetch shared part ids" get shared-part
+            phase "update shared parts" update shared-part
+
+            phase "create reconciliations" create reconciliation
+            phase "create export files" create export-file
+            phase "create account templates" create account-template
+            phase "fetch reconciliation ids" get reconciliation
+            phase "fetch export file ids" get export-file
+            phase "fetch account template ids" get account-template
+
+            # Link before pushing template code, so the final save compiles against its shared parts.
+            link_phase
+
+            phase "update reconciliations" update reconciliation
+            phase "update export files" update export-file
+            phase "update account templates" update account-template
+
+            if [[ "${AUTH_FAILED}" -eq 1 ]]; then
+              echo "::error::firm ${FIRM_ID}: credential rejected, stopping. Another CONFIG_JSON refresh may have rotated the tokens mid-run."
+              echo "auth_failed_firm=${FIRM_ID}" >> "$GITHUB_OUTPUT"
+              break
+            fi
+          done
+
+          echo "auth_failed=$([[ "${AUTH_FAILED}" -eq 1 ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          if [[ "${FAILED}" -ne 0 || "${AUTH_FAILED}" -ne 0 ]]; then
+            exit 1
+          fi
+
+      - name: Write summary
+        if: ${{ always() && steps.sync.outputs.log_dir != '' }}
+        env:
+          FIRM_IDS: ${{ steps.firms.outputs.firm_ids }}
+          LOG_DIR: ${{ steps.sync.outputs.log_dir }}
+        run: |
+          clean() { tr -d '`|<>[]()!' <<< "$1"; }
+
+          # The CLI writes fetched/created ids into config.json; nothing commits them back.
+          mapfile -d '' -t CHANGED < <(git -c core.quotePath=false diff --name-only -z -- '*/config.json')
+
+          read -ra IDS <<< "${FIRM_IDS}"
+          for FIRM_ID in "${IDS[@]}"; do
+            FIRM_DIR="${LOG_DIR}/${FIRM_ID}"
+            {
+              echo "## Firm ${FIRM_ID}"
+              echo
+              if [[ ! -f "${FIRM_DIR}/phases.tsv" ]]; then
+                echo "❌ Not synced: the run stopped before reaching this firm."
+                echo
+                continue
+              fi
+              echo "| Phase | Result | Detail |"
+              echo "|---|---|---|"
+              while IFS=$'\t' read -r LABEL RESULT DETAIL; do
+                ICON="✅"
+                [[ "${RESULT}" != "ok" ]] && ICON="❌"
+                echo "| ${ICON} ${LABEL} | ${RESULT} | $(clean "${DETAIL}") |"
+              done < "${FIRM_DIR}/phases.tsv"
+              echo
+
+              for F in "${FIRM_DIR}"/*.failed; do
+                [[ -f "${F}" ]] || continue
+                echo "**Failed in $(basename "${F}" .failed | cut -d- -f2- | tr '_' ' '):** $(clean "$(paste -sd, "${F}")")"
+                echo
+              done
+
+              # Skips of templates that already exist are expected, not worth flagging.
+              ISSUES=$(cat "${FIRM_DIR}"/[0-9]*.log 2>/dev/null | grep -E '^\[(error|warn)\]' | grep -v 'already exists on' | sort -u || true)
+              if [[ -n "${ISSUES}" ]]; then
+                echo "<details><summary>Errors and warnings</summary>"
+                echo
+                while IFS= read -r LINE; do
+                  echo "- $(clean "${LINE}")"
+                done <<< "${ISSUES}"
+                echo
+                echo "</details>"
+                echo
+              fi
+
+              ROWS=()
+              for FILE in "${CHANGED[@]}"; do
+                NEW=$(jq -r --arg f "${FIRM_ID}" '.id[$f] // empty' "${FILE}" 2>/dev/null || true)
+                OLD=$(git show "HEAD:${FILE}" 2>/dev/null | jq -r --arg f "${FIRM_ID}" '.id[$f] // empty' 2>/dev/null || true)
+                if [[ -n "${NEW}" && "${NEW}" != "${OLD}" ]]; then
+                  ROWS+=("| $(clean "$(dirname "${FILE}")") | ${NEW} |")
+                fi
+              done
+              if [[ ${#ROWS[@]} -gt 0 ]]; then
+                echo "### Ids missing from the repository (${#ROWS[@]})"
+                echo
+                echo "| Template | Id |"
+                echo "|---|---|"
+                printf '%s\n' "${ROWS[@]}"
+              else
+                echo "No ids were missing from the repository."
+              fi
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+
+  # A refresh that lost a race with another CONFIG_JSON writer, or tokens rotated mid-run, heals
+  # on a fresh run: secrets.* is snapshotted at run creation, so only a new run can see the
+  # winner's write. Every phase is idempotent, so re-running the whole sync is safe.
+  # `schedule` only, so a retry (a workflow_dispatch run) can never retry itself.
+  retry-on-race:
+    needs: sync
+    if: |
+      !cancelled() &&
+      github.event_name == 'schedule' &&
+      github.run_attempt == '1' &&
+      ((needs.sync.outputs.refresh_completed == 'true' && needs.sync.outputs.failed_firms != '') ||
+       needs.sync.outputs.auth_failed == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # A job-level block replaces the workflow-level one, so contents: read is restated.
+    permissions:
+      actions: write
+      contents: read
+    outputs:
+      dispatched: ${{ steps.retry.outcome == 'success' }}
+    steps:
+      - name: Auto-retry once via a fresh dispatch
+        id: retry
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The caller's workflow file, e.g. owner/repo/.github/workflows/x.yml@refs/heads/main.
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+        run: |
+          WORKFLOW_FILE="${WORKFLOW_REF#*/.github/workflows/}"
+          WORKFLOW_FILE="${WORKFLOW_FILE%%@*}"
+          # The dispatch is the new run's secret snapshot point, so give the winner's write time
+          # to land; the jitter keeps several losers from colliding again.
+          sleep $((20 + RANDOM % 40))
+          gh workflow run "${WORKFLOW_FILE}" --repo "${REPO}" --ref "${REF}"
+          echo "::notice::Dispatched a retry of ${WORKFLOW_FILE} on ${REF}"
+
+  alert-on-failure:
+    needs: [sync, retry-on-race]
+    if: |
+      always() &&
+      (needs.sync.result != 'success' ||
+       needs.sync.outputs.refresh_completed != 'true' ||
+       needs.sync.outputs.failed_firms != '' ||
+       needs.sync.outputs.auto_renew_lost != '' ||
+       needs.sync.outputs.write_back_failed == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Alert Slack
+        # A dispatched retry usually self-resolves; it alerts on its own if it doesn't.
+        if: ${{ always() && needs.retry-on-race.outputs.dispatched != 'true' }}
+        env:
+          SLACK: ${{ secrets.SLACK_CI_ALERTS_WEBHOOK_URL }}
+          SYNC_RESULT: ${{ needs.sync.result }}
+          FAILED_FIRMS: ${{ needs.sync.outputs.failed_firms }}
+          FAILED_SUMMARY: ${{ needs.sync.outputs.failed_firms_summary }}
+          REFRESH_COMPLETED: ${{ needs.sync.outputs.refresh_completed }}
+          AUTO_RENEW_LOST: ${{ needs.sync.outputs.auto_renew_lost }}
+          WRITE_BACK_FAILED: ${{ needs.sync.outputs.write_back_failed }}
+          AUTH_FAILED: ${{ needs.sync.outputs.auth_failed }}
+          AUTH_FAILED_FIRM: ${{ needs.sync.outputs.auth_failed_firm }}
+          FIRM_IDS: ${{ inputs.firm_ids }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [[ -z "${SLACK}" ]]; then
+            echo "No SLACK_CI_ALERTS_WEBHOOK_URL secret in this repository, skipping alert"
+            exit 0
+          fi
+          NOT_RUN="the sync itself did not run"
+          if [[ "${SYNC_RESULT}" == "cancelled" ]]; then
+            FIRMS="none"
+            DETAIL="not an auth problem: the run was cancelled or timed out"
+          # Checked before the refresh outputs: they keep their healthy values when only the write-back failed.
+          elif [[ "${WRITE_BACK_FAILED}" == "true" ]]; then
+            FIRMS="none"
+            DETAIL="every firm refreshed, but writing CONFIG_JSON back to the secret failed - check the job log | ${NOT_RUN}"
+          elif [[ "${REFRESH_COMPLETED}" != "true" ]]; then
+            FIRMS="unknown"
+            DETAIL="the refresh loop did not finish - check the job log (a zero-step startup_failure/cancellation, or an early abort inside the refresh step, e.g. an invalid CONFIG_JSON or no firms in it) | ${NOT_RUN}"
+          elif [[ -n "${FAILED_FIRMS}" ]]; then
+            FIRMS="${FAILED_FIRMS}"
+            DETAIL="${FAILED_SUMMARY} | ${NOT_RUN}"
+          elif [[ -n "${AUTO_RENEW_LOST}" ]]; then
+            FIRMS="${AUTO_RENEW_LOST}"
+            DETAIL="every token refreshed and CONFIG_JSON was written, but the CLI did not preserve the autoRenew flag for these firms - the no-renew protection is not in effect for them | ${NOT_RUN}"
+          elif [[ "${AUTH_FAILED}" == "true" ]]; then
+            FIRMS="${AUTH_FAILED_FIRM:-${FIRM_IDS}}"
+            DETAIL="the refresh succeeded, but a credential was rejected mid-sync - most likely another CONFIG_JSON refresh rotated the tokens during the run. Later phases and firms were not synced"
+          else
+            FIRMS="${FIRM_IDS}"
+            DETAIL="not an auth problem: the sync finished with failures (template errors, a firm not authorized or not allowlisted, or a timeout) - see the run's job summary"
+          fi
+          TEXT=$(printf '⚠️ sync-all-templates failed in %s — firm(s): %s\n%s\n%s' \
+            "${REPO}" "${FIRMS}" "${DETAIL}" "${RUN_URL}")
+          curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
+            -X POST "${SLACK}" -H 'Content-Type: application/json' \
+            --data-binary "$(jq -n --arg text "${TEXT}" '{text: $text}')" \
+            || echo "::warning::failed to post the alert to Slack"
