@@ -220,10 +220,13 @@ on:
 
 permissions:
   contents: read
-  actions: write
 
 jobs:
   run-tests:
+    # On this job only, so jobs added to the caller later don't inherit actions: write
+    permissions:
+      contents: read
+      actions: write
     uses: silverfin/bso_github_actions/.github/workflows/run_tests_inline_auth.yml@main
     secrets: inherit
 ```

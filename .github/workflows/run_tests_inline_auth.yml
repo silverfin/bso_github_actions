@@ -12,9 +12,10 @@
 # Caller requirements:
 # - `workflow_dispatch` with a required string `base_sha` input, in the caller's own workflow file:
 #   retry-on-race re-dispatches the caller's workflow (by its file name).
-# - `permissions: { contents: read, actions: write }` - retry-on-race needs actions: write, and a
-#   called workflow can only narrow what the caller grants. Without it the whole run fails at
-#   startup: no test-templates, and the required check never reports.
+# - `permissions: { contents: read, actions: write }` on the calling job (not workflow-wide, so jobs
+#   added to the caller later don't inherit actions: write) - retry-on-race needs actions: write,
+#   and a called workflow can only narrow what the caller grants. Without it the whole run fails
+#   at startup: no test-templates, and the required check never reports.
 # - `secrets: inherit`.
 # - No other CONFIG_JSON writer on a schedule (e.g. a refresh_token.yml cron): it races this job's
 #   own refresh. Disable it when switching.
@@ -186,8 +187,10 @@ jobs:
           # so this keys off that job's own result. A cancel landing after it already succeeded
           # falls through to the refresh_completed branch, whose text already names cancellation.)
           if [[ "${CHANGED_TEMPLATES_RESULT}" == "cancelled" ]]; then
-            FIRMS="none"
-            DETAIL="not an auth problem: the run was cancelled before the refresh step ran"
+            # Not an auth signal, and the required check already blocks via test-templates - a
+            # Slack post here would only be noise on every manual or superseded cancel.
+            echo "Run was cancelled before the refresh step ran - not an auth problem, skipping alert"
+            exit 0
           elif [[ -n "${CHANGED_TEMPLATES_RESULT}" && "${CHANGED_TEMPLATES_RESULT}" != "success" ]]; then
             FIRMS="none"
             DETAIL="not an auth problem: check-changed-templates did not succeed (${CHANGED_TEMPLATES_RESULT}) before the refresh step ever ran - check that job's own log, not the refresh step's. Likely causes: an unreachable base (a force-pushed or rebased base branch on pull_request, a force-pushed main on push, or a stale base_sha on a workflow_dispatch retry), or a rejected dispatched base_sha. A re-run replays the same base, so a PR blocked this way needs a new commit or a rebase"
