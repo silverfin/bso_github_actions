@@ -128,8 +128,10 @@ jobs:
     # The losing run only has retry-on-race and the alert job left when it dispatches this, so it
     # finishes within a minute or two; the wait below is capped at 15, inside this 20.
     timeout-minutes: 20
+    # pull-requests: read is for the PR-moved check's `gh api pulls/{n}` call.
     permissions:
       actions: write
+      pull-requests: read
     steps:
       - name: Wait for the losing run, then re-run its failed jobs
         env:
@@ -223,6 +225,26 @@ jobs:
           fi
           if [[ "${ATTEMPT}" != "1" ]]; then
             echo "::notice::run ${RERUN_RUN_ID} was already re-run during the jitter - leaving it alone"
+            exit 0
+          fi
+          # Only while the PR is still open at this run's commit: a newer commit has its own
+          # pull_request run, and re-running this one would only race it. By PR number, not
+          # branch, so a merged PR's deleted branch doesn't read as an error.
+          PR_NUMBER=$(jq -r '.pull_requests[0].number // empty' <<< "${RUN}")
+          if [[ -z "${PR_NUMBER}" ]]; then
+            echo "::notice::run ${RERUN_RUN_ID} no longer has an open PR - leaving it alone"
+            exit 0
+          fi
+          if ! PR=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}"); then
+            echo "::error::could not read PR #${PR_NUMBER} of run ${RERUN_RUN_ID} - not re-running it"
+            exit 1
+          fi
+          if [[ "$(jq -r '.state' <<< "${PR}")" != "open" ]]; then
+            echo "::notice::PR #${PR_NUMBER} is no longer open - leaving run ${RERUN_RUN_ID} alone"
+            exit 0
+          fi
+          if [[ "$(jq -r '.head.sha' <<< "${PR}")" != "$(jq -r '.head_sha' <<< "${RUN}")" ]]; then
+            echo "::notice::PR #${PR_NUMBER} moved on - its newer run covers it, leaving run ${RERUN_RUN_ID} alone"
             exit 0
           fi
           gh run rerun "${RERUN_RUN_ID}" --failed --repo "${REPO}"
