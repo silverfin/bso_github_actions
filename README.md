@@ -161,7 +161,8 @@ _Steps:_
 
 _Prerequisites_:
 
-* `SF_API_CLIENT_ID`, `SF_API_SECRET`, `CONFIG_JSON`, `REPO_ACCESS_TOKEN` (via `secrets: inherit`)
+* `SF_API_CLIENT_ID`, `SF_API_SECRET`, `CONFIG_JSON`, `REPO_ACCESS_TOKEN`, declared under
+  `workflow_call.secrets` - pass exactly these, not `secrets: inherit`
 
 _Example caller:_
 
@@ -190,7 +191,11 @@ jobs:
       firm_id: ${{ inputs.firm_id }}
       auth_code: ${{ inputs.auth_code }}
       writer_workflows: run_tests.yml
-    secrets: inherit
+    secrets:
+      SF_API_CLIENT_ID: ${{ secrets.SF_API_CLIENT_ID }}
+      SF_API_SECRET: ${{ secrets.SF_API_SECRET }}
+      CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+      REPO_ACCESS_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
 ```
 
 ### Testing

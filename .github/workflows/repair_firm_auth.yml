@@ -32,6 +32,20 @@ on:
           "run_tests.yml refresh_token.yml"). The caller's own file is added automatically.
         required: true
         type: string
+    # Declared, so callers pass exactly these instead of `secrets: inherit`.
+    secrets:
+      SF_API_CLIENT_ID:
+        description: "Silverfin API OAuth client id, for the token exchange."
+        required: true
+      SF_API_SECRET:
+        description: "Silverfin API OAuth client secret, for the token exchange."
+        required: true
+      CONFIG_JSON:
+        description: "silverfin-cli credentials file content; the repaired firm's token pair is written into it."
+        required: true
+      REPO_ACCESS_TOKEN:
+        description: "PAT that can list this repo's workflow runs and write its CONFIG_JSON secret."
+        required: true
 
 permissions: {}
 
