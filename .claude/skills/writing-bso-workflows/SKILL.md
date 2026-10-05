@@ -70,8 +70,7 @@ If a local `.cursor/review-learnings/` exists (it is not tracked in this repo), 
      X=$(tr ... <<< "$X")
      ```
      Put `set -e` **immediately** after `RC=$?`. A follow-up `tr`/`sed` still inside the
-     `set +e` block (the residual after `run_sampler.yml`'s first RC-capture fix, be_market#3178
-     / this repo's #53) can fail silently, empty `X`, and skip a later text match while `RC`
+     `set +e` block can fail silently, empty `X`, and skip a later text match while `RC`
      still looks like `cmd1`'s. A single capture can use `RC=0; X=$(cmd1) || RC=$?` instead of
      the `set +e`/`set -e` pair - use `set +e ... set -e` only when you capture or check every
      command's status before re-enabling `-e`, not just the one you care about.
@@ -175,18 +174,16 @@ If a local `.cursor/review-learnings/` exists (it is not tracked in this repo), 
      still matches once that migration lands.
 
 8. **A new reusable workflow needs a README.md entry** (Individual Action Documentation
-   section) - repo convention since #24, and README drift on this file is treated as a real
+   section) - README drift on this file is treated as a real
    regression here, not a nit.
 
 9. **A market repo consumes this repo's workflows one of three ways - know which before
    assuming a merge here reaches it:**
    - **`uses: .../X.yml@main`** - the default. Confirmed across all 4 market repos (be/nl/lu/uk)
-     for every wrapper except the two cases below. **A merge to `main` reaches this caller on
+     for every wrapper. **A merge to `main` reaches this caller on
      its very next run** - no gradual rollout, no opt-out short of the caller pinning itself.
-   - **`uses: .../X.yml@<sha>`** - pinned. Only be_market's `check_auth.yml`/
-     `refresh-config-json`, deliberately isolating the CI-auth pilot (see silverfin-cli's
-     `CI_AUTH_SAMPLER_PLAN.md`). A merge here does NOT reach that caller until its pin is
-     bumped.
+   - **`uses: .../X.yml@<sha>`** - pinned. A merge here does NOT reach that caller until its
+     pin is bumped. Check the caller for a pin before assuming it tracks `main`.
    - **Fully forked/inlined - no `uses:` reference at all.** Two shapes, both live: a permanent
      local reimplementation (be_market's `run_tests.yml`) and a *temporary* inlined copy carried
      while something upstream settles (`run_sampler.yml`, inlined in be/nl/lu - so that file
