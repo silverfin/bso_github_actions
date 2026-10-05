@@ -10,8 +10,9 @@
 # Temporary file name. Markets move to this one at a time; once all have, it replaces run_tests.yml.
 #
 # Caller requirements:
-# - `workflow_dispatch` with a required string `base_sha` input, in the caller's own workflow file:
-#   retry-on-race re-dispatches the caller's workflow (by its file name).
+# - `workflow_dispatch` with a required string `rerun_run_id` input, in the caller's own workflow
+#   file: retry-on-race dispatches the caller's workflow on the default branch, and that run only
+#   re-runs the losing run's failed jobs (rerun-losing-run).
 # - `permissions: { contents: read, actions: write }` on the calling job (not workflow-wide, so jobs
 #   added to the caller later don't inherit actions: write) - retry-on-race needs actions: write,
 #   and a called workflow can only narrow what the caller grants. Without it the whole run fails
@@ -32,28 +33,25 @@ jobs:
   #
   # Concurrent test-templates/push_to_review_firm jobs each refresh CONFIG_JSON independently, so
   # two can race on one firm's single-use refresh token. The loser fails cleanly but still fails
-  # its own job, and a fresh run almost always succeeds within seconds. Retries only that shape -
-  # a named-firm rejection with the loop otherwise complete; a mid-loop crash or a write-back
-  # failure still alerts instead.
+  # its own job, and a re-run almost always succeeds. Retries only that shape - a named-firm
+  # rejection with the loop otherwise complete; a mid-loop crash or a write-back failure still
+  # alerts instead.
   #
   # Not narrowed to the race error text: the action classifies per-firm success/failure, not
-  # cause, so a dead credential also lands here and costs one wasted retry before the alert
+  # cause, so a dead credential also lands here and costs one wasted re-run before the alert
   # fires. Narrowing it needs a change in bso_github_actions - not worth it yet.
   #
-  # `pull_request` only. That also prevents a retry-of-a-retry (a dispatched run's event_name is
-  # `workflow_dispatch`), and avoids dispatching full secrets against fork-checked-out code.
+  # The retry is a re-run of THIS run, not a fresh run: only a pull_request-event run counts toward
+  # the PR's required check (a dispatched run's check on the same commit is ignored), and a re-run
+  # reads the current CONFIG_JSON - both measured. A run can't re-run itself while it's still going,
+  # so this dispatches the caller's workflow (rerun-losing-run below), which waits for this run to
+  # finish and then re-runs its failed jobs.
   #
-  # A successful retry should clear the required `test-templates` check: check runs anchor to the
-  # PR's head SHA, which is what the dispatch targets, and a required check matches by name with
-  # the latest winning. Confirm once post-merge - untestable before the trigger is on main. If it
-  # doesn't clear, stop suppressing the alert for this shape; an in-job retry is not the fallback,
-  # because secrets.* is fixed for the life of a run.
+  # `pull_request` only, and `run_attempt == '1'`, so a re-run (attempt 2) can never retry itself.
   retry-on-race:
     needs: test-templates
-    # `!cancelled()`, not `always()`: this dispatches a brand-new full test run, so a cancelled
-    # run must not resurrect it. (test-templates below needs `always()` for the opposite reason -
-    # it backs a required check.) `run_attempt == '1'` likewise: "Re-run failed jobs" keeps the
-    # `pull_request` event, so every click would dispatch another ~120-minute run.
+    # `!cancelled()`, not `always()`: a cancelled run must not be resurrected. (test-templates below
+    # needs `always()` for the opposite reason - it backs a required check.)
     if: |
       !cancelled() &&
       needs.test-templates.outputs.refresh_completed == 'true' &&
@@ -61,16 +59,12 @@ jobs:
       github.event_name == 'pull_request' &&
       github.run_attempt == '1'
     runs-on: ubuntu-latest
-    # A sleep of at most 60s plus two `gh` calls; never legitimately longer. Bounded explicitly
-    # because alert-on-check-auth-failure now `needs:` this job - on the default 360-minute job
-    # timeout, one hung `gh` call would hold back the only check-auth page for six hours.
+    # Two `gh` calls; never legitimately longer. Bounded explicitly because
+    # alert-on-check-auth-failure `needs:` this job - on the default 360-minute job timeout, one
+    # hung `gh` call would hold back the only check-auth page for six hours.
     timeout-minutes: 5
-    # A job-level `permissions:` block replaces the workflow-level one entirely for that job, not
-    # merges with it - so `contents: read` isn't inherited from the top of this file just because
-    # it's declared there. Missing it here made the branch-move check's `gh api commits/{ref}` call
-    # 403 unconditionally (private repo, no Contents access), which under continue-on-error read as
-    # a failed retry on every single invocation - the retry never actually fired, only added its
-    # sleep as latency before the same alert that always would have fired anyway.
+    # A job-level `permissions:` block replaces the workflow-level one entirely, so `contents: read`
+    # must be repeated here for the branch-move check's `gh api commits/{ref}` call.
     permissions:
       actions: write
       contents: read
@@ -79,7 +73,7 @@ jobs:
       # it returns no run id, so this cannot assert that a run was actually created.
       dispatched: ${{ steps.retry.outcome == 'success' }}
     steps:
-      - name: Auto-retry once via a fresh dispatch
+      - name: Dispatch a re-run of this run's failed jobs
         id: retry
         continue-on-error: true
         env:
@@ -89,30 +83,13 @@ jobs:
           # branch name is attacker-influenceable text, not a literal.
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          # tj-actions/changed-files needs an explicit base to diff against on a workflow_dispatch
-          # run - github.event.before (used for `push`) doesn't exist on this trigger, and without
-          # this it silently falls back to HEAD^, meaning the retry would only re-test whatever the
-          # PR's last single commit touched instead of its full diff against main.
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RUN_ID: ${{ github.run_id }}
           # In a called workflow this is the *caller's* workflow file, which is the one carrying
           # the workflow_dispatch trigger - never this file.
           CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
-          # Load-bearing for freshness, not just anti-collision jitter: secrets.* is snapshotted
-          # when a run is *created*, not when its jobs start (measured: a run created seconds before
-          # another run's write, whose job started two minutes after it, still read the old value).
-          # The dispatch below is therefore the snapshot point, so this sleep is what gives the
-          # winner's write time to land first; dispatching instantly lets the retry snapshot the
-          # same stale CONFIG_JSON and fail identically. The jitter on top keeps multiple losers
-          # from one burst from re-colliding with each other.
-          sleep $((20 + RANDOM % 40))
-          # workflow_dispatch only accepts a branch/tag ref, which resolves to the branch's *current*
-          # tip at dispatch time - if someone pushed a new commit during the sleep above, that tip is
-          # no longer the commit whose refresh actually lost the race. Retrying it would silently
-          # drop this failure's alert (dispatched would still read true) while testing a commit a
-          # fresh pull_request run already covers on its own. Exiting here instead routes this back
-          # to the normal alert path via `outcome != 'success'`.
           # owner/repo/.github/workflows/<file>@<ref> -> <file>
           CALLER_WORKFLOW="${CALLER_WORKFLOW_REF%@*}"
           CALLER_WORKFLOW="${CALLER_WORKFLOW##*/}"
@@ -120,21 +97,188 @@ jobs:
             echo "::error::could not derive the caller's workflow file from github.workflow_ref (${#CALLER_WORKFLOW_REF} characters)"
             exit 1
           fi
+          # A newer commit gets its own pull_request run; re-running this one would test a commit
+          # the PR no longer points at. Exiting routes this to the normal alert via
+          # `outcome != 'success'`.
           CURRENT_SHA=$(gh api "repos/${REPO}/commits/${PR_HEAD_REF}" --jq '.sha')
           if [[ "${CURRENT_SHA}" != "${PR_HEAD_SHA}" ]]; then
-            echo "::warning::${PR_HEAD_REF} moved from ${PR_HEAD_SHA} to ${CURRENT_SHA} during the retry delay - skipping this stale retry so the original failure alerts normally"
+            echo "::warning::${PR_HEAD_REF} moved from ${PR_HEAD_SHA} to ${CURRENT_SHA} - skipping the re-run so the original failure alerts normally"
             exit 1
           fi
-          # The dispatch trigger is checked at the dispatched branch, not on main: a branch that
-          # predates the caller's workflow_dispatch trigger gets a 422 here until it rebases, which
-          # falls through to the normal alert.
-          echo "Retrying via a fresh dispatch - firm(s) ${FAILED_FIRMS} lost a refresh race against a concurrent job, not a genuine credential problem"
+          # Dispatched on the default branch, not the PR branch: the helper only needs the
+          # caller's workflow_dispatch trigger, and a PR branch that predates it would 422.
+          echo "Dispatching a re-run - firm(s) ${FAILED_FIRMS} lost a refresh race against a concurrent job, not a genuine credential problem"
           gh workflow run "${CALLER_WORKFLOW}" \
             --repo "${REPO}" \
-            --ref "refs/heads/${PR_HEAD_REF}" \
-            -f base_sha="${PR_BASE_SHA}"
-          # @uri, not the raw ref: a literal `/` in the query filter yields a dead link.
-          echo "::notice::Dispatched a retry for ${PR_HEAD_REF} (commit ${PR_HEAD_SHA}) - see https://github.com/${REPO}/actions/workflows/${CALLER_WORKFLOW}?query=branch%3A$(jq -rn --arg b "${PR_HEAD_REF}" '$b|@uri')"
+            --ref "refs/heads/${DEFAULT_BRANCH}" \
+            -f rerun_run_id="${RUN_ID}"
+          echo "::notice::Dispatched a helper that re-runs this run's failed jobs once it finishes - see https://github.com/${REPO}/actions/workflows/${CALLER_WORKFLOW}?query=event%3Aworkflow_dispatch"
+
+  # Only job in a workflow_dispatch run: re-runs the losing pull_request run named by rerun_run_id
+  # once it has finished. Alerts on its own failure, since the losing run's alert was suppressed on
+  # the strength of this dispatch.
+  rerun-losing-run:
+    if: github.event_name == 'workflow_dispatch'
+    # Serialises duplicate helpers for one run; the attempt re-check below then makes the second a
+    # no-op instead of a rejected re-run.
+    concurrency:
+      group: rerun-losing-run-${{ github.event.inputs.rerun_run_id }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    # The losing run only has retry-on-race and the alert job left when it dispatches this, so it
+    # finishes within a minute or two; the wait below is capped at 15, inside this 20.
+    timeout-minutes: 20
+    # pull-requests: read is for the PR-moved check's `gh api pulls/{n}` call.
+    permissions:
+      actions: write
+      pull-requests: read
+    steps:
+      - name: Wait for the losing run, then re-run its failed jobs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RERUN_RUN_ID: ${{ github.event.inputs.rerun_run_id }}
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          # Length only, never the raw value, until it's known to be well-formed: a newline plus
+          # `::` in a dispatch input would inject workflow commands into this log.
+          if [[ ! "${RERUN_RUN_ID}" =~ ^[0-9]+$ ]]; then
+            echo "::error::rerun_run_id must be a numeric run id (received ${#RERUN_RUN_ID} characters)"
+            exit 1
+          fi
+          # owner/repo/.github/workflows/<file>@<ref> -> .github/workflows/<file>
+          CALLER_PATH="${CALLER_WORKFLOW_REF%@*}"
+          CALLER_PATH="${CALLER_PATH#*/*/}"
+          if ! RUN=$(gh api "repos/${REPO}/actions/runs/${RERUN_RUN_ID}"); then
+            echo "::error::could not read run ${RERUN_RUN_ID}"
+            exit 1
+          fi
+          # Only ever re-run a recent pull_request run of this same caller workflow, from a branch in
+          # this repo - this input is free text to anyone who can dispatch, and a re-run executes
+          # that run's commit with the current secrets.
+          if ! jq -e --arg path "${CALLER_PATH}" --argjson now "$(date +%s)" \
+               '.event == "pull_request" and .path == $path
+                and .head_repository.full_name == .repository.full_name
+                and ($now - (.created_at | fromdateiso8601)) < 7200' <<< "${RUN}" > /dev/null; then
+            echo "::error::run ${RERUN_RUN_ID} is not a pull_request run of ${CALLER_PATH} from this repo created in the last 2 hours - refusing to re-run it"
+            exit 1
+          fi
+          # Past validation: from here a failure is a real race left unretried, worth paging.
+          echo "REACHED_WAIT=true" >> "$GITHUB_ENV"
+          # Re-checked after the wait too: someone may re-run it by hand in the meantime.
+          if [[ "$(jq -r '.run_attempt' <<< "${RUN}")" != "1" ]]; then
+            echo "::notice::run ${RERUN_RUN_ID} was already re-run - leaving it alone"
+            exit 0
+          fi
+          DEADLINE=$(( $(date +%s) + 900 ))
+          POLL_ERRORS=0
+          while true; do
+            if ! RUN=$(gh api "repos/${REPO}/actions/runs/${RERUN_RUN_ID}"); then
+              # A single API blip shouldn't page for a race that would recover on the next poll.
+              POLL_ERRORS=$((POLL_ERRORS + 1))
+              if (( POLL_ERRORS >= 3 )); then
+                echo "::error::could not read run ${RERUN_RUN_ID} three times in a row"
+                exit 1
+              fi
+            else
+              POLL_ERRORS=0
+              [[ "$(jq -r '.status' <<< "${RUN}")" == "completed" ]] && break
+            fi
+            if (( $(date +%s) >= DEADLINE )); then
+              echo "::error::run ${RERUN_RUN_ID} did not finish within 15 minutes - not re-running it"
+              exit 1
+            fi
+            sleep 15
+          done
+          if [[ "$(jq -r '.run_attempt' <<< "${RUN}")" != "1" ]]; then
+            echo "::notice::run ${RERUN_RUN_ID} was already re-run while waiting - leaving it alone"
+            exit 0
+          fi
+          CONCLUSION=$(jq -r '.conclusion' <<< "${RUN}")
+          case "${CONCLUSION}" in
+            success|cancelled)
+              echo "::notice::run ${RERUN_RUN_ID} finished as ${CONCLUSION} - nothing to re-run"
+              exit 0
+              ;;
+            failure)
+              ;;
+            *)
+              echo "::error::run ${RERUN_RUN_ID} finished as ${CONCLUSION} - not re-running it"
+              exit 1
+              ;;
+          esac
+          # Losers from one burst finish together; jitter so their re-runs don't snapshot the same
+          # CONFIG_JSON and race again.
+          sleep $((RANDOM % 45))
+          # Retried, not skipped: re-running on a stale read could duplicate a hand re-run.
+          ATTEMPT=""
+          for _ in 1 2 3; do
+            if RUN=$(gh api "repos/${REPO}/actions/runs/${RERUN_RUN_ID}"); then
+              ATTEMPT=$(jq -r '.run_attempt' <<< "${RUN}")
+              break
+            fi
+            sleep 5
+          done
+          if [[ -z "${ATTEMPT}" ]]; then
+            echo "::error::could not re-read run ${RERUN_RUN_ID} after the jitter - not re-running it"
+            exit 1
+          fi
+          if [[ "${ATTEMPT}" != "1" ]]; then
+            echo "::notice::run ${RERUN_RUN_ID} was already re-run during the jitter - leaving it alone"
+            exit 0
+          fi
+          # Only while the PR is still open at this run's commit: a newer commit has its own
+          # pull_request run, and re-running this one would only race it. By PR number, not
+          # branch, so a merged PR's deleted branch doesn't read as an error.
+          PR_NUMBER=$(jq -r '.pull_requests[0].number // empty' <<< "${RUN}")
+          if [[ -z "${PR_NUMBER}" ]]; then
+            echo "::notice::run ${RERUN_RUN_ID} no longer has an open PR - leaving it alone"
+            exit 0
+          fi
+          if ! PR=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}"); then
+            echo "::error::could not read PR #${PR_NUMBER} of run ${RERUN_RUN_ID} - not re-running it"
+            exit 1
+          fi
+          if [[ "$(jq -r '.state' <<< "${PR}")" != "open" ]]; then
+            echo "::notice::PR #${PR_NUMBER} is no longer open - leaving run ${RERUN_RUN_ID} alone"
+            exit 0
+          fi
+          if [[ "$(jq -r '.head.sha' <<< "${PR}")" != "$(jq -r '.head_sha' <<< "${RUN}")" ]]; then
+            echo "::notice::PR #${PR_NUMBER} moved on - its newer run covers it, leaving run ${RERUN_RUN_ID} alone"
+            exit 0
+          fi
+          gh run rerun "${RERUN_RUN_ID}" --failed --repo "${REPO}"
+          echo "::notice::Re-running the failed jobs of https://github.com/${REPO}/actions/runs/${RERUN_RUN_ID}"
+      # cancelled() too: a timed-out or cancelled helper is just as silent as a failed one.
+      # retry-on-race dispatches as github-actions[bot], so its helpers always page. A hand
+      # dispatch, or a hand re-run of a helper, only pages past validation - refused, there is no
+      # race behind it. triggering_actor, not actor: actor stays the bot on a re-run.
+      - name: Alert Slack if the re-run could not be started
+        if: |
+          (failure() || cancelled()) &&
+          (github.triggering_actor == 'github-actions[bot]' || env.REACHED_WAIT == 'true')
+        env:
+          SLACK: ${{ secrets.SLACK_CI_ALERTS_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          RERUN_RUN_ID: ${{ github.event.inputs.rerun_run_id }}
+          HELPER_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [[ -z "${SLACK}" ]]; then
+            echo "No SLACK_CI_ALERTS_WEBHOOK_URL secret in this repository, skipping alert"
+            exit 0
+          fi
+          # Only the length of an unvalidated input reaches Slack, never the raw value.
+          if [[ "${RERUN_RUN_ID}" =~ ^[0-9]+$ ]]; then
+            LOSER="https://github.com/${REPO}/actions/runs/${RERUN_RUN_ID}"
+          else
+            LOSER="(invalid rerun_run_id, ${#RERUN_RUN_ID} characters)"
+          fi
+          TEXT=$(printf '⚠️ check-auth in %s: a PR run lost a token refresh race, but re-running it failed - that PR'"'"'s required check stays red until someone re-runs its failed jobs.\nLosing run: %s\nHelper run: %s' \
+            "${REPO}" "${LOSER}" "${HELPER_URL}")
+          curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
+            -X POST "$SLACK" -H 'Content-Type: application/json' \
+            --data-binary "$(jq -n --arg text "$TEXT" '{text: $text}')" \
+            || echo "::warning::failed to post the re-run alert to Slack"
 
   # Trigger looks at test-templates' own refresh outputs directly rather than its overall
   # result: test-templates now also runs the actual liquid tests, and a generic "job failed"
@@ -144,8 +288,11 @@ jobs:
   # it just doesn't also fire on an unrelated test failure.
   alert-on-check-auth-failure:
     needs: [check-changed-templates, test-templates, retry-on-race]
+    # Never on a workflow_dispatch (helper) run: every job above is skipped there, so every output
+    # is empty and the conditions below would read as a failed refresh.
     if: |
       always() &&
+      github.event_name != 'workflow_dispatch' &&
       (needs.test-templates.outputs.refresh_completed != 'true' ||
        needs.test-templates.outputs.failed_firms != '' ||
        needs.test-templates.outputs.auto_renew_lost != '' ||
@@ -156,15 +303,14 @@ jobs:
     permissions: {}
     steps:
       - name: Alert Slack on check-auth failure
-        # Skipped when a retry dispatch was accepted - paging on every momentary race loss, most
-        # of which self-resolve in seconds, is the alert fatigue this was meant to avoid.
-        # `!= 'true'` still alerts when retry-on-race was skipped entirely or the dispatch call
-        # failed, so no failure goes unpaged.
+        # Skipped when a re-run dispatch was accepted - paging on every momentary race loss, most
+        # of which self-resolve, is the alert fatigue this was meant to avoid. `!= 'true'` still
+        # alerts when retry-on-race was skipped entirely or the dispatch call failed; the helper
+        # alerts on its own failure, and a failed re-run alerts from its own attempt.
         #
-        # One shape does: the dispatches endpoint is 204 with no run id, so a call the API accepts
-        # that never becomes a run suppresses this with nothing to replace it. Only polling could
-        # see that, deliberately not built until it's observed once. The likeliest cause, a
-        # malformed workflow file, yields a `startup_failure` run that alerts on its own.
+        # One shape goes unpaged: the dispatches endpoint is 204 with no run id, so a call the API
+        # accepts that never becomes a run suppresses this with nothing to replace it. The
+        # likeliest cause, a malformed workflow file, yields a `startup_failure` run instead.
         if: |
           always() &&
           needs.retry-on-race.outputs.dispatched != 'true'
@@ -193,7 +339,7 @@ jobs:
             exit 0
           elif [[ -n "${CHANGED_TEMPLATES_RESULT}" && "${CHANGED_TEMPLATES_RESULT}" != "success" ]]; then
             FIRMS="none"
-            DETAIL="not an auth problem: check-changed-templates did not succeed (${CHANGED_TEMPLATES_RESULT}) before the refresh step ever ran - check that job's own log, not the refresh step's. Likely causes: an unreachable base (a force-pushed or rebased base branch on pull_request, a force-pushed main on push, or a stale base_sha on a workflow_dispatch retry), or a rejected dispatched base_sha. A re-run replays the same base, so a PR blocked this way needs a new commit or a rebase"
+            DETAIL="not an auth problem: check-changed-templates did not succeed (${CHANGED_TEMPLATES_RESULT}) before the refresh step ever ran - check that job's own log, not the refresh step's. Likely cause: an unreachable base (a force-pushed or rebased base branch on pull_request, or a force-pushed main on push). A re-run replays the same base, so a PR blocked this way needs a new commit or a rebase"
           # Checked next: refresh_completed/failed_firms/auto_renew_lost are all set to their
           # pre-write-back (healthy) values when the write-back itself is what failed, so this
           # would otherwise fall through to the "everything succeeded" branch and never alert on
@@ -234,6 +380,7 @@ jobs:
           CHANGED_TEMPLATES_RESULT: ${{ needs.check-changed-templates.result }}
 
   check-changed-templates:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     outputs:
       changed_templates: ${{ steps.templates_changed.outputs.changed_templates }}
@@ -243,40 +390,6 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      # `required: true` on a workflow_dispatch input is a presence check, not a non-empty one,
-      # and fail_on_initial_diff_error only catches an *unreachable* base - not an empty one
-      # (which falls through the ternary to github.event.before, empty on this trigger, and then
-      # to a HEAD^ diff) nor a reachable-but-wrong one such as the head commit itself. Either
-      # yields an empty changed-file list, a green test-templates, and a satisfied required check
-      # that ran no tests. Deliberately not an ancestry check: pull_request.base.sha is the base
-      # branch tip, which is not always an ancestor of the head, so --is-ancestor would reject
-      # legitimate retries.
-      - name: Validate the dispatched base_sha
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        env:
-          BASE_SHA: ${{ github.event.inputs.base_sha }}
-        run: |
-          # Length only in the message, never the raw value: this is the one place the input is
-          # emitted before it is known to be well-formed, and a newline plus `::` in it would
-          # inject workflow commands into this job's log.
-          if [[ ! "${BASE_SHA,,}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::base_sha must be a full 40-character commit SHA (received ${#BASE_SHA} characters)"
-            exit 1
-          fi
-          if [[ "${BASE_SHA}" == "${GITHUB_SHA}" ]]; then
-            echo "::error::base_sha equals the dispatched commit - that diffs a commit against itself and would test nothing"
-            exit 1
-          fi
-          # Equality is not enough: ANY base already containing the dispatched commit gives an
-          # empty diff by construction - main's tip once this branch merges, a same-tree branch or
-          # tag, a later commit here - and that passes the only required check having tested
-          # nothing. Assert this direction only: base.sha is the base-*branch tip* and
-          # legitimately is not an ancestor of the head, so the reverse check would reject real
-          # runs. Inside `if` so a base missing from the checkout doesn't abort under `-e`.
-          if git merge-base --is-ancestor "${GITHUB_SHA}" "${BASE_SHA}"; then
-            echo "::error::base_sha already contains the dispatched commit - the diff would be empty and the run would pass having tested nothing"
-            exit 1
-          fi
       - name: Get changed liquid files
         id: changed-files
         uses: tj-actions/changed-files@24d32ffd492484c1d75e0c0b894501ddb9d30d62 # v47
@@ -296,7 +409,7 @@ jobs:
           # against itself always yields zero changed files and silently skips every test on
           # that trigger. pull_request diffs against the PR's actual base commit; push diffs
           # against the commit main pointed to before this push landed.
-          base_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || (github.event_name == 'workflow_dispatch' && github.event.inputs.base_sha) || github.event.before }}
+          base_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           # Emit the file list as a JSON array so paths containing spaces (e.g. account
           # template names) survive the hand-off between steps and jobs intact.
           # escape_json: false keeps it valid JSON for jq (the default double-escapes the quotes).
@@ -425,7 +538,8 @@ jobs:
     # the suite running, since `always()` keeps the job alive. Accepted - the branch-protection
     # reason outweighs it. The job may then report `cancelled` rather than `failure`; both block,
     # only `skipped` passes, so the property holds either way.
-    if: ${{ always() }}
+    # A workflow_dispatch run is only the re-run helper (rerun-losing-run) and backs no PR check.
+    if: ${{ always() && github.event_name != 'workflow_dispatch' }}
     steps:
       # Must come first, and must exit non-zero: the whole point is that this job reports
       # `failure` rather than `skipped`, so the required check stays red. Every later step is
