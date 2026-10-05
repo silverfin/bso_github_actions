@@ -44,6 +44,7 @@ The document will go over all the Github Actions that currently automate a coupl
   * [Testing](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf13d6dbd0df1e4450b3b22691c)
     * [Check YAML files (check_tests.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf931fa1547b4b419d940464f89)
     * [Run liquid tests (run_tests.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBfa4878bb5baac49cbb0c39d927)
+    * [Run liquid tests, inline auth (run_tests_inline_auth.yml)](#run-liquid-tests-inline-auth-run_tests_inline_authyml)
   * [Slack updates](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBfc9ca89d4b174494391ba075c5)
     * [Automated slack update (slack_changelog.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf862cf4257e68475d8b47891c6)
   * [Review firm deployment](#review-firm-deployment)
@@ -185,6 +186,50 @@ If the `test_firm_id` is not used for a specific handle, the Github action will 
 If none of the above options is used/defined, we will fall back to the default option: the first firm id that is present in the `config.json` file. This is again template specific, but the order cannot be changed (the smallest firm id number will always be on top). 
 
 
+
+#### Run liquid tests, inline auth `(run_tests_inline_auth.yml)`
+
+_Description:_
+Same tests as `run_tests.yml`, but `test-templates` refreshes `CONFIG_JSON` as its own first step
+instead of relying on a separate `check_auth.yml` job (whose write a later job in the same run never
+sees). Markets switch to it one at a time; once all have, it replaces `run_tests.yml`.
+
+_Differences from `run_tests.yml`:_
+
+* Refreshes tokens inline via the `refresh-config-json` action, seeding `autoRenew: false`, and blanks the refresh token on disk before tests run
+* If a concurrent run wins a refresh race, it re-dispatches the caller's workflow once (`retry-on-race`) before alerting Slack
+* `test-templates` always runs, so the required check fails rather than passing as skipped when change detection fails or the run is cancelled
+* A push to main diffs against the previous main commit (not `main` itself), so post-merge runs actually test something
+* The silverfin-cli install happens outside the PR checkout
+
+_Caller requirements:_
+
+```yaml
+on:
+  pull_request:
+    branches: ["*"]
+  push:
+    branches: ["main"]
+  # retry-on-race re-dispatches this file
+  workflow_dispatch:
+    inputs:
+      base_sha:
+        description: "PR base commit SHA (set by retry-on-race)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  run-tests:
+    uses: silverfin/bso_github_actions/.github/workflows/run_tests_inline_auth.yml@main
+    secrets: inherit
+```
+
+Disable any scheduled `CONFIG_JSON` refresher (e.g. a `refresh_token.yml` cron) when switching: it
+races the inline refresh.
 
 ### Slack updates
 

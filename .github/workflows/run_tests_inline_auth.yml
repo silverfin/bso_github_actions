@@ -1,0 +1,1125 @@
+# Reusable version of be_market's forked run_tests.yml: test-templates refreshes CONFIG_JSON as its
+# own first step, instead of depending on a separate check-auth job. A secret written by one job is
+# not visible to a later job in the same run (secrets.* is snapshotted when the run is created), so
+# run_tests.yml's separate check-auth job never actually feeds test-templates a fresh token.
+#
+# The refresh seeds a per-firm `autoRenew: false` flag, and the CLI is pinned to silverfin-cli#273,
+# which honours it: a stale credential ends that command with exit 2 instead of the CLI silently
+# rotating the shared refresh token on the runner and leaving CONFIG_JSON holding a dead pair.
+#
+# Temporary file name. Markets move to this one at a time; once all have, it replaces run_tests.yml.
+#
+# Caller requirements:
+# - `workflow_dispatch` with a required string `base_sha` input, in the caller's own workflow file:
+#   retry-on-race re-dispatches the caller's workflow (by its file name).
+# - `permissions: { contents: read, actions: write }` - retry-on-race needs actions: write, and a
+#   called workflow can only narrow what the caller grants.
+# - `secrets: inherit`.
+# - No other CONFIG_JSON writer on a schedule (e.g. a refresh_token.yml cron): it races this job's
+#   own refresh. Disable it when switching.
+name: run-liquid-tests
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  # Split from the alert job so `actions: write` never lands on the Slack-posting step, which
+  # needs no API access: a job-level `permissions:` block replaces the workflow-level one.
+  #
+  # Concurrent test-templates/push_to_review_firm jobs each refresh CONFIG_JSON independently, so
+  # two can race on one firm's single-use refresh token. The loser fails cleanly but still fails
+  # its own job, and a fresh run almost always succeeds within seconds. Retries only that shape -
+  # a named-firm rejection with the loop otherwise complete; a mid-loop crash or a write-back
+  # failure still alerts instead.
+  #
+  # Not narrowed to the race error text: the action classifies per-firm success/failure, not
+  # cause, so a dead credential also lands here and costs one wasted retry before the alert
+  # fires. Narrowing it needs a change in bso_github_actions - not worth it yet.
+  #
+  # `pull_request` only. That also prevents a retry-of-a-retry (a dispatched run's event_name is
+  # `workflow_dispatch`), and avoids dispatching full secrets against fork-checked-out code.
+  #
+  # A successful retry should clear the required `test-templates` check: check runs anchor to the
+  # PR's head SHA, which is what the dispatch targets, and a required check matches by name with
+  # the latest winning. Confirm once post-merge - untestable before the trigger is on main. If it
+  # doesn't clear, stop suppressing the alert for this shape; an in-job retry is not the fallback,
+  # because secrets.* is fixed for the life of a run.
+  retry-on-race:
+    needs: test-templates
+    # `!cancelled()`, not `always()`: this dispatches a brand-new full test run, so a cancelled
+    # run must not resurrect it. (test-templates below needs `always()` for the opposite reason -
+    # it backs a required check.) `run_attempt == '1'` likewise: "Re-run failed jobs" keeps the
+    # `pull_request` event, so every click would dispatch another ~120-minute run.
+    if: |
+      !cancelled() &&
+      needs.test-templates.outputs.refresh_completed == 'true' &&
+      needs.test-templates.outputs.failed_firms != '' &&
+      github.event_name == 'pull_request' &&
+      github.run_attempt == '1'
+    runs-on: ubuntu-latest
+    # A sleep of at most 60s plus two `gh` calls; never legitimately longer. Bounded explicitly
+    # because alert-on-check-auth-failure now `needs:` this job - on the default 360-minute job
+    # timeout, one hung `gh` call would hold back the only check-auth page for six hours.
+    timeout-minutes: 5
+    # A job-level `permissions:` block replaces the workflow-level one entirely for that job, not
+    # merges with it - so `contents: read` isn't inherited from the top of this file just because
+    # it's declared there. Missing it here made the branch-move check's `gh api commits/{ref}` call
+    # 403 unconditionally (private repo, no Contents access), which under continue-on-error read as
+    # a failed retry on every single invocation - the retry never actually fired, only added its
+    # sleep as latency before the same alert that always would have fired anyway.
+    permissions:
+      actions: write
+      contents: read
+    outputs:
+      # Strictly "the dispatch call returned 0". The dispatches endpoint is 204 fire-and-forget:
+      # it returns no run id, so this cannot assert that a run was actually created.
+      dispatched: ${{ steps.retry.outcome == 'success' }}
+    steps:
+      - name: Auto-retry once via a fresh dispatch
+        id: retry
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FAILED_FIRMS: ${{ needs.test-templates.outputs.failed_firms }}
+          # Passed via env, not interpolated directly into the script (flagged by actionlint): a
+          # branch name is attacker-influenceable text, not a literal.
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # tj-actions/changed-files needs an explicit base to diff against on a workflow_dispatch
+          # run - github.event.before (used for `push`) doesn't exist on this trigger, and without
+          # this it silently falls back to HEAD^, meaning the retry would only re-test whatever the
+          # PR's last single commit touched instead of its full diff against main.
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          REPO: ${{ github.repository }}
+          # In a called workflow this is the *caller's* workflow file, which is the one carrying
+          # the workflow_dispatch trigger - never this file.
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          # Load-bearing for freshness, not just anti-collision jitter: secrets.* is snapshotted
+          # when a run is *created*, not when its jobs start (measured: a run created seconds before
+          # another run's write, whose job started two minutes after it, still read the old value).
+          # The dispatch below is therefore the snapshot point, so this sleep is what gives the
+          # winner's write time to land first; dispatching instantly lets the retry snapshot the
+          # same stale CONFIG_JSON and fail identically. The jitter on top keeps multiple losers
+          # from one burst from re-colliding with each other.
+          sleep $((20 + RANDOM % 40))
+          # workflow_dispatch only accepts a branch/tag ref, which resolves to the branch's *current*
+          # tip at dispatch time - if someone pushed a new commit during the sleep above, that tip is
+          # no longer the commit whose refresh actually lost the race. Retrying it would silently
+          # drop this failure's alert (dispatched would still read true) while testing a commit a
+          # fresh pull_request run already covers on its own. Exiting here instead routes this back
+          # to the normal alert path via `outcome != 'success'`.
+          # owner/repo/.github/workflows/<file>@<ref> -> <file>
+          CALLER_WORKFLOW="${CALLER_WORKFLOW_REF%@*}"
+          CALLER_WORKFLOW="${CALLER_WORKFLOW##*/}"
+          CURRENT_SHA=$(gh api "repos/${REPO}/commits/${PR_HEAD_REF}" --jq '.sha')
+          if [[ "${CURRENT_SHA}" != "${PR_HEAD_SHA}" ]]; then
+            echo "::warning::${PR_HEAD_REF} moved from ${PR_HEAD_SHA} to ${CURRENT_SHA} during the retry delay - skipping this stale retry so the original failure alerts normally"
+            exit 1
+          fi
+          echo "Retrying via a fresh dispatch - firm(s) ${FAILED_FIRMS} lost a refresh race against a concurrent job, not a genuine credential problem"
+          gh workflow run "${CALLER_WORKFLOW}" \
+            --repo "${REPO}" \
+            --ref "refs/heads/${PR_HEAD_REF}" \
+            -f base_sha="${PR_BASE_SHA}"
+          # @uri, not the raw ref: a literal `/` in the query filter yields a dead link.
+          echo "::notice::Dispatched a retry for ${PR_HEAD_REF} (commit ${PR_HEAD_SHA}) - see https://github.com/${REPO}/actions/workflows/${CALLER_WORKFLOW}?query=branch%3A$(jq -rn --arg b "${PR_HEAD_REF}" '$b|@uri')"
+
+  # Trigger looks at test-templates' own refresh outputs directly rather than its overall
+  # result: test-templates now also runs the actual liquid tests, and a generic "job failed"
+  # condition would misfire on an ordinary test failure that has nothing to do with auth.
+  # `always()` plus checking refresh_completed/failed_firms/auto_renew_lost directly still
+  # catches a zero-step startup_failure/cancellation (those outputs come back empty then too),
+  # it just doesn't also fire on an unrelated test failure.
+  alert-on-check-auth-failure:
+    needs: [check-changed-templates, test-templates, retry-on-race]
+    if: |
+      always() &&
+      (needs.test-templates.outputs.refresh_completed != 'true' ||
+       needs.test-templates.outputs.failed_firms != '' ||
+       needs.test-templates.outputs.auto_renew_lost != '' ||
+       needs.test-templates.outputs.write_back_failed == 'true')
+    runs-on: ubuntu-latest
+    # This job never calls the GitHub API - only secrets, needs outputs, and an external webhook -
+    # so it gets none of the default GITHUB_TOKEN permissions.
+    permissions: {}
+    steps:
+      - name: Alert Slack on check-auth failure
+        # Skipped when a retry dispatch was accepted - paging on every momentary race loss, most
+        # of which self-resolve in seconds, is the alert fatigue this was meant to avoid.
+        # `!= 'true'` still alerts when retry-on-race was skipped entirely or the dispatch call
+        # failed, so no failure goes unpaged.
+        #
+        # One shape does: the dispatches endpoint is 204 with no run id, so a call the API accepts
+        # that never becomes a run suppresses this with nothing to replace it. Only polling could
+        # see that, deliberately not built until it's observed once. The likeliest cause, a
+        # malformed workflow file, yields a `startup_failure` run that alerts on its own.
+        if: |
+          always() &&
+          needs.retry-on-race.outputs.dispatched != 'true'
+        run: |
+          if [[ -z "${SLACK}" ]]; then
+            echo "No SLACK_CI_ALERTS_WEBHOOK_URL secret in this repository, skipping alert"
+            exit 0
+          fi
+          # Checked first: when check-changed-templates doesn't succeed, test-templates fails at
+          # its own guard step without reaching the refresh, so every output is empty. That
+          # satisfies refresh_completed != 'true' below and would otherwise blame the refresh step
+          # for a failure it never reached. Reachable because check-changed-templates sets
+          # fail_on_initial_diff_error: true.
+          #
+          # `!= success`, not `== failure`: that guard fires on ANY non-success result, so
+          # cancelled and skipped must land here too.
+          # Cancellation first: the common cancel kills check-changed-templates mid-flight, and
+          # without this it takes the branch below and tells the author to rebase for what was a
+          # deliberate cancel. (`cancelled()` can't be read here - it is only allowed in an `if:` -
+          # so this keys off that job's own result. A cancel landing after it already succeeded
+          # falls through to the refresh_completed branch, whose text already names cancellation.)
+          if [[ "${CHANGED_TEMPLATES_RESULT}" == "cancelled" ]]; then
+            FIRMS="none"
+            DETAIL="not an auth problem: the run was cancelled before the refresh step ran"
+          elif [[ -n "${CHANGED_TEMPLATES_RESULT}" && "${CHANGED_TEMPLATES_RESULT}" != "success" ]]; then
+            FIRMS="none"
+            DETAIL="not an auth problem: check-changed-templates did not succeed (${CHANGED_TEMPLATES_RESULT}) before the refresh step ever ran - check that job's own log, not the refresh step's. Likely causes: an unreachable base (a force-pushed or rebased base branch on pull_request, a force-pushed main on push, or a stale base_sha on a workflow_dispatch retry), or a rejected dispatched base_sha. A re-run replays the same base, so a PR blocked this way needs a new commit or a rebase"
+          # Checked next: refresh_completed/failed_firms/auto_renew_lost are all set to their
+          # pre-write-back (healthy) values when the write-back itself is what failed, so this
+          # would otherwise fall through to the "everything succeeded" branch and never alert on
+          # a genuine secret-persistence failure.
+          elif [[ "${WRITE_BACK_FAILED}" == "true" ]]; then
+            FIRMS="none"
+            DETAIL="every firm refreshed, but writing CONFIG_JSON back to the secret failed - check the job log"
+          elif [[ "${REFRESH_COMPLETED}" != "true" ]]; then
+            FIRMS="unknown"
+            DETAIL="the refresh loop did not finish - check the job log (a zero-step startup_failure/cancellation, or an early abort inside the refresh step, e.g. an invalid CONFIG_JSON or no firms in it)"
+            if [[ -n "${AUTO_RENEW_LOST}" ]]; then
+              DETAIL="${DETAIL} | also: the CLI did not preserve the autoRenew flag for firm(s): ${AUTO_RENEW_LOST}"
+            fi
+          elif [[ -n "${FAILED_FIRMS}" ]]; then
+            FIRMS="${FAILED_FIRMS}"
+            DETAIL="${FAILED_SUMMARY}"
+            if [[ -n "${AUTO_RENEW_LOST}" ]]; then
+              DETAIL="${DETAIL} | also: the CLI did not preserve the autoRenew flag for firm(s): ${AUTO_RENEW_LOST}"
+            fi
+          else
+            FIRMS="${AUTO_RENEW_LOST}"
+            DETAIL="every token refreshed and CONFIG_JSON was written, but the CLI did not preserve the autoRenew flag for these firms - the no-renew protection is not in effect for them"
+          fi
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TEXT=$(printf '⚠️ check-auth failed in %s during a liquid-test run (%s) — firm(s): %s\n%s\n%s' \
+            "${{ github.repository }}" "${{ github.event_name }}" "$FIRMS" "$DETAIL" "$RUN_URL")
+          curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
+            -X POST "$SLACK" -H 'Content-Type: application/json' \
+            --data-binary "$(jq -n --arg text "$TEXT" '{text: $text}')" \
+            || echo "::warning::failed to post the check-auth alert to Slack"
+        env:
+          SLACK: ${{ secrets.SLACK_CI_ALERTS_WEBHOOK_URL }}
+          FAILED_FIRMS: ${{ needs.test-templates.outputs.failed_firms }}
+          FAILED_SUMMARY: ${{ needs.test-templates.outputs.failed_firms_summary }}
+          REFRESH_COMPLETED: ${{ needs.test-templates.outputs.refresh_completed }}
+          AUTO_RENEW_LOST: ${{ needs.test-templates.outputs.auto_renew_lost }}
+          WRITE_BACK_FAILED: ${{ needs.test-templates.outputs.write_back_failed }}
+          CHANGED_TEMPLATES_RESULT: ${{ needs.check-changed-templates.result }}
+
+  check-changed-templates:
+    runs-on: ubuntu-latest
+    outputs:
+      changed_templates: ${{ steps.templates_changed.outputs.changed_templates }}
+    steps:
+      - name: Checkout Repository - Fetch all history for all tags and branches
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # `required: true` on a workflow_dispatch input is a presence check, not a non-empty one,
+      # and fail_on_initial_diff_error only catches an *unreachable* base - not an empty one
+      # (which falls through the ternary to github.event.before, empty on this trigger, and then
+      # to a HEAD^ diff) nor a reachable-but-wrong one such as the head commit itself. Either
+      # yields an empty changed-file list, a green test-templates, and a satisfied required check
+      # that ran no tests. Deliberately not an ancestry check: pull_request.base.sha is the base
+      # branch tip, which is not always an ancestor of the head, so --is-ancestor would reject
+      # legitimate retries.
+      - name: Validate the dispatched base_sha
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          BASE_SHA: ${{ github.event.inputs.base_sha }}
+        run: |
+          # Length only in the message, never the raw value: this is the one place the input is
+          # emitted before it is known to be well-formed, and a newline plus `::` in it would
+          # inject workflow commands into this job's log.
+          if [[ ! "${BASE_SHA,,}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::base_sha must be a full 40-character commit SHA (received ${#BASE_SHA} characters)"
+            exit 1
+          fi
+          if [[ "${BASE_SHA}" == "${GITHUB_SHA}" ]]; then
+            echo "::error::base_sha equals the dispatched commit - that diffs a commit against itself and would test nothing"
+            exit 1
+          fi
+          # Equality is not enough: ANY base already containing the dispatched commit gives an
+          # empty diff by construction - main's tip once this branch merges, a same-tree branch or
+          # tag, a later commit here - and that passes the only required check having tested
+          # nothing. Assert this direction only: base.sha is the base-*branch tip* and
+          # legitimately is not an ancestor of the head, so the reverse check would reject real
+          # runs. Inside `if` so a base missing from the checkout doesn't abort under `-e`.
+          if git merge-base --is-ancestor "${GITHUB_SHA}" "${BASE_SHA}"; then
+            echo "::error::base_sha already contains the dispatched commit - the diff would be empty and the run would pass having tested nothing"
+            exit 1
+          fi
+      - name: Get changed liquid files
+        id: changed-files
+        uses: tj-actions/changed-files@24d32ffd492484c1d75e0c0b894501ddb9d30d62 # v47
+        with:
+          since_last_remote_commit: false
+          dir_names: false
+          # Defaults to "false" at this pinned SHA: an unreachable base_sha only warns and returns
+          # an empty (well-formed) array, which passes the guards below and goes green having
+          # tested nothing. Failing loudly instead is never a false pass.
+          #
+          # Global, so it also changes two paths it was not added for: a force-pushed main makes
+          # `github.event.before` unreachable on `push`, and a rebased base branch does the same
+          # to `pull_request.base.sha`. Both used to go silently green.
+          fail_on_initial_diff_error: true
+          # An unconditional 'main' is a no-op on the push-to-main trigger: by the time this job
+          # runs, the push has already moved main to the checked-out commit, so diffing 'main'
+          # against itself always yields zero changed files and silently skips every test on
+          # that trigger. pull_request diffs against the PR's actual base commit; push diffs
+          # against the commit main pointed to before this push landed.
+          base_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || (github.event_name == 'workflow_dispatch' && github.event.inputs.base_sha) || github.event.before }}
+          # Emit the file list as a JSON array so paths containing spaces (e.g. account
+          # template names) survive the hand-off between steps and jobs intact.
+          # escape_json: false keeps it valid JSON for jq (the default double-escapes the quotes).
+          # safe_output: false stops backslash-escaping of shell metacharacters (& ( ) ...) inside
+          # the JSON values, which is invalid JSON and would silently empty the template list.
+          # Safe here: the list is passed via env and parsed with jq, never eval'd by the shell.
+          # quotepath: false emits paths with non-ASCII characters (e.g. a curly apostrophe in an
+          # account template name) as-is; the action defaults this to true, which octal-escapes
+          # them so they no longer match the glob and the template is silently dropped (setting
+          # git's global core.quotepath does not help - the action overrides it from this input).
+          json: true
+          escape_json: false
+          safe_output: false
+          quotepath: false
+          files: |
+            **/**.{liquid,yml,yaml,json}
+      - name: Filter templates changed
+        id: templates_changed
+        env:
+          # Passed via env (not inlined) so a path with quotes/spaces cannot break the script.
+          ALL_CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
+        run: |
+          # all_changed_files is a JSON array (json: true). Extract the unique template
+          # directories, space-safely. Only reconciliation_texts and account_templates have
+          # liquid tests; shared_parts is left out so a shared-parts-only PR skips the test
+          # job entirely instead of spinning it up just to skip every template.
+          pattern='(reconciliation_texts|account_templates)/[^/]+'
+          # Fail loudly if the changed-files output is not a JSON array. `jq -e .` alone would
+          # pass on any valid JSON (e.g. an object, or a double-encoded "[]" string) - checking
+          # `type == "array"` catches those too. A silent jq failure here would empty the
+          # template list and skip every test while CI stays green.
+          if ! printf '%s' "${ALL_CHANGED_FILES:-[]}" | jq -e 'type == "array"' > /dev/null; then
+            echo "::error::changed-files output is not a JSON array, refusing to skip tests silently"
+            exit 1
+          fi
+          # Extract into a file (not a process substitution), and check jq's own exit code via
+          # PIPESTATUS - not the whole pipeline's combined exit status. Two things matter here:
+          #  - under bash -eo pipefail, a jq failure inside `< <(...)` prints to stderr but its
+          #    exit status is invisible to the enclosing script, so mapfile would silently read 0
+          #    lines and the job would carry on reporting an empty (green) list;
+          #  - but `grep -oE` legitimately exits 1 when a PR's changed files simply don't touch
+          #    any reconciliation_texts/account_templates directory, and with pipefail that
+          #    benign "no matches" would make the *pipeline's* exit code non-zero too - checking
+          #    only jq's own status (PIPESTATUS[1]) tells that apart from a real jq failure.
+          EXTRACTED="$(mktemp)"
+          set +e
+          printf '%s' "${ALL_CHANGED_FILES:-[]}" | jq -r '.[]' | grep -oE "$pattern" | sort -u > "${EXTRACTED}"
+          JQ_EXIT="${PIPESTATUS[1]}"
+          set -e
+          if [ "${JQ_EXIT}" -ne 0 ]; then
+            echo "::error::failed to parse the changed-files output with jq (exit ${JQ_EXIT}), refusing to skip tests silently"
+            exit 1
+          fi
+          mapfile -t changed_templates < "${EXTRACTED}"
+          rm -f "${EXTRACTED}"
+          if [ ${#changed_templates[@]} -eq 0 ]; then
+            echo "No templates changed"
+            echo "changed_templates=[]" >> "$GITHUB_OUTPUT"
+          else
+            echo "Changed templates:"
+            printf '  %s\n' "${changed_templates[@]}"
+            # Emit a JSON array so directory names containing spaces survive as single entries.
+            json=$(printf '%s\n' "${changed_templates[@]}" | jq -R . | jq -s -c .)
+            echo "changed_templates=${json}" >> "$GITHUB_OUTPUT"
+          fi
+
+  test-templates:
+    runs-on: ubuntu-latest
+    # A single platform test run can take up to ~33 minutes (the CLI's own polling limit),
+    # and transient errors are retried, so give the job room without letting it hang forever.
+    # No `concurrency: group: refresh-tokens` here even though the first step refreshes
+    # CONFIG_JSON: it would serialize this up-to-120-minute job against the cron for the group's
+    # whole duration - affordable for push_to_review_firm.yml's seconds-long `push` job, not here.
+    #
+    # Nor can the refresh be split back into its own seconds-long job that *could* carry the
+    # group: a job hands a value to a later job through its outputs, and job outputs are readable
+    # over the API by anyone with repo read. A refresh token there is a downgrade from a secret.
+    # (That is the whole reason. The cross-job staleness finding at the top of this file is a
+    # different mechanism - outputs do reach later jobs; it is a *secret* write that does not.)
+    # Accepted trade: this job's own refresh
+    # can race a concurrent cron/other-caller refresh with no GitHub-level serialization - bounded
+    # and loud (a clean exit 2 via the autoRenew interceptor), never silent, so no worse than the
+    # exposure adding a per-run refresh to this file already introduced.
+    timeout-minutes: 120
+    outputs:
+      failed_firms: ${{ steps.refresh.outputs.failed_firms }}
+      failed_firms_summary: ${{ steps.refresh.outputs.failed_firms_summary }}
+      auto_renew_lost: ${{ steps.refresh.outputs.auto_renew_lost }}
+      refresh_completed: ${{ steps.refresh.outputs.refresh_completed }}
+      write_back_failed: ${{ steps.refresh.outputs.write_back_failed }}
+    env:
+      SF_API_CLIENT_ID: "${{ secrets.SF_API_CLIENT_ID }}"
+      SF_API_SECRET: "${{ secrets.SF_API_SECRET }}"
+      SF_TEST_FIRM_ID: "${{ vars.SF_TEST_FIRM_ID }}"
+      CHANGED_TEMPLATES: "${{ needs.check-changed-templates.outputs.changed_templates }}"
+      # Truthy/falsy shorthand for the step-level `if:` guards below - the actual test run is
+      # skipped when nothing changed, but the refresh above it always runs regardless, so a repo
+      # with no cron backstop keeps getting refreshed even on a template-less PR.
+      # The `!= ''` half matters now that this job runs on `always()`: a failed or cancelled
+      # check-changed-templates yields an empty output, and `'' != '[]'` is true, which would
+      # gate every test step OPEN. Only the guard step's ordering stops it - this makes the
+      # condition itself correct rather than relying on that.
+      HAS_CHANGED_TEMPLATES: "${{ needs.check-changed-templates.outputs.changed_templates != '[]' && needs.check-changed-templates.outputs.changed_templates != '' }}"
+      # Concurrency and retry knobs. One `run-test --status` call runs all of its templates
+      # concurrently (Promise.all) with no client-side rate limiting, so the global number of
+      # in-flight tests is bounded by MAX_PARALLEL_TESTS (per call) x MAX_PARALLEL_FIRMS
+      # (buckets running at the same time).
+      MAX_PARALLEL_TESTS: 10
+      # How many firm|type buckets run at the same time. Different firms no longer wait for
+      # each other; a slow firm only delays its own bucket.
+      MAX_PARALLEL_FIRMS: 3
+      # Attempts per template for TRANSIENT platform errors (internal error, no response,
+      # run never completed). Genuine test failures are never retried.
+      MAX_TEST_ATTEMPTS: 3
+    needs: check-changed-templates
+    # `test-templates` is the only required check on main, and a *skipped* required check passes
+    # branch protection. Without a job-level `if:` this job is skipped, not failed, when
+    # check-changed-templates fails - so an upstream failure becomes a green gate that ran no tests.
+    #
+    # `always()`, not `!cancelled()`: a job whose `if:` is false on a cancelled run reports
+    # *skipped*, which passes, where no `if:` at all reported *cancelled*, which blocks. So
+    # `!cancelled()` would reopen this hole for the cancel window. `always()` runs the job even
+    # on a cancelled workflow, so the guard below also catches `cancelled()` - otherwise a cancel
+    # arriving after check-changed-templates succeeded would launch the full suite. That closes
+    # the pre-start window only: a cancel arriving after the guard has been evaluated still leaves
+    # the suite running, since `always()` keeps the job alive. Accepted - the branch-protection
+    # reason outweighs it. The job may then report `cancelled` rather than `failure`; both block,
+    # only `skipped` passes, so the property holds either way.
+    if: ${{ always() }}
+    steps:
+      # Must come first, and must exit non-zero: the whole point is that this job reports
+      # `failure` rather than `skipped`, so the required check stays red. Every later step is
+      # implicitly skipped once this one fails.
+      #
+      # `cancelled()` is the other half of the job's `always()`. Without it, a cancel landing
+      # after check-changed-templates already succeeded would start the full ~120-minute suite on
+      # a run someone deliberately killed - `always()` runs the job even when the workflow is
+      # cancelled, which is the cost of using it for the branch-protection reason above.
+      # Two steps, not one with a branching message: `cancelled()` is only allowed in an `if:`
+      # (actionlint enforces this), so it can't be passed through `env:` and tested in the script.
+      - name: Stop a cancelled run before the suite starts
+        if: ${{ cancelled() }}
+        run: |
+          echo "::error::run cancelled - stopping before the test suite starts"
+          exit 1
+      - name: Fail if template detection did not succeed
+        if: ${{ !cancelled() && needs.check-changed-templates.result != 'success' }}
+        env:
+          CHANGED_TEMPLATES_RESULT: ${{ needs.check-changed-templates.result }}
+        run: |
+          echo "::error::check-changed-templates did not succeed (${CHANGED_TEMPLATES_RESULT}) - failing this job so the required check stays red rather than passing as skipped. Check that job's log."
+          exit 1
+      - name: Refresh CONFIG_JSON
+        id: refresh
+        uses: silverfin/bso_github_actions/.github/actions/refresh-config-json@main
+        with:
+          sf_api_client_id: ${{ secrets.SF_API_CLIENT_ID }}
+          sf_api_secret: ${{ secrets.SF_API_SECRET }}
+          config_json: ${{ secrets.CONFIG_JSON }}
+          repo_access_token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          seed_no_auto_renew: "true"
+      - name: Setup Node v22
+        if: ${{ env.HAS_CHANGED_TEMPLATES == 'true' }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      # Before checkout and outside the workspace: `npm install` treats the current directory as a
+      # project, so inside the PR's tree a PR-added package.json's install scripts would run with
+      # this job's SF_API_* secrets in env.
+      - name: "Add silverfin-cli package (pinned to the autoRenew branch)"
+        if: ${{ env.HAS_CHANGED_TEMPLATES == 'true' }}
+        # SHA, not the branch name: silverfin-cli#273 is open and unmerged, so the branch ref is
+        # mutable - a later push or a force-push would change what this job installs with no
+        # workflow diff to review. Revert to unpinned once #273 merges.
+        run: |
+          INSTALL_DIR="${RUNNER_TEMP}/silverfin-cli-install"
+          mkdir -p "${INSTALL_DIR}"
+          npm install --prefix "${INSTALL_DIR}" --ignore-scripts https://github.com/silverfin/silverfin-cli.git#b072a6027f447437993728645a39bed2a0f6f5c9
+          echo "SILVERFIN_CLI_BIN=${INSTALL_DIR}/node_modules/silverfin-cli/bin/cli.js" >> "$GITHUB_ENV"
+      - name: Checkout Repository - Fetch all history for all tags and branches
+        if: ${{ env.HAS_CHANGED_TEMPLATES == 'true' }}
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Blank the refresh token on disk
+        if: ${{ env.HAS_CHANGED_TEMPLATES == 'true' }}
+        run: |
+          # The refresh step above already wrote $HOME/.silverfin/config.json fresh - this just
+          # strips the refreshToken before the test run uses the file. silverfin-cli#273's
+          # interceptor gate reads only the autoRenew flag, never the refreshToken's own value, so
+          # this job never legitimately needs a working refresh token on disk for its ~2-hour
+          # timeout, on a runner a pull_request to this repo controls the contents of.
+          jq 'to_entries | map(if (.key|test("^[0-9]+$")) then .value.refreshToken = "" else . end) | from_entries' \
+            "$HOME/.silverfin/config.json" > "$HOME/.silverfin/config.stripped.json"
+          mv "$HOME/.silverfin/config.stripped.json" "$HOME/.silverfin/config.json"
+      - name: Run liquid tests for updated templates (grouped per firm, run in parallel)
+        if: ${{ env.HAS_CHANGED_TEMPLATES == 'true' }}
+        run: |
+          echo ""
+          echo "========== SETUP =========="
+          echo ""
+
+          MAX_PARALLEL="${MAX_PARALLEL_TESTS:-10}"
+          MAX_FIRMS="${MAX_PARALLEL_FIRMS:-3}"
+          MAX_ATTEMPTS="${MAX_TEST_ATTEMPTS:-3}"
+          # Assignment form, not `echo "...$(...)"` : under `set -eo pipefail` a failing command
+          # substitution only aborts the step when it's the right-hand side of an assignment, not
+          # when it's embedded in another command's arguments - so a broken CLI install fails
+          # fast here instead of silently surfacing later as a wall of no-verdict failures.
+          CLI_VERSION=$(node "${SILVERFIN_CLI_BIN}" -V)
+          echo "CLI version: ${CLI_VERSION}"
+          echo "Parallelism: ${MAX_PARALLEL} template(s) per CLI call, ${MAX_FIRMS} firm bucket(s) at a time, ${MAX_ATTEMPTS} attempt(s) on transient errors"
+          echo ""
+
+          # Testable templates grouped by "<firm id>|<template type>". Each bucket maps to
+          # `run-test` calls for a single firm and a single template type (a CLI constraint).
+          # Identifiers are stored newline-separated so account template names (which contain
+          # spaces and other characters) stay intact.
+          declare -A TEMPLATE_BUCKETS
+          declare -a ERRORS
+          declare -a SUMMARY
+          declare -a FAIL_DETAILS
+          SUMMARY_FILE="${GITHUB_STEP_SUMMARY:-/dev/null}"
+          # Counts templates actually queued for testing, as opposed to changed template
+          # directories that were found but skipped (no config, no handle/name, no test YAML,
+          # etc.). Used below to tell "nothing needed testing" apart from "everything was
+          # silently skipped", so a fully-skipped run is never reported the same as a real pass.
+          QUEUED_COUNT=0
+          SKIPPED_COUNT=0
+          FIRM_SELECTION_LOG="$(mktemp)"
+
+          echo ""
+          echo "========== FIRM SELECTION =========="
+          echo ""
+
+          # CHANGED_TEMPLATES is a JSON array; read it space-safely. The process substitution
+          # keeps the loop in the current shell so the arrays above survive.
+          while IFS= read -r CURRENT_DIR; do
+            [[ -z "${CURRENT_DIR}" ]] && continue
+            while [[ "${CURRENT_DIR}" != "." ]]; do
+              if [[ -e "${CURRENT_DIR}/config.json" ]]; then
+                # Decide the template type from the path. Only reconciliation_texts and
+                # account_templates have liquid tests; the filter step already excludes other
+                # types, this branch is defense in depth.
+                if [[ "${CURRENT_DIR}" == *reconciliation_texts* ]]; then
+                  TEMPLATE_TYPE="reconciliationText"
+                  # `.handle // .name` only falls back on null/false, not on an empty string, so
+                  # a config with "handle": "" would produce an empty identifier instead of
+                  # falling back to .name. Treat both null and "" as "missing" explicitly.
+                  # 2>/dev/null || echo "": a malformed config.json (e.g. edited by the same PR
+                  # this job is testing) must not abort the whole step via `set -eo pipefail` on
+                  # a bare command substitution - it should fall through to "missing" and skip
+                  # just this one template like the other jq lookups below already do.
+                  IDENTIFIER=$(cat "${CURRENT_DIR}/config.json" | jq -r '
+                    (.handle // "" | tostring) as $h |
+                    if ($h != "" and $h != "null") then $h else (.name // "" | tostring) end
+                  ' 2>/dev/null || echo "")
+                  if [[ -z "${IDENTIFIER}" || "${IDENTIFIER}" == "null" ]]; then
+                    echo "Skipping ${CURRENT_DIR} (no handle or name in config.json)" >> "${FIRM_SELECTION_LOG}"
+                    SKIPPED_COUNT=$((SKIPPED_COUNT+1))
+                    break
+                  fi
+                elif [[ "${CURRENT_DIR}" == *account_templates* ]]; then
+                  TEMPLATE_TYPE="accountTemplate"
+                  # Account template configs often have a null handle/name, so use the folder name.
+                  IDENTIFIER=$(basename "${CURRENT_DIR}")
+                else
+                  echo "Skipping ${CURRENT_DIR} (no liquid tests for this template type)" >> "${FIRM_SELECTION_LOG}"
+                  SKIPPED_COUNT=$((SKIPPED_COUNT+1))
+                  break
+                fi
+
+                # Skip templates whose test YAML is missing or has no real content. The CLI
+                # reports those as FAILED ("there are no tests stored in the YAML file"), and a
+                # template without tests should not fail CI.
+                TEST_REL=$(cat "${CURRENT_DIR}/config.json" | jq -r '.test // empty' 2>/dev/null || echo "")
+                if [[ -z "${TEST_REL}" ]]; then
+                  echo "Skipping ${IDENTIFIER} (no liquid tests defined)" >> "${FIRM_SELECTION_LOG}"
+                  SKIPPED_COUNT=$((SKIPPED_COUNT+1))
+                  break
+                fi
+                TEST_PATH="${CURRENT_DIR}/${TEST_REL}"
+                # Path-traversal guard: config.json is repo content (and can arrive via a PR), so
+                # ".test" must resolve to a path that stays inside CURRENT_DIR - otherwise a
+                # crafted config (e.g. ".test": "../../../etc/passwd") could point TEST_PATH at an
+                # arbitrary file on the runner, which then gets read/grep'd below.
+                RESOLVED_TEST_PATH=$(realpath -m -- "${TEST_PATH}")
+                RESOLVED_CURRENT_DIR=$(realpath -m -- "${CURRENT_DIR}")
+                if [[ "${RESOLVED_TEST_PATH}" != "${RESOLVED_CURRENT_DIR}/"* ]]; then
+                  echo "Skipping ${IDENTIFIER} (.test path escapes template directory)" >> "${FIRM_SELECTION_LOG}"
+                  echo "::warning::${IDENTIFIER} has a .test path in config.json ('${TEST_REL}') that escapes its own template directory - skipping"
+                  SKIPPED_COUNT=$((SKIPPED_COUNT+1))
+                  break
+                fi
+                if [[ ! -s "${TEST_PATH}" ]] \
+                   || [[ "$(grep -cvE '^[[:space:]]*(#|$)' "${TEST_PATH}")" -eq 0 ]]; then
+                  echo "Skipping ${IDENTIFIER} (no liquid tests defined)" >> "${FIRM_SELECTION_LOG}"
+                  SKIPPED_COUNT=$((SKIPPED_COUNT+1))
+                  break
+                fi
+
+                # Initialize FIRM_ID and FIRM_SOURCE (default-only annotation on queue lines).
+                FIRM_ID=""
+                FIRM_SOURCE=""
+
+                # Check if test_firm_id is present in config
+                TEST_FIRM_ID=$(cat "${CURRENT_DIR}/config.json" | jq -r ".test_firm_id // empty" 2>/dev/null || echo "")
+
+                if [[ -n "$TEST_FIRM_ID" && "$TEST_FIRM_ID" != "null" ]]; then
+                  # 1. Template-specific test_firm_id (highest priority)
+                  # `if (.id|type)=="object"` guard: `.id | keys[]` on an array (a malformed
+                  # config.json) doesn't error, it silently returns numeric indices (0, 1, ...)
+                  # instead of real firm ids, which could then false-match a small test_firm_id.
+                  AVAILABLE_FIRM_IDS=$(cat "${CURRENT_DIR}/config.json" | jq -r 'if (.id|type)=="object" then (.id|keys[]) else empty end' 2>/dev/null || echo "")
+
+                  # Check for exact match by looping through available IDs
+                  FOUND_MATCH=false
+                  for available_id in $AVAILABLE_FIRM_IDS; do
+                    if [[ "$available_id" == "$TEST_FIRM_ID" ]]; then
+                      FOUND_MATCH=true
+                      break
+                    fi
+                  done
+
+                  if [[ "$FOUND_MATCH" == "true" ]]; then
+                    FIRM_ID="$TEST_FIRM_ID"
+                    FIRM_SOURCE="test_firm_id"
+                  else
+                    echo "Warning: test_firm_id '${TEST_FIRM_ID}' not found in .id object, falling back to environment variable or default"
+                  fi
+                fi
+
+                if [[ -z "$FIRM_ID" && -n "$SF_TEST_FIRM_ID" ]]; then
+                  # 2. Environment variable fallback
+                  AVAILABLE_FIRM_IDS=$(cat "${CURRENT_DIR}/config.json" | jq -r 'if (.id|type)=="object" then (.id|keys[]) else empty end' 2>/dev/null || echo "")
+
+                  # Check for exact match by looping through available IDs
+                  FOUND_MATCH=false
+                  for available_id in $AVAILABLE_FIRM_IDS; do
+                    if [[ "$available_id" == "$SF_TEST_FIRM_ID" ]]; then
+                      FOUND_MATCH=true
+                      break
+                    fi
+                  done
+
+                  if [[ "$FOUND_MATCH" == "true" ]]; then
+                    FIRM_ID="$SF_TEST_FIRM_ID"
+                    FIRM_SOURCE="SF_TEST_FIRM_ID"
+                  else
+                    echo "Warning: SF_TEST_FIRM_ID '${SF_TEST_FIRM_ID}' not found in .id object, falling back to default"
+                  fi
+                fi
+
+                if [[ -z "$FIRM_ID" ]]; then
+                  # 3. Default behavior - use first available firm ID. Expected for most
+                  # templates; regenerating config.json can reorder ".id" keys, so pin
+                  # test_firm_id when a specific firm matters.
+                  # Guarded in a single jq expression (rather than piping .id into keys_unsorted
+                  # into first) so a config with a missing/null/empty ".id" object returns empty
+                  # instead of jq erroring on "Cannot index null" / "Cannot use keys_unsorted on
+                  # null" - a raw jq crash here would otherwise leave FIRM_ID empty and still fall
+                  # through to running the CLI with `--firm ""`.
+                  FIRM_ID=$(cat "${CURRENT_DIR}/config.json" | jq -r '
+                    if (.id | type) == "object" and (.id | length) > 0
+                    then (.id | keys_unsorted | first)
+                    else empty end
+                  ' 2>/dev/null || echo "")
+                  if [[ -z "${FIRM_ID}" ]]; then
+                    echo "Skipping ${IDENTIFIER} (no firm IDs configured in config.json)" >> "${FIRM_SELECTION_LOG}"
+                    echo "::warning::${IDENTIFIER} has no firm IDs configured in config.json (.id is missing/null/empty) - skipping"
+                    SKIPPED_COUNT=$((SKIPPED_COUNT+1))
+                    break
+                  fi
+                  FIRM_SOURCE="default"
+                fi
+
+                # FIRM_ID is embedded in a "|"-delimited bucket key below and split back apart
+                # with ${KEY%%|*}/${KEY##*|}; a non-numeric value (e.g. one that itself contains
+                # "|", from a malformed config.json's ".id" keys or test_firm_id/SF_TEST_FIRM_ID)
+                # would silently misparse into the wrong firm/type. All three sources above
+                # (template-specific test_firm_id, SF_TEST_FIRM_ID, and the default fallback)
+                # are validated here in one place rather than at each source.
+                if [[ ! "${FIRM_ID}" =~ ^[0-9]+$ ]]; then
+                  echo "Skipping ${IDENTIFIER} (resolved to a non-numeric firm id '${FIRM_ID}')" >> "${FIRM_SELECTION_LOG}"
+                  echo "::warning::${IDENTIFIER} resolved to a non-numeric firm id ('${FIRM_ID}') - skipping"
+                  SKIPPED_COUNT=$((SKIPPED_COUNT+1))
+                  break
+                fi
+
+                # Group this template under "<firm>|<type>" so all templates that share a firm
+                # and type run together in one parallel batch. Newline-separated keeps identifiers
+                # that contain spaces (account template names) intact.
+                TEMPLATE_BUCKETS["${FIRM_ID}|${TEMPLATE_TYPE}"]+="${IDENTIFIER}"$'\n'
+                QUEUED_COUNT=$((QUEUED_COUNT+1))
+                if [[ "${FIRM_SOURCE}" == "default" ]]; then
+                  echo "+ ${IDENTIFIER} -> firm ${FIRM_ID} (default)" >> "${FIRM_SELECTION_LOG}"
+                else
+                  echo "+ ${IDENTIFIER} -> firm ${FIRM_ID}" >> "${FIRM_SELECTION_LOG}"
+                fi
+                break
+              else
+                echo "Config file not found in ${CURRENT_DIR}" >> "${FIRM_SELECTION_LOG}"
+                CURRENT_DIR="$(dirname "${CURRENT_DIR}")"
+              fi
+            done
+          done < <(printf '%s' "${CHANGED_TEMPLATES}" | jq -r '.[]')
+
+          BUCKET_COUNT=${#TEMPLATE_BUCKETS[@]}
+          FIRM_SELECTION_TITLE="Queued ${QUEUED_COUNT} template(s) in ${BUCKET_COUNT} bucket(s)"
+          if (( SKIPPED_COUNT > 0 )); then
+            FIRM_SELECTION_TITLE+=", ${SKIPPED_COUNT} skipped"
+          fi
+          echo "::group::${FIRM_SELECTION_TITLE}"
+          cat "${FIRM_SELECTION_LOG}"
+          echo "::endgroup::"
+          rm -f "${FIRM_SELECTION_LOG}"
+
+          {
+            echo "## Liquid test results"
+            echo ""
+            echo "Queued **${QUEUED_COUNT}** template(s) for testing."
+            echo ""
+          } >> "${SUMMARY_FILE}"
+
+          echo ""
+          echo "========== TEST RUNS =========="
+          echo ""
+
+          # Each "<firm>|<type>" bucket runs as its own background job, so different firms
+          # proceed in parallel (capped at MAX_FIRMS) and a slow firm only delays its own
+          # bucket. Within a bucket the CLI runs up to MAX_PARALLEL templates concurrently
+          # per call.
+          #
+          # Transient platform problems (internal error, no response, run never completed)
+          # are retried up to MAX_ATTEMPTS per template. Genuine test failures - the CLI
+          # lists the failing unit tests as the reason - are never retried.
+          WORKDIR=$(mktemp -d)
+
+          # Extract CLI log lines for one failed template (exact name match).
+          # Uses the same top-level vs indented [log] line distinction as the verdict
+          # parser: detail lines also match ": FAILED" but must not close the block.
+          print_failed_template_log() {
+            local OUT="$1" NAME="$2"
+            tr '\r' '\n' < "${OUT}" | sed -E $'s/\033\\[[0-9;?]*[A-Za-z]//g' | awk -v name="$NAME" '
+              BEGIN { in_block=0 }
+              /^\[log\] [^[:space:]]/ {
+                line = substr($0, 7)
+                if (line ~ /: FAILED[[:space:]]*$/) {
+                  n = line
+                  sub(/: FAILED[[:space:]]*$/, "", n)
+                  if (n == name) { in_block=1; print $0; next }
+                  in_block=0; next
+                }
+                if (line ~ /: PASSED[[:space:]]*$/) { in_block=0; next }
+                in_block=0; next
+              }
+              /^\[log\]  / {
+                if (in_block) { print; next }
+              }
+            '
+          }
+
+          # Markdown-safe cell text (pipes break table layout).
+          md_escape() {
+            local TEXT="$1"
+            TEXT="${TEXT//|/&#124;}"
+            printf '%s' "${TEXT}"
+          }
+
+          # GITHUB_STEP_SUMMARY is capped at 1 MiB per step; keep failure-detail blocks bounded.
+          SUMMARY_FAILURE_BUDGET=900000
+          SUMMARY_FAILURE_USED=$(wc -c < "${SUMMARY_FILE}" 2>/dev/null | tr -d ' ')
+          MAX_FAILURE_LOG_CHARS=12000
+
+          append_summary_chunk() {
+            local CHUNK="$1"
+            local CHUNK_BYTES
+            # wc -c, not ${#CHUNK}: SUMMARY_FAILURE_USED/BUDGET are byte counts (GITHUB_STEP_SUMMARY's
+            # 1 MiB cap is a byte limit), while ${#CHUNK} counts characters under bash's UTF-8 locale -
+            # they diverge on any non-ASCII template name or CLI output.
+            CHUNK_BYTES=$(printf '%s' "${CHUNK}" | wc -c)
+            if (( SUMMARY_FAILURE_USED + CHUNK_BYTES > SUMMARY_FAILURE_BUDGET )); then
+              return 1
+            fi
+            printf '%s' "${CHUNK}" >> "${SUMMARY_FILE}"
+            SUMMARY_FAILURE_USED=$((SUMMARY_FAILURE_USED + CHUNK_BYTES))
+            return 0
+          }
+
+          run_bucket() {
+            # $1=firm  $2=template type  $3=identifier list file  $4=output file  $5=verdict file
+            # $6=duration file
+            # Writes only to its own files; the main shell prints them when the bucket ends.
+            # Verdict lines are "<status>\t<attempts>\t<name>".
+            local FIRM="$1" TYPE="$2" LIST="$3" OUT="$4" VERDICTS="$5" DURATION_FILE="$6"
+            # Timestamped inside the subshell itself, not by the parent's poll loop: the parent
+            # only samples every 10s (see the ALL_BUCKETS_DONE loop below), which would otherwise
+            # round every duration up to the next 10s boundary.
+            local BUCKET_START_TS
+            BUCKET_START_TS=$(date +%s)
+            local CLI_FLAG="--handle"
+            [[ "${TYPE}" == "accountTemplate" ]] && CLI_FLAG="--account-template"
+            # Verdicts are appended to VERDICTS as soon as each one is decided (not batched into
+            # an in-memory array and flushed only once at function exit): a later attempt's
+            # `mktemp` failing under `set -e` would kill this subshell mid-run, and any decided
+            # verdict not yet on disk would be lost - including genuine passes from an earlier,
+            # already-completed attempt.
+            local -a REMAINING=() NEXT=() BATCH=() VALID=()
+            local ATTEMPT=1 TOTAL START RAW PARSED BATCH_EXIT NAME STATUS TRANSIENT
+            mapfile -t REMAINING < "${LIST}"
+            # A name starting with "-" would be read by the CLI's option parser as a FLAG rather
+            # than a value: commander stops consuming a variadic option (--handle/--account-template
+            # take <names...>) at the first "-"-prefixed token. Reject up front - same guard as
+            # run_sampler.yml's reject_option_like_names - so it surfaces as an ordinary FAIL
+            # verdict instead of being silently misparsed by the CLI.
+            for NAME in "${REMAINING[@]}"; do
+              if [[ "${NAME}" == -* ]]; then
+                # accountTemplate's NAME is the directory basename; reconciliationText's comes from
+                # config.json's handle/name, so renaming the directory does nothing there.
+                if [[ "${TYPE}" == "accountTemplate" ]]; then
+                  printf '%s\t%s\t%s\n' "FAIL - name starts with '-', which silverfin-cli would parse as an option instead of a value. Rename the template directory." "1" "${NAME}" >> "${VERDICTS}"
+                else
+                  printf '%s\t%s\t%s\n' "FAIL - name starts with '-', which silverfin-cli would parse as an option instead of a value. Change the handle (or fallback name) in the template's config.json." "1" "${NAME}" >> "${VERDICTS}"
+                fi
+              else
+                VALID+=("${NAME}")
+              fi
+            done
+            REMAINING=("${VALID[@]}")
+            while (( ${#REMAINING[@]} > 0 && ATTEMPT <= MAX_ATTEMPTS )); do
+              if (( ATTEMPT > 1 )); then
+                echo "--- attempt ${ATTEMPT}: retrying ${#REMAINING[@]} template(s) after a transient platform error ---" >> "${OUT}"
+                sleep 10
+              fi
+              NEXT=()
+              TOTAL=${#REMAINING[@]}
+              for (( START=0; START<TOTAL; START+=MAX_PARALLEL )); do
+                BATCH=("${REMAINING[@]:START:MAX_PARALLEL}")
+                RAW=$(mktemp "${WORKDIR}/raw.XXXXXX")
+                BATCH_EXIT=0
+                node "${SILVERFIN_CLI_BIN}" run-test --firm "${FIRM}" --status ${CLI_FLAG} "${BATCH[@]}" > "${RAW}" 2>&1 || BATCH_EXIT=$?
+                cat "${RAW}" >> "${OUT}"
+                # Normalise (split carriage-return frames, strip ANSI escapes), then read the
+                # top-level "[log] <name>: PASSED|FAILED" lines. The indented "[log]   ..."
+                # lines that follow a FAILED line carry the reason: named failing unit tests
+                # mean a genuine failure, platform-error texts mean a transient one (retry).
+                # Names are matched exactly (never inside a regex): account template names
+                # contain spaces and characters like & ( ).
+                PARSED=$(mktemp "${WORKDIR}/parsed.XXXXXX")
+                tr '\r' '\n' < "${RAW}" | sed -E $'s/\033\\[[0-9;?]*[A-Za-z]//g' | awk '
+                  /^\[log\] [^[:space:]]/ {
+                    line = substr($0, 7)
+                    if (line ~ /: PASSED[[:space:]]*$/) { name = line; sub(/: PASSED[[:space:]]*$/, "", name); verdict[name] = "PASSED"; cur = name; next }
+                    if (line ~ /: FAILED[[:space:]]*$/) { name = line; sub(/: FAILED[[:space:]]*$/, "", name); verdict[name] = "FAILED"; cur = name; next }
+                    cur = ""; next
+                  }
+                  /^\[log\]  / {
+                    # couldn.t (dot, not an apostrophe literal): matches the CLI default
+                    # test_error message regardless of straight vs curly apostrophe, and avoids
+                    # an apostrophe inside this single-quoted awk script.
+                    if (cur != "" && tolower($0) ~ /internal error|no response from the platform|test run did not complete|couldn.t complete the test run|timeout\. try to run your test again/) transient[cur] = 1
+                  }
+                  END { for (n in verdict) printf "%s\t%d\t%s\n", verdict[n], (n in transient) ? 1 : 0, n }
+                ' > "${PARSED}"
+                local -A RESULTS=() RETRYABLE=()
+                while IFS=$'\t' read -r STATUS TRANSIENT NAME; do
+                  RESULTS["${NAME}"]="${STATUS}"
+                  RETRYABLE["${NAME}"]="${TRANSIENT}"
+                done < "${PARSED}"
+                for NAME in "${BATCH[@]}"; do
+                  case "${RESULTS[${NAME}]:-}" in
+                    PASSED)
+                      printf '%s\t%s\t%s\n' "PASS" "${ATTEMPT}" "${NAME}" >> "${VERDICTS}"
+                      ;;
+                    FAILED)
+                      if [[ "${RETRYABLE[${NAME}]:-0}" == "1" ]] && (( ATTEMPT < MAX_ATTEMPTS )); then
+                        NEXT+=("${NAME}")
+                      elif [[ "${RETRYABLE[${NAME}]:-0}" == "1" ]]; then
+                        printf '%s\t%s\t%s\n' "FAIL - transient platform error persisted" "${ATTEMPT}" "${NAME}" >> "${VERDICTS}"
+                      else
+                        printf '%s\t%s\t%s\n' "FAIL" "${ATTEMPT}" "${NAME}" >> "${VERDICTS}"
+                      fi
+                      ;;
+                    *)
+                      # No verdict line for this template: the CLI died or dropped it.
+                      if (( ATTEMPT < MAX_ATTEMPTS )); then
+                        NEXT+=("${NAME}")
+                      else
+                        printf '%s\t%s\t%s\n' "FAIL - no verdict from the CLI (exit code ${BATCH_EXIT})" "${ATTEMPT}" "${NAME}" >> "${VERDICTS}"
+                      fi
+                      ;;
+                  esac
+                done
+              done
+              REMAINING=("${NEXT[@]}")
+              ATTEMPT=$((ATTEMPT+1))
+            done
+            printf '%s' "$(( $(date +%s) - BUCKET_START_TS ))" > "${DURATION_FILE}"
+          }
+
+          # Launch buckets (at most MAX_FIRMS at a time). Verdict output is deferred until
+          # every bucket has finished so parallel runs do not interleave in the log.
+          KEYS=("${!TEMPLATE_BUCKETS[@]}")
+          declare -A BUCKET_PID
+          declare -a BUCKET_DURATION=()
+          NEXT_LAUNCH=0
+
+          print_one_verdict() {
+            local i="$1" FIRM_ID="$2" STATUS="$3" ATTEMPTS="$4" NAME="$5"
+            local NOTE=""
+            if (( ATTEMPTS > 1 )); then
+              NOTE=" (attempt ${ATTEMPTS})"
+            fi
+            if [[ "${STATUS}" == "PASS" ]]; then
+              echo "  ${NAME}: ${STATUS}${NOTE}"
+              return 0
+            fi
+            echo "::group::${NAME}: ${STATUS}${NOTE}"
+            print_failed_template_log "${WORKDIR}/out.${i}" "${NAME}"
+            echo "::endgroup::"
+            FAIL_DETAILS+=("${NAME}"$'\t'"${FIRM_ID}"$'\t'"${STATUS}${NOTE}"$'\t'"${i}")
+          }
+
+          print_bucket_results() {
+            local i="$1" KEY FIRM_ID TEMPLATE_TYPE DURATION BUCKET_PASSED BUCKET_FAILED BUCKET_TOTAL
+            local STATUS ATTEMPTS NAME NOTE
+            KEY="${KEYS[${i}]}"
+            FIRM_ID="${KEY%%|*}"
+            TEMPLATE_TYPE="${KEY##*|}"
+            DURATION="${BUCKET_DURATION[${i}]}"
+            BUCKET_PASSED=0
+            BUCKET_FAILED=0
+            BUCKET_TOTAL=$(wc -l < "${WORKDIR}/list.${i}" | tr -d ' ')
+            echo ""
+            echo "----------------------------------------------------------------"
+            echo "firm ${FIRM_ID} - ${TEMPLATE_TYPE} | ${BUCKET_TOTAL} template(s) | ran for ${DURATION}s"
+            echo "----------------------------------------------------------------"
+            declare -A SEEN=()
+            while IFS=$'\t' read -r STATUS ATTEMPTS NAME; do
+              SEEN["${NAME}"]=1
+            done < "${WORKDIR}/verdicts.${i}"
+            # Failures first, then passes (within this bucket).
+            while IFS=$'\t' read -r STATUS ATTEMPTS NAME; do
+              [[ "${STATUS}" == "PASS" ]] && continue
+              NOTE=""
+              if (( ATTEMPTS > 1 )); then
+                NOTE=" (attempt ${ATTEMPTS})"
+              fi
+              print_one_verdict "${i}" "${FIRM_ID}" "${STATUS}" "${ATTEMPTS}" "${NAME}"
+              BUCKET_FAILED=$((BUCKET_FAILED+1))
+              SUMMARY+=("${STATUS}${NOTE}"$'\t'"${FIRM_ID}"$'\t'"${NAME}")
+              ERRORS+=("${NAME}")
+            done < "${WORKDIR}/verdicts.${i}"
+            while IFS= read -r NAME; do
+              if [[ -z "${SEEN[${NAME}]:-}" ]]; then
+                BUCKET_FAILED=$((BUCKET_FAILED+1))
+                echo "::group::${NAME}: FAIL - runner crashed"
+                echo "No verdict produced (bucket runner crashed)."
+                echo "::endgroup::"
+                ERRORS+=("${NAME}")
+                SUMMARY+=("FAIL - runner crashed"$'\t'"${FIRM_ID}"$'\t'"${NAME}")
+                FAIL_DETAILS+=("${NAME}"$'\t'"${FIRM_ID}"$'\t'"FAIL - runner crashed"$'\t'"${i}")
+              fi
+            done < "${WORKDIR}/list.${i}"
+            while IFS=$'\t' read -r STATUS ATTEMPTS NAME; do
+              [[ "${STATUS}" == "PASS" ]] || continue
+              print_one_verdict "${i}" "${FIRM_ID}" "${STATUS}" "${ATTEMPTS}" "${NAME}"
+              BUCKET_PASSED=$((BUCKET_PASSED+1))
+              NOTE=""
+              if (( ATTEMPTS > 1 )); then
+                NOTE=" (attempt ${ATTEMPTS})"
+              fi
+              SUMMARY+=("${STATUS}${NOTE}"$'\t'"${FIRM_ID}"$'\t'"${NAME}")
+            done < "${WORKDIR}/verdicts.${i}"
+            if (( BUCKET_FAILED > 0 )); then
+              # Raw CLI output for the whole bucket, not just print_failed_template_log's
+              # per-template extract: the extract matches on a "[log] <name>: FAILED" line, which
+              # never appears for the documented "no verdict from the CLI" case (an expired
+              # access token kills the CLI process mid-batch) - this is the only remaining trail
+              # for diagnosing that failure mode.
+              echo "::group::firm ${FIRM_ID} - ${TEMPLATE_TYPE} - raw CLI output"
+              cat "${WORKDIR}/out.${i}"
+              echo "::endgroup::"
+            fi
+            echo "[done] firm ${FIRM_ID} - ${TEMPLATE_TYPE} (${DURATION}s, ${BUCKET_PASSED}/${BUCKET_TOTAL} passed)"
+          }
+
+          launch_ready_buckets() {
+            local KEY FIRM TYPE COUNT
+            while (( NEXT_LAUNCH < ${#KEYS[@]} )) && (( $(jobs -rp | wc -l) < MAX_FIRMS )); do
+              KEY="${KEYS[${NEXT_LAUNCH}]}"
+              FIRM="${KEY%%|*}"
+              TYPE="${KEY##*|}"
+              # `|| true`: grep exits 1 when a bucket's identifiers are all empty (e.g. a
+              # config with "handle": ""), which under `set -eo pipefail` would abort the
+              # whole step and kill every bucket. An empty list is handled downstream.
+              printf '%s' "${TEMPLATE_BUCKETS[${KEY}]}" | sort -u | grep -v '^$' > "${WORKDIR}/list.${NEXT_LAUNCH}" || true
+              : > "${WORKDIR}/out.${NEXT_LAUNCH}"
+              : > "${WORKDIR}/verdicts.${NEXT_LAUNCH}"
+              COUNT=$(wc -l < "${WORKDIR}/list.${NEXT_LAUNCH}" | tr -d ' ')
+              run_bucket "${FIRM}" "${TYPE}" "${WORKDIR}/list.${NEXT_LAUNCH}" "${WORKDIR}/out.${NEXT_LAUNCH}" "${WORKDIR}/verdicts.${NEXT_LAUNCH}" "${WORKDIR}/duration.${NEXT_LAUNCH}" &
+              BUCKET_PID[${NEXT_LAUNCH}]=$!
+              echo "[start] firm ${FIRM} - ${TYPE} (${COUNT} template(s))"
+              NEXT_LAUNCH=$((NEXT_LAUNCH+1))
+            done
+          }
+          launch_ready_buckets
+          echo ""
+          echo "Tests running - per-template results print after every bucket has finished."
+          echo ""
+          ALL_BUCKETS_DONE=0
+          WAITED_SECONDS=0
+          # One line every 5 minutes so a long, otherwise-silent wait (up to the 120min job
+          # timeout) still shows signs of life, without flushing per-bucket results early.
+          HEARTBEAT_INTERVAL=300
+          while (( ALL_BUCKETS_DONE == 0 )); do
+            launch_ready_buckets
+            for (( i=0; i<NEXT_LAUNCH; i++ )); do
+              if [[ -z "${BUCKET_DURATION[${i}]:-}" ]] && ! kill -0 "${BUCKET_PID[${i}]}" 2>/dev/null; then
+                wait "${BUCKET_PID[${i}]}" 2>/dev/null || true
+                BUCKET_DURATION[${i}]=$(cat "${WORKDIR}/duration.${i}" 2>/dev/null || echo "?")
+              fi
+            done
+            if (( NEXT_LAUNCH < ${#KEYS[@]} )); then
+              ALL_BUCKETS_DONE=0
+            else
+              ALL_BUCKETS_DONE=1
+              for (( i=0; i<${#KEYS[@]}; i++ )); do
+                if kill -0 "${BUCKET_PID[${i}]}" 2>/dev/null; then
+                  ALL_BUCKETS_DONE=0
+                fi
+              done
+            fi
+            if (( ALL_BUCKETS_DONE == 1 )); then
+              break
+            fi
+            sleep 10
+            WAITED_SECONDS=$((WAITED_SECONDS+10))
+            if (( WAITED_SECONDS % HEARTBEAT_INTERVAL == 0 )); then
+              STILL_RUNNING=0
+              for (( i=0; i<NEXT_LAUNCH; i++ )); do
+                kill -0 "${BUCKET_PID[${i}]}" 2>/dev/null && STILL_RUNNING=$((STILL_RUNNING+1))
+              done
+              echo "[heartbeat] still running (${WAITED_SECONDS}s elapsed) - ${STILL_RUNNING}/${#KEYS[@]} bucket(s) in flight"
+            fi
+          done
+          echo ""
+          echo "All ${#KEYS[@]} bucket(s) finished - printing results."
+          echo ""
+          for (( i=0; i<${#KEYS[@]}; i++ )); do
+            print_bucket_results "${i}"
+          done
+          # Flat summary: failures first, then passes.
+          if [ ${#SUMMARY[@]} -gt 0 ]; then
+            echo ""
+            echo "========== RESULTS =========="
+            echo ""
+            for ENTRY in "${SUMMARY[@]}"; do
+              [[ "${ENTRY%%$'\t'*}" == "PASS"* ]] && continue
+              IFS=$'\t' read -r RESULT FIRM NAME <<< "${ENTRY}"
+              printf ' %-45s firm %-8s %s\n' "${NAME}" "${FIRM}" "${RESULT}"
+            done
+            for ENTRY in "${SUMMARY[@]}"; do
+              [[ "${ENTRY%%$'\t'*}" == "PASS"* ]] || continue
+              IFS=$'\t' read -r RESULT FIRM NAME <<< "${ENTRY}"
+              printf ' %-45s firm %-8s %s\n' "${NAME}" "${FIRM}" "${RESULT}"
+            done
+            echo "----------------------------------------------------------------"
+            echo "${#ERRORS[@]} failed, $(( ${#SUMMARY[@]} - ${#ERRORS[@]} )) passed"
+
+            {
+              echo "| Template | Firm | Result |"
+              echo "| --- | --- | --- |"
+              for ENTRY in "${SUMMARY[@]}"; do
+                [[ "${ENTRY%%$'\t'*}" == "PASS"* ]] && continue
+                IFS=$'\t' read -r RESULT FIRM NAME <<< "${ENTRY}"
+                printf '| %s | %s | %s |\n' "$(md_escape "${NAME}")" "${FIRM}" "$(md_escape "${RESULT}")"
+              done
+              for ENTRY in "${SUMMARY[@]}"; do
+                [[ "${ENTRY%%$'\t'*}" == "PASS"* ]] || continue
+                IFS=$'\t' read -r RESULT FIRM NAME <<< "${ENTRY}"
+                printf '| %s | %s | %s |\n' "$(md_escape "${NAME}")" "${FIRM}" "$(md_escape "${RESULT}")"
+              done
+              echo ""
+              echo "**${#ERRORS[@]} failed**, $(( ${#SUMMARY[@]} - ${#ERRORS[@]} )) passed"
+              if [ ${#FAIL_DETAILS[@]} -gt 0 ]; then
+                echo ""
+                echo "### Failed tests"
+                SUMMARY_FAILURE_USED=$(wc -c < "${SUMMARY_FILE}" 2>/dev/null | tr -d ' ')
+                SUMMARY_FAILURE_TRUNCATED=false
+                for DETAIL in "${FAIL_DETAILS[@]}"; do
+                  IFS=$'\t' read -r NAME FIRM RESULT BUCKET_IDX <<< "${DETAIL}"
+                  FAIL_LOG=$(print_failed_template_log "${WORKDIR}/out.${BUCKET_IDX}" "${NAME}")
+                  if (( ${#FAIL_LOG} > MAX_FAILURE_LOG_CHARS )); then
+                    FAIL_LOG="${FAIL_LOG:0:MAX_FAILURE_LOG_CHARS}"$'\n'"... (truncated; see job log for full CLI output)"
+                  fi
+                  CHUNK=$(
+                    echo ""
+                    echo "#### $(md_escape "${NAME}") (firm ${FIRM})"
+                    echo ""
+                    echo '```text'
+                    if [[ -n "${FAIL_LOG}" ]]; then
+                      printf '%s\n' "${FAIL_LOG}"
+                    else
+                      echo "No CLI log lines captured for this template."
+                    fi
+                    echo '```'
+                  )
+                  if ! append_summary_chunk "${CHUNK}"; then
+                    SUMMARY_FAILURE_TRUNCATED=true
+                    break
+                  fi
+                done
+                if [[ "${SUMMARY_FAILURE_TRUNCATED}" == "true" ]]; then
+                  echo ""
+                  echo "_Failure details truncated (${#FAIL_DETAILS[@]} total); see the job log for full CLI output._"
+                fi
+              fi
+            } >> "${SUMMARY_FILE}"
+          fi
+          # CHECK ERRORS PRESENT
+          if [ ${#ERRORS[@]} -eq 0 ]; then
+              # This step only runs when check-changed-templates found matching directories (the
+              # step-level HAS_CHANGED_TEMPLATES guard; the job-level `if:` no longer gates on the
+              # template list), so QUEUED_COUNT==0 here means every one of them was
+              # skipped (missing config, handle/name, or test YAML) rather than genuinely having
+              # no tests to run for this specific change. Flag it loudly instead of silently
+              # reporting the same "All tests have passed" as a real, evidenced pass.
+              if [ "${QUEUED_COUNT}" -eq 0 ]; then
+                echo "::warning::No templates were actually queued for testing - every changed template directory was skipped. Treating this as a pass, but double-check the skip reasons above if tests were expected to run."
+              fi
+              echo "All tests have passed"
+          else
+              echo "Errors: ${ERRORS[@]}, please run the tests locally to fix the errors"
+              exit 1
+          fi
