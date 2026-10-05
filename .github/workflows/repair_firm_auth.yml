@@ -29,7 +29,7 @@ on:
       writer_workflows:
         description: >-
           Whitespace-separated workflow filenames in the calling repo that write CONFIG_JSON (e.g.
-          "run_tests.yml refresh_token.yml"). The caller's own file is added automatically.
+          "run_tests.yml push_to_review_firm.yml"). The caller's own file is added automatically.
         required: true
         type: string
     # Declared, so callers pass exactly these instead of `secrets: inherit`.
@@ -198,6 +198,11 @@ jobs:
           FIRM_ID="${FIRM_ID//[[:space:]]/}"
           if [[ -z "${FIRM_ID}" ]]; then
             echo "::error::firm_id is empty once whitespace is stripped - supply the ID of the firm to repair. The authorization code has NOT been used."
+            exit 1
+          fi
+          # CONFIG_JSON's non-firm keys (defaultFirmIDs, partnerCredentials) are objects too.
+          if [[ ! "${FIRM_ID}" =~ ^[0-9]+$ ]]; then
+            echo "::error::firm_id must be a numeric firm ID (received ${#FIRM_ID} characters). The authorization code has NOT been used."
             exit 1
           fi
 
