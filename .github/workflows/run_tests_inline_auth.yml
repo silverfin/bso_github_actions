@@ -161,6 +161,8 @@ jobs:
             echo "::error::run ${RERUN_RUN_ID} is not a pull_request run of ${CALLER_PATH} from this repo created in the last 2 hours - refusing to re-run it"
             exit 1
           fi
+          # Past validation: from here a failure is a real race left unretried, worth paging.
+          echo "REACHED_WAIT=true" >> "$GITHUB_ENV"
           # Re-checked after the wait too: someone may re-run it by hand in the meantime.
           if [[ "$(jq -r '.run_attempt' <<< "${RUN}")" != "1" ]]; then
             echo "::notice::run ${RERUN_RUN_ID} was already re-run - leaving it alone"
@@ -203,11 +205,23 @@ jobs:
               exit 1
               ;;
           esac
+          # Losers from one burst finish together; jitter so their re-runs don't snapshot the same
+          # CONFIG_JSON and race again.
+          sleep $((RANDOM % 45))
+          if ! RUN=$(gh api "repos/${REPO}/actions/runs/${RERUN_RUN_ID}"); then
+            echo "::error::could not re-read run ${RERUN_RUN_ID} before re-running it"
+            exit 1
+          fi
+          if [[ "$(jq -r '.run_attempt' <<< "${RUN}")" != "1" ]]; then
+            echo "::notice::run ${RERUN_RUN_ID} was already re-run during the jitter - leaving it alone"
+            exit 0
+          fi
           gh run rerun "${RERUN_RUN_ID}" --failed --repo "${REPO}"
           echo "::notice::Re-running the failed jobs of https://github.com/${REPO}/actions/runs/${RERUN_RUN_ID}"
-      # cancelled() too: a timed-out or cancelled helper is just as silent as a failed one.
+      # cancelled() too: a timed-out or cancelled helper is just as silent as a failed one. A
+      # dispatch refused at validation just fails its own run - no race behind it to page about.
       - name: Alert Slack if the re-run could not be started
-        if: failure() || cancelled()
+        if: (failure() || cancelled()) && env.REACHED_WAIT == 'true'
         env:
           SLACK: ${{ secrets.SLACK_CI_ALERTS_WEBHOOK_URL }}
           REPO: ${{ github.repository }}
