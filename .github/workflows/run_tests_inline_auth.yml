@@ -208,9 +208,20 @@ jobs:
           # Losers from one burst finish together; jitter so their re-runs don't snapshot the same
           # CONFIG_JSON and race again.
           sleep $((RANDOM % 45))
-          # A failed re-read falls through: it was attempt 1 before the jitter, so re-running is safe.
-          if RUN=$(gh api "repos/${REPO}/actions/runs/${RERUN_RUN_ID}") \
-             && [[ "$(jq -r '.run_attempt' <<< "${RUN}")" != "1" ]]; then
+          # Retried, not skipped: re-running on a stale read could duplicate a hand re-run.
+          ATTEMPT=""
+          for _ in 1 2 3; do
+            if RUN=$(gh api "repos/${REPO}/actions/runs/${RERUN_RUN_ID}"); then
+              ATTEMPT=$(jq -r '.run_attempt' <<< "${RUN}")
+              break
+            fi
+            sleep 5
+          done
+          if [[ -z "${ATTEMPT}" ]]; then
+            echo "::error::could not re-read run ${RERUN_RUN_ID} after the jitter - not re-running it"
+            exit 1
+          fi
+          if [[ "${ATTEMPT}" != "1" ]]; then
             echo "::notice::run ${RERUN_RUN_ID} was already re-run during the jitter - leaving it alone"
             exit 0
           fi
@@ -218,11 +229,12 @@ jobs:
           echo "::notice::Re-running the failed jobs of https://github.com/${REPO}/actions/runs/${RERUN_RUN_ID}"
       # cancelled() too: a timed-out or cancelled helper is just as silent as a failed one.
       # retry-on-race dispatches as github-actions[bot], so its helpers always page. A hand
-      # dispatch only pages past validation - refused, there is no race behind it.
+      # dispatch, or a hand re-run of a helper, only pages past validation - refused, there is no
+      # race behind it. triggering_actor, not actor: actor stays the bot on a re-run.
       - name: Alert Slack if the re-run could not be started
         if: |
           (failure() || cancelled()) &&
-          (github.actor == 'github-actions[bot]' || env.REACHED_WAIT == 'true')
+          (github.triggering_actor == 'github-actions[bot]' || env.REACHED_WAIT == 'true')
         env:
           SLACK: ${{ secrets.SLACK_CI_ALERTS_WEBHOOK_URL }}
           REPO: ${{ github.repository }}
