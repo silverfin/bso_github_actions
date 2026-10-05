@@ -119,9 +119,14 @@ jobs:
   # the strength of this dispatch.
   rerun-losing-run:
     if: github.event_name == 'workflow_dispatch'
+    # Serialises duplicate helpers for one run; the attempt re-check below then makes the second a
+    # no-op instead of a rejected re-run.
+    concurrency:
+      group: rerun-losing-run-${{ github.event.inputs.rerun_run_id }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     # The losing run only has retry-on-race and the alert job left when it dispatches this, so it
-    # finishes within a minute or two; the wait below is capped at 15.
+    # finishes within a minute or two; the wait below is capped at 15, inside this 20.
     timeout-minutes: 20
     permissions:
       actions: write
@@ -146,38 +151,63 @@ jobs:
             echo "::error::could not read run ${RERUN_RUN_ID}"
             exit 1
           fi
-          # Only ever re-run a first-attempt pull_request run of this same caller workflow - this
-          # input is free text to anyone who can dispatch, and must not re-run arbitrary runs.
-          if ! jq -e --arg path "${CALLER_PATH}" \
-               '.event == "pull_request" and .run_attempt == 1 and .path == $path' <<< "${RUN}" > /dev/null; then
-            echo "::error::run ${RERUN_RUN_ID} is not a first-attempt pull_request run of ${CALLER_PATH} - refusing to re-run it"
+          # Only ever re-run a recent pull_request run of this same caller workflow, from a branch in
+          # this repo - this input is free text to anyone who can dispatch, and a re-run executes
+          # that run's commit with the current secrets.
+          if ! jq -e --arg path "${CALLER_PATH}" --argjson now "$(date +%s)" \
+               '.event == "pull_request" and .path == $path
+                and .head_repository.full_name == .repository.full_name
+                and ($now - (.created_at | fromdateiso8601)) < 7200' <<< "${RUN}" > /dev/null; then
+            echo "::error::run ${RERUN_RUN_ID} is not a pull_request run of ${CALLER_PATH} from this repo created in the last 2 hours - refusing to re-run it"
             exit 1
           fi
+          # Re-checked after the wait too: someone may re-run it by hand in the meantime.
+          if [[ "$(jq -r '.run_attempt' <<< "${RUN}")" != "1" ]]; then
+            echo "::notice::run ${RERUN_RUN_ID} was already re-run - leaving it alone"
+            exit 0
+          fi
           DEADLINE=$(( $(date +%s) + 900 ))
+          POLL_ERRORS=0
           while true; do
-            if ! STATUS=$(gh api "repos/${REPO}/actions/runs/${RERUN_RUN_ID}" --jq '.status'); then
-              echo "::error::could not read the status of run ${RERUN_RUN_ID}"
-              exit 1
+            if ! RUN=$(gh api "repos/${REPO}/actions/runs/${RERUN_RUN_ID}"); then
+              # A single API blip shouldn't page for a race that would recover on the next poll.
+              POLL_ERRORS=$((POLL_ERRORS + 1))
+              if (( POLL_ERRORS >= 3 )); then
+                echo "::error::could not read run ${RERUN_RUN_ID} three times in a row"
+                exit 1
+              fi
+            else
+              POLL_ERRORS=0
+              [[ "$(jq -r '.status' <<< "${RUN}")" == "completed" ]] && break
             fi
-            [[ "${STATUS}" == "completed" ]] && break
             if (( $(date +%s) >= DEADLINE )); then
               echo "::error::run ${RERUN_RUN_ID} did not finish within 15 minutes - not re-running it"
               exit 1
             fi
             sleep 15
           done
-          if ! CONCLUSION=$(gh api "repos/${REPO}/actions/runs/${RERUN_RUN_ID}" --jq '.conclusion'); then
-            echo "::error::could not read the conclusion of run ${RERUN_RUN_ID}"
-            exit 1
-          fi
-          if [[ "${CONCLUSION}" != "failure" ]]; then
-            echo "::notice::run ${RERUN_RUN_ID} finished as ${CONCLUSION} - nothing to re-run"
+          if [[ "$(jq -r '.run_attempt' <<< "${RUN}")" != "1" ]]; then
+            echo "::notice::run ${RERUN_RUN_ID} was already re-run while waiting - leaving it alone"
             exit 0
           fi
+          CONCLUSION=$(jq -r '.conclusion' <<< "${RUN}")
+          case "${CONCLUSION}" in
+            success|cancelled)
+              echo "::notice::run ${RERUN_RUN_ID} finished as ${CONCLUSION} - nothing to re-run"
+              exit 0
+              ;;
+            failure)
+              ;;
+            *)
+              echo "::error::run ${RERUN_RUN_ID} finished as ${CONCLUSION} - not re-running it"
+              exit 1
+              ;;
+          esac
           gh run rerun "${RERUN_RUN_ID}" --failed --repo "${REPO}"
           echo "::notice::Re-running the failed jobs of https://github.com/${REPO}/actions/runs/${RERUN_RUN_ID}"
+      # cancelled() too: a timed-out or cancelled helper is just as silent as a failed one.
       - name: Alert Slack if the re-run could not be started
-        if: failure()
+        if: failure() || cancelled()
         env:
           SLACK: ${{ secrets.SLACK_CI_ALERTS_WEBHOOK_URL }}
           REPO: ${{ github.repository }}
