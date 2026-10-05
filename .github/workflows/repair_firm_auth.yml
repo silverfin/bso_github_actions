@@ -90,9 +90,14 @@ jobs:
             exit 1
           fi
 
-          # owner/repo/.github/workflows/<file>@<ref> -> <file>
-          SELF_WORKFLOW="${CALLER_WORKFLOW_REF%@*}"
+          # owner/repo/.github/workflows/<file>@<ref> -> <file>. First `@`: a branch name may hold one.
+          SELF_WORKFLOW="${CALLER_WORKFLOW_REF%%@*}"
           SELF_WORKFLOW="${SELF_WORKFLOW##*/}"
+          # Both would vanish in the unquoted split below and leave writers unwatched.
+          if [[ -z "${SELF_WORKFLOW}" || -z "${WRITER_WORKFLOWS//[[:space:]]/}" ]]; then
+            echo "::error::writer_workflows is empty, or the caller's own workflow file could not be derived - fix the caller. The authorization code has NOT been used - discard it and start a new dispatch with a fresh one."
+            exit 1
+          fi
           # Shape-checked before reaching `gh`: a name starting with `-` would be read as a flag.
           # Split unquoted on purpose; set -f so an entry like `*.yml` isn't globbed.
           set -f
