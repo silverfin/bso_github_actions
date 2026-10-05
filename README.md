@@ -41,6 +41,7 @@ The document will go over all the Github Actions that currently automate a coupl
     * [Remove Code Review Label (remove_code_review_label.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf2828559422d84087b81255dc8)
   * [Authentication](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf4f743db4b6854130af8693671)
     * [Check authentication (check_auth.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf73af65c6455e4bb6a62454b15)
+    * [Repair a firm's CI auth token pair (repair_firm_auth.yml)](#repair-a-firms-ci-auth-token-pair-repair_firm_authyml)
   * [Testing](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf13d6dbd0df1e4450b3b22691c)
     * [Check YAML files (check_tests.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf931fa1547b4b419d940464f89)
     * [Run liquid tests (run_tests.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBfa4878bb5baac49cbb0c39d927)
@@ -132,6 +133,70 @@ _Prerequisites_:
 * `REPO_ACCESS_TOKEN`: GitHub personal access token
 
 
+
+#### Repair a firm's CI auth token pair `(repair_firm_auth.yml)`
+
+_Description_:
+Repairs one firm's dead token pair in `CONFIG_JSON` by doing the OAuth `authorization_code` exchange
+in CI, so no live token pair lands on a laptop. Only that firm's `accessToken`/`refreshToken` change;
+every other field and firm is carried through. Refuses a firm that isn't already in `CONFIG_JSON`.
+
+_Inputs:_
+
+* `firm_id` (string, required) - the firm to repair.
+* `auth_code` (string, required) - the one-time code from the firm's OAuth authorize screen, opened
+  while logged into Silverfin as the "Github Actions" user (URL in the workflow's header comment).
+  Masked line by line; still recorded in the run's dispatch inputs, so discard it after a refusal.
+* `writer_workflows` (string, required) - whitespace-separated filenames of every workflow in the
+  calling repo that writes `CONFIG_JSON`. The caller's own file is added automatically.
+
+_Trigger_: `workflow_dispatch` in the caller, run by hand, one firm at a time.
+
+_Steps:_
+
+* Refuses a re-run (the code is single-use) and refuses while any listed writer is in flight or
+  finished after this run was queued (its snapshot of `CONFIG_JSON` would revert that write)
+* Exchanges the code for a token pair and writes the updated `CONFIG_JSON` back, retrying transient
+  `gh secret set` failures
+
+_Prerequisites_:
+
+* `SF_API_CLIENT_ID`, `SF_API_SECRET`, `CONFIG_JSON`, `REPO_ACCESS_TOKEN`, declared under
+  `workflow_call.secrets` - pass exactly these, not `secrets: inherit`
+
+_Example caller:_
+
+```yaml
+name: Manually repair a firm's CI auth token pair
+run-name: Repair CI auth for firm ${{ inputs.firm_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      firm_id:
+        description: "Firm ID to repair. Must already be a key in CONFIG_JSON."
+        required: true
+        type: string
+      auth_code:
+        description: "One-time authorization code from that firm's OAuth authorize screen."
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  repair-firm-auth:
+    permissions: {}
+    uses: silverfin/bso_github_actions/.github/workflows/repair_firm_auth.yml@main
+    with:
+      firm_id: ${{ inputs.firm_id }}
+      auth_code: ${{ inputs.auth_code }}
+      writer_workflows: run_tests.yml
+    secrets:
+      SF_API_CLIENT_ID: ${{ secrets.SF_API_CLIENT_ID }}
+      SF_API_SECRET: ${{ secrets.SF_API_SECRET }}
+      CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+      REPO_ACCESS_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+```
 
 ### Testing
 
