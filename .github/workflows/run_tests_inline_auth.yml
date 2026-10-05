@@ -13,7 +13,8 @@
 # - `workflow_dispatch` with a required string `base_sha` input, in the caller's own workflow file:
 #   retry-on-race re-dispatches the caller's workflow (by its file name).
 # - `permissions: { contents: read, actions: write }` - retry-on-race needs actions: write, and a
-#   called workflow can only narrow what the caller grants.
+#   called workflow can only narrow what the caller grants. Without it the whole run fails at
+#   startup: no test-templates, and the required check never reports.
 # - `secrets: inherit`.
 # - No other CONFIG_JSON writer on a schedule (e.g. a refresh_token.yml cron): it races this job's
 #   own refresh. Disable it when switching.
@@ -114,11 +115,18 @@ jobs:
           # owner/repo/.github/workflows/<file>@<ref> -> <file>
           CALLER_WORKFLOW="${CALLER_WORKFLOW_REF%@*}"
           CALLER_WORKFLOW="${CALLER_WORKFLOW##*/}"
+          if [[ "${CALLER_WORKFLOW}" != *.yml && "${CALLER_WORKFLOW}" != *.yaml ]]; then
+            echo "::error::could not derive the caller's workflow file from github.workflow_ref (${#CALLER_WORKFLOW_REF} characters)"
+            exit 1
+          fi
           CURRENT_SHA=$(gh api "repos/${REPO}/commits/${PR_HEAD_REF}" --jq '.sha')
           if [[ "${CURRENT_SHA}" != "${PR_HEAD_SHA}" ]]; then
             echo "::warning::${PR_HEAD_REF} moved from ${PR_HEAD_SHA} to ${CURRENT_SHA} during the retry delay - skipping this stale retry so the original failure alerts normally"
             exit 1
           fi
+          # The dispatch trigger is checked at the dispatched branch, not on main: a branch that
+          # predates the caller's workflow_dispatch trigger gets a 422 here until it rebases, which
+          # falls through to the normal alert.
           echo "Retrying via a fresh dispatch - firm(s) ${FAILED_FIRMS} lost a refresh race against a concurrent job, not a genuine credential problem"
           gh workflow run "${CALLER_WORKFLOW}" \
             --repo "${REPO}" \
@@ -516,6 +524,7 @@ jobs:
           # silently skipped", so a fully-skipped run is never reported the same as a real pass.
           QUEUED_COUNT=0
           SKIPPED_COUNT=0
+          FALLBACK_COUNT=0
           FIRM_SELECTION_LOG="$(mktemp)"
 
           echo ""
@@ -683,6 +692,7 @@ jobs:
                 QUEUED_COUNT=$((QUEUED_COUNT+1))
                 if [[ "${FIRM_SOURCE}" == "default" ]]; then
                   echo "+ ${IDENTIFIER} -> firm ${FIRM_ID} (default)" >> "${FIRM_SELECTION_LOG}"
+                  FALLBACK_COUNT=$((FALLBACK_COUNT+1))
                 else
                   echo "+ ${IDENTIFIER} -> firm ${FIRM_ID}" >> "${FIRM_SELECTION_LOG}"
                 fi
@@ -703,6 +713,9 @@ jobs:
           cat "${FIRM_SELECTION_LOG}"
           echo "::endgroup::"
           rm -f "${FIRM_SELECTION_LOG}"
+          if (( FALLBACK_COUNT > 0 )); then
+            echo "::warning::${FALLBACK_COUNT} template(s) have no valid test_firm_id and no matching SF_TEST_FIRM_ID, so they default to the first firm id in their config.json. That choice can silently change when config.json is regenerated, and tests then run against a firm without the right test data. Pin test_firm_id in the template config (or set the SF_TEST_FIRM_ID repository variable) for stable firm assignment."
+          fi
 
           {
             echo "## Liquid test results"
