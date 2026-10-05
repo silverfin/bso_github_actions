@@ -12,8 +12,8 @@ getting introduced in new workflow files, then caught in review, over and over -
 file that gets the pattern right in one step and wrong in the next step of the *same* diff.
 This skill is the checklist to apply BEFORE writing, so the reviewer doesn't have to.
 
-If a local `.cursor/review-learnings/` exists (it is not tracked in this repo), read
-`_syntax.md` and the topic file for the workflow you're editing (see its `INDEX.md`).
+If `.cursor/review-learnings/_syntax.md` exists locally (it is not tracked in this repo),
+read it and the topic file for the workflow you're editing (see its `INDEX.md`).
 
 ## The checklist
 
