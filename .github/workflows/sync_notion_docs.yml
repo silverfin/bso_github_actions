@@ -15,6 +15,9 @@ on:
 jobs:
   sync-notion-docs:
     runs-on: ubuntu-latest
+    # Retries are bounded (~6 attempts per call, 120s max each), so a run
+    # that outlives this is stuck, not slow.
+    timeout-minutes: 30
     # This job only reads the repository and talks to external HTTP APIs
     # (Notion, Slack) - it never writes anything back to the repo - so it gets
     # read-only contents and none of the other default token permissions.
@@ -155,7 +158,25 @@ jobs:
             echo "SLACK_CI_ALERTS_WEBHOOK_URL not set, skipping Slack alert"
             exit 0
           fi
-          TEXT="Notion sync failed for: ${FAILED_HANDLES} (market: ${MARKET}, commit: ${COMMIT_SHA})"
+          TEXT="Notion sync failed for: ${FAILED_HANDLES} (market: ${MARKET}, commit: ${COMMIT_SHA}). Reasons in the job log: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg text "$TEXT" '{text: $text}')" \
+            "$SLACK"
+        continue-on-error: true
+
+      # The sync script always exits 0, so a failed job means an earlier step
+      # (checkout, changed-files, the script fetch) broke and nothing synced.
+      - name: Alert Slack if the job failed before syncing
+        if: ${{ failure() }}
+        env:
+          MARKET: ${{ inputs.market }}
+          SLACK: ${{ secrets.SLACK_CI_ALERTS_WEBHOOK_URL }}
+        run: |
+          if [[ -z "$SLACK" ]]; then
+            echo "SLACK_CI_ALERTS_WEBHOOK_URL not set, skipping Slack alert"
+            exit 0
+          fi
+          TEXT="Notion sync job failed before syncing anything (market: ${MARKET}): ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           curl -fsS -X POST -H 'Content-Type: application/json' \
             -d "$(jq -n --arg text "$TEXT" '{text: $text}')" \
             "$SLACK"

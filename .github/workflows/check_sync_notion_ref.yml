@@ -1,0 +1,48 @@
+# sync_notion_docs.yml runs the script and config fetched from its pinned REF,
+# not from the checkout. If a PR changes either without bumping REF (or REF
+# points at a commit with different content), production keeps running the
+# old script. Fails the PR until REF serves exactly the files in the PR.
+name: check-sync-notion-ref
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/sync-notion-docs.sh'
+      - 'scripts/notion-config.json'
+      - '.github/workflows/sync_notion_docs.yml'
+      - '.github/workflows/check_sync_notion_ref.yml'
+
+jobs:
+  check-ref:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Compare REF's files with this PR's
+        shell: bash
+        run: |
+          REF=$(sed -n 's/^ *REF: *\([0-9a-f]\{40\}\) *$/\1/p' .github/workflows/sync_notion_docs.yml)
+          if [[ ! "${REF}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::could not read a 40-char REF from sync_notion_docs.yml"
+            exit 1
+          fi
+          failed=0
+          for f in scripts/sync-notion-docs.sh scripts/notion-config.json; do
+            if ! curl -fsSL --connect-timeout 10 --max-time 60 -o /tmp/ref_file \
+                "https://raw.githubusercontent.com/silverfin/bso_github_actions/${REF}/${f}"; then
+              echo "::error::could not fetch ${f} at REF ${REF} - is that commit pushed?"
+              failed=1
+              continue
+            fi
+            if ! cmp -s /tmp/ref_file "${f}"; then
+              echo "::error::${f} at REF ${REF} differs from this PR - bump REF in sync_notion_docs.yml to a commit with these changes"
+              failed=1
+            fi
+          done
+          exit "${failed}"

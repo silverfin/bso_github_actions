@@ -638,33 +638,92 @@ JSON
     "created_handles=vol_1_fixture" "$(cat "$github_output")"
 }
 
-# The doc is named after the folder but the Notion row is found by
-# config.json's handle; if they differ the target row is ambiguous, so the
-# sync refuses instead of writing to either.
-test_cli_refuses_rt_whose_handle_differs_from_folder() {
+# nl_market's reconciliation_texts/model_condensed has handle
+# model_profit_loss_condensed: the skill names the doc after the handle, and
+# the Notion row is found by it.
+test_cli_rt_doc_named_after_handle() {
   setup_stub_curl
   setup_resolve_fixture
   local root="$SCRIPT_DIR/fixtures/notion-sync"
-  mkdir -p "$root/reconciliation_texts/dir_name_fixture/template_info"
-  echo '{"handle": "actual_handle_value"}' > "$root/reconciliation_texts/dir_name_fixture/config.json"
-  echo "# Mismatched dir name" > "$root/reconciliation_texts/dir_name_fixture/template_info/dir_name_fixture.md"
-  printf "${SCHEMA_OK}${SCHEMA_OK}" > "$STUB_CURL_RESPONSES"
+  local dir="reconciliation_texts/model_condensed"
+  mkdir -p "$root/$dir/template_info"
+  echo '{"handle": "model_profit_loss_condensed"}' > "$root/$dir/config.json"
+  echo "# doc" > "$root/$dir/template_info/model_profit_loss_condensed.md"
+  echo "# wrong name" > "$root/$dir/template_info/model_condensed.md"
+  printf "${SCHEMA_OK}${SCHEMA_OK}"'200\t-\t{"results":[{"id":"page-m","properties":{"Handle":{"rich_text":[{"plain_text":"model_profit_loss_condensed"}]}}}]}\n200\t-\t{}\n200\t-\t{}\n' > "$STUB_CURL_RESPONSES"
 
-  local changed_file github_output test_config
+  local changed_file github_output test_config out
   changed_file="$SCRIPT_DIR/fixtures/notion-sync/changed-readmes.txt"
-  printf '%s\n' "reconciliation_texts/dir_name_fixture/template_info/dir_name_fixture.md" > "$changed_file"
+  printf '%s\n' "$dir/template_info/model_profit_loss_condensed.md" "$dir/template_info/model_condensed.md" > "$changed_file"
   github_output="$SCRIPT_DIR/fixtures/notion-sync/github_output.txt"
   : > "$github_output"
   test_config=$(write_cli_test_config BE)
 
+  out=$(NOTION_TOKEN="fake-token" GITHUB_OUTPUT="$github_output" \
+    bash "$SCRIPT_DIR/../sync-notion-docs.sh" "$changed_file" "$root" "BE" "abcdef1234567" "$test_config" 2>&1)
+
+  assert_contains "CLI RT handle != folder: handle-named doc is UPDATED" "$dir: UPDATED" "$out"
+  assert_eq "CLI RT handle != folder: folder-named doc is reported, not synced" \
+    "failed_handles=$dir/template_info/model_condensed.md" "$(cat "$github_output")"
+  assert_eq "CLI RT handle != folder: 2 schema + lookup/update/stamp calls only" "5" "$(curl_call_count)"
+  rm -rf "${root:?}/$dir"
+}
+
+test_cli_empty_list_makes_no_calls() {
+  setup_stub_curl
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  local test_config changed_file github_output out rc
+  test_config=$(write_cli_test_config BE)
+  changed_file="$root/changed-readmes.txt"
+  printf '\n' > "$changed_file"
+  github_output="$root/github_output.txt"
+  : > "$github_output"
+  out=$(NOTION_TOKEN="fake-token" GITHUB_OUTPUT="$github_output" \
+    bash "$SCRIPT_DIR/../sync-notion-docs.sh" "$changed_file" "$root" "BE" "abcdef1234567" "$test_config" 2>&1) && rc=0 || rc=$?
+  assert_eq "CLI empty list: exits 0" "0" "$rc"
+  assert_eq "CLI empty list: no Notion calls" "0" "$(curl_call_count)"
+  assert_eq "CLI empty list: no alert" "" "$(cat "$github_output")"
+}
+
+test_cli_notion_unreachable_is_not_a_schema_error() {
+  setup_stub_curl
+  setup_resolve_fixture
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  local test_config changed_file github_output
+  test_config=$(write_cli_test_config BE)
+  echo "# Vol 1" > "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md"
+  printf '500\t-\t{"code":"internal_server_error"}\n' > "$STUB_CURL_RESPONSES"
+  changed_file="$root/changed-readmes.txt"
+  printf '%s\n' "reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md" > "$changed_file"
+  github_output="$root/github_output.txt"
+  : > "$github_output"
   NOTION_TOKEN="fake-token" GITHUB_OUTPUT="$github_output" \
     bash "$SCRIPT_DIR/../sync-notion-docs.sh" "$changed_file" "$root" "BE" "abcdef1234567" "$test_config" > /dev/null 2>&1
+  assert_eq "CLI Notion 5xx on schema fetch: alerts as unreachable, not schema" \
+    "failed_handles=config-error:notion-unreachable:BE" "$(cat "$github_output")"
+}
 
-  assert_eq "CLI handle/folder mismatch: reported as failed" \
-    "failed_handles=dir_name_fixture" "$(cat "$github_output")"
-  assert_eq "CLI handle/folder mismatch: no page lookup or write after the schema checks" \
-    "2" "$(curl_call_count)"
-  rm -rf "$root/reconciliation_texts/dir_name_fixture"
+test_cli_refuses_trim_collision() {
+  setup_stub_curl
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  rm -rf "$root/account_templates"
+  mkdir -p "$root/account_templates/Foo/template_info" "$root/account_templates/Foo /template_info"
+  echo '{}' > "$root/account_templates/Foo/config.json"
+  echo '{}' > "$root/account_templates/Foo /config.json"
+  echo "# a" > "$root/account_templates/Foo /template_info/Foo .md"
+  printf "${SCHEMA_OK}${SCHEMA_OK}" > "$STUB_CURL_RESPONSES"
+  local test_config changed_file github_output
+  test_config=$(write_cli_test_config BE)
+  changed_file="$root/changed-readmes.txt"
+  printf '%s\n' "account_templates/Foo /template_info/Foo .md" > "$changed_file"
+  github_output="$root/github_output.txt"
+  : > "$github_output"
+  NOTION_TOKEN="fake-token" GITHUB_OUTPUT="$github_output" \
+    bash "$SCRIPT_DIR/../sync-notion-docs.sh" "$changed_file" "$root" "BE" "abcdef1234567" "$test_config" > /dev/null 2>&1
+  assert_eq "CLI trim collision: reported as failed" \
+    "failed_handles=account_templates/Foo /template_info/Foo .md" "$(cat "$github_output")"
+  assert_eq "CLI trim collision: no page lookup or write" "2" "$(curl_call_count)"
+  rm -rf "$root/account_templates"
 }
 
 # --- CLI exit-0 safety contract -------------------------------------------
@@ -852,7 +911,10 @@ test_cli_joins_multiple_handles_readably() {
 test_cli_reports_failed_handles_via_github_output
 test_cli_classifies_updated_and_failed_results
 test_cli_stamp_failure_reports_both_failed_and_created
-test_cli_refuses_rt_whose_handle_differs_from_folder
+test_cli_rt_doc_named_after_handle
+test_cli_empty_list_makes_no_calls
+test_cli_notion_unreachable_is_not_a_schema_error
+test_cli_refuses_trim_collision
 test_cli_missing_changed_readmes_file
 test_cli_malformed_config
 test_cli_market_not_in_config
@@ -875,8 +937,6 @@ test_template_dir_for_doc() {
   local path rc
   for path in \
     "reconciliation_texts/wagenpark/README.md" \
-    "reconciliation_texts/vol_1/template_info/README.md" \
-    "reconciliation_texts/vol_1/template_info/vol_1_v2.md" \
     "reconciliation_texts/vol_1/template_info/vol_1.MD" \
     "reconciliation_texts/vol_1/template_info/old/vol_1.md" \
     "reconciliation_texts/vol_1/tests/README.md" \
@@ -968,9 +1028,14 @@ test_check_data_source_schema() {
   setup_stub_curl
   printf '200\t-\t{"properties":{"Name":{"type":"title"},"Handle":{"type":"title"},"Market":{"type":"select"}}}\n' > "$STUB_CURL_RESPONSES"
   out=$(NOTION_TOKEN="fake-token" check_data_source_schema "ds-abc" 2>&1) && rc=0 || rc=$?
-  assert_eq "check_data_source_schema: missing/wrong-typed property fails" "1" "$rc"
+  assert_eq "check_data_source_schema: missing/wrong-typed property returns 2" "2" "$rc"
   assert_contains "check_data_source_schema: names the missing property" "Last Updated (want date, got missing)" "$out"
   assert_contains "check_data_source_schema: names the wrong-typed property" "Handle (want rich_text, got title)" "$out"
+
+  setup_stub_curl
+  printf '500\t-\t{"code":"error"}\n' > "$STUB_CURL_RESPONSES"
+  NOTION_TOKEN="fake-token" check_data_source_schema "ds-abc" > /dev/null 2>&1 && rc=0 || rc=$?
+  assert_eq "check_data_source_schema: unreadable data source returns 1" "1" "$rc"
 
   setup_stub_curl
   printf '200\t-\t{"object":"data_source"}\n' > "$STUB_CURL_RESPONSES"

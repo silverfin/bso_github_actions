@@ -43,11 +43,8 @@ resolve_handle() {
     return 1
   fi
 
-  # The doc is named after the folder (template_info/<folder>.md) but the
-  # Notion row is found by config.json's handle. If the two disagree, it is
-  # unclear which row the doc belongs to, so refuse rather than guess.
-  if [[ "$jq_output" != "${template_dir#*/}" ]]; then
-    echo "ERROR: $template_dir has config.json handle '$jq_output', which differs from its folder name" >&2
+  if [[ "$jq_output" == */* ]]; then
+    echo "ERROR: $template_dir has a config.json handle containing '/'" >&2
     return 1
   fi
 
@@ -64,14 +61,29 @@ trim_ws() {
   printf '%s' "$s"
 }
 
-# $1 = changed path. Prints the template dir when the path is exactly
-# <reconciliation_texts|account_templates>/<folder>/template_info/<folder>.md,
-# the file silverfin-uni-create-template-specific-md writes. Returns 1 otherwise.
+# $1 = changed path. Prints the template dir when the path has the shape
+# <reconciliation_texts|account_templates>/<folder>/template_info/<name>.md.
+# Returns 1 otherwise. main() then checks <name> is the template's handle.
 template_dir_for_doc() {
   local path="$1"
-  [[ "$path" =~ ^((reconciliation_texts|account_templates)/([^/]+))/template_info/([^/]+)$ ]] || return 1
-  [[ "${BASH_REMATCH[4]}" == "${BASH_REMATCH[3]}.md" ]] || return 1
+  [[ "$path" =~ ^((reconciliation_texts|account_templates)/[^/]+)/template_info/[^/]+\.md$ ]] || return 1
   printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# $1 = account template dir, $2 = repo_root. Prints the other account
+# template folders whose name trims to the same Handle: Notion cannot tell
+# them apart, so syncing either would overwrite the other's page.
+find_trim_collisions() {
+  local template_dir="$1" repo_root="$2"
+  local trimmed other_dir other
+  trimmed=$(trim_ws "${template_dir#*/}")
+  for other_dir in "$repo_root"/account_templates/*/; do
+    other="${other_dir%/}"
+    other="account_templates/${other##*/}"
+    [[ "$other" == "$template_dir" ]] && continue
+    [[ "$(trim_ws "${other#*/}")" == "$trimmed" ]] && printf '%s\n' "$other"
+  done
+  return 0
 }
 
 # $1 = template dir, $2 = repo_root.
@@ -285,10 +297,12 @@ find_page_by_handle() {
   return 0
 }
 
-# $1 = data_source_id. Fails unless the data source has every property this
-# script writes or filters on, with the right type. Checked before any page
-# is touched: a missing column would otherwise only surface on the metadata
-# PATCH, after the page body had already been replaced.
+# $1 = data_source_id. Checked before any page is touched: a missing column
+# would otherwise only surface on the metadata PATCH, after the page body had
+# already been replaced. Returns 1 when Notion could not be read, 2 when a
+# property this script filters on or writes on every run is missing or has
+# another type. (Market is only written on create; a bad Market fails that
+# one create, reported like any other failure.)
 check_data_source_schema() {
   local data_source_id="$1"
   local response
@@ -297,7 +311,7 @@ check_data_source_schema() {
   if ! problems=$(echo "$response" | jq -r '
       if (.properties | type) != "object" then error("`.properties` is missing or not an object") else . end
       | . as $ds
-      | {"Name": "title", "Handle": "rich_text", "Market": "select", "Last Updated": "date"}
+      | {"Name": "title", "Handle": "rich_text", "Last Updated": "date"}
       | to_entries[]
       | select(($ds.properties[.key].type // "missing") != .value)
       | "\(.key) (want \(.value), got \($ds.properties[.key].type // "missing"))"
@@ -307,7 +321,7 @@ check_data_source_schema() {
   fi
   if [[ -n "$problems" ]]; then
     echo "ERROR: data source $data_source_id is missing required properties: ${problems//$'\n'/, }" >&2
-    return 1
+    return 2
   fi
   return 0
 }
@@ -481,10 +495,20 @@ main() {
     return 0
   fi
 
-  local ds
+  if ! grep -q '[^[:space:]]' "$changed_readmes_path"; then
+    echo "No template docs changed, nothing to sync"
+    return 0
+  fi
+
+  local ds schema_rc
   for ds in "$rt_ds" "$at_ds"; do
-    if ! check_data_source_schema "$ds"; then
+    schema_rc=0
+    check_data_source_schema "$ds" || schema_rc=$?
+    if (( schema_rc == 2 )); then
       write_config_abort_alert "config-error:schema:${market}"
+      return 0
+    elif (( schema_rc != 0 )); then
+      write_config_abort_alert "config-error:notion-unreachable:${market}"
       return 0
     fi
   done
@@ -499,9 +523,29 @@ main() {
     # reported: a misnamed doc that got merged would otherwise never reach
     # Notion and nobody would notice.
     if ! template_dir=$(template_dir_for_doc "$readme_path"); then
-      echo "$readme_path: FAILED: not a <template>/template_info/<folder>.md path, not synced" >&2
+      echo "$readme_path: FAILED: not a <template>/template_info/<handle>.md path, not synced" >&2
       failed+=("$readme_path")
       continue
+    fi
+    local doc_handle
+    if ! doc_handle=$(resolve_handle "$template_dir" "$repo_root"); then
+      echo "$readme_path: FAILED: could not resolve the template's handle, not synced" >&2
+      failed+=("$readme_path")
+      continue
+    fi
+    if [[ "${readme_path##*/}" != "$doc_handle.md" ]]; then
+      echo "$readme_path: FAILED: expected $template_dir/template_info/$doc_handle.md, not synced" >&2
+      failed+=("$readme_path")
+      continue
+    fi
+    if [[ "$template_dir" == account_templates/* ]]; then
+      local collisions
+      collisions=$(find_trim_collisions "$template_dir" "$repo_root")
+      if [[ -n "$collisions" ]]; then
+        echo "$readme_path: FAILED: Handle collides with ${collisions//$'\n'/, } once trimmed, not synced" >&2
+        failed+=("$readme_path")
+        continue
+      fi
     fi
 
     local data_source_id
