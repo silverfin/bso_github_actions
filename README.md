@@ -41,9 +41,11 @@ The document will go over all the Github Actions that currently automate a coupl
     * [Remove Code Review Label (remove_code_review_label.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf2828559422d84087b81255dc8)
   * [Authentication](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf4f743db4b6854130af8693671)
     * [Check authentication (check_auth.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf73af65c6455e4bb6a62454b15)
+    * [Repair a firm's CI auth token pair (repair_firm_auth.yml)](#repair-a-firms-ci-auth-token-pair-repair_firm_authyml)
   * [Testing](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf13d6dbd0df1e4450b3b22691c)
     * [Check YAML files (check_tests.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf931fa1547b4b419d940464f89)
     * [Run liquid tests (run_tests.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBfa4878bb5baac49cbb0c39d927)
+    * [Run liquid tests, inline auth (run_tests_inline_auth.yml)](#run-liquid-tests-inline-auth-run_tests_inline_authyml)
   * [Slack updates](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBfc9ca89d4b174494391ba075c5)
     * [Automated slack update (slack_changelog.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf862cf4257e68475d8b47891c6)
   * [Review firm deployment](#review-firm-deployment)
@@ -132,6 +134,70 @@ _Prerequisites_:
 
 
 
+#### Repair a firm's CI auth token pair `(repair_firm_auth.yml)`
+
+_Description_:
+Repairs one firm's dead token pair in `CONFIG_JSON` by doing the OAuth `authorization_code` exchange
+in CI, so no live token pair lands on a laptop. Only that firm's `accessToken`/`refreshToken` change;
+every other field and firm is carried through. Refuses a firm that isn't already in `CONFIG_JSON`.
+
+_Inputs:_
+
+* `firm_id` (string, required) - the firm to repair.
+* `auth_code` (string, required) - the one-time code from the firm's OAuth authorize screen, opened
+  while logged into Silverfin as the "Github Actions" user (URL in the workflow's header comment).
+  Masked line by line; still recorded in the run's dispatch inputs, so discard it after a refusal.
+* `writer_workflows` (string, required) - whitespace-separated filenames of every workflow in the
+  calling repo that writes `CONFIG_JSON`. The caller's own file is added automatically.
+
+_Trigger_: `workflow_dispatch` in the caller, run by hand, one firm at a time.
+
+_Steps:_
+
+* Refuses a re-run (the code is single-use) and refuses while any listed writer is in flight or
+  finished after this run was queued (its snapshot of `CONFIG_JSON` would revert that write)
+* Exchanges the code for a token pair and writes the updated `CONFIG_JSON` back, retrying transient
+  `gh secret set` failures
+
+_Prerequisites_:
+
+* `SF_API_CLIENT_ID`, `SF_API_SECRET`, `CONFIG_JSON`, `REPO_ACCESS_TOKEN`, declared under
+  `workflow_call.secrets` - pass exactly these, not `secrets: inherit`
+
+_Example caller:_
+
+```yaml
+name: Manually repair a firm's CI auth token pair
+run-name: Repair CI auth for firm ${{ inputs.firm_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      firm_id:
+        description: "Firm ID to repair. Must already be a key in CONFIG_JSON."
+        required: true
+        type: string
+      auth_code:
+        description: "One-time authorization code from that firm's OAuth authorize screen."
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  repair-firm-auth:
+    permissions: {}
+    uses: silverfin/bso_github_actions/.github/workflows/repair_firm_auth.yml@main
+    with:
+      firm_id: ${{ inputs.firm_id }}
+      auth_code: ${{ inputs.auth_code }}
+      writer_workflows: run_tests.yml
+    secrets:
+      SF_API_CLIENT_ID: ${{ secrets.SF_API_CLIENT_ID }}
+      SF_API_SECRET: ${{ secrets.SF_API_SECRET }}
+      CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+      REPO_ACCESS_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+```
+
 ### Testing
 
 #### Check YAML files `(check_tests.yml)`
@@ -185,6 +251,53 @@ If the `test_firm_id` is not used for a specific handle, the Github action will 
 If none of the above options is used/defined, we will fall back to the default option: the first firm id that is present in the `config.json` file. This is again template specific, but the order cannot be changed (the smallest firm id number will always be on top). 
 
 
+
+#### Run liquid tests, inline auth `(run_tests_inline_auth.yml)`
+
+_Description:_
+Same tests as `run_tests.yml`, but `test-templates` refreshes `CONFIG_JSON` as its own first step
+instead of relying on a separate `check_auth.yml` job (whose write a later job in the same run never
+sees). Markets switch to it one at a time; once all have, it replaces `run_tests.yml`.
+
+_Differences from `run_tests.yml`:_
+
+* Refreshes tokens inline via the `refresh-config-json` action, seeding `autoRenew: false`, and blanks the refresh token on disk before tests run
+* If a concurrent run wins a refresh race, the losing PR run's failed jobs are re-run once (`retry-on-race` dispatches a small helper run that waits for the losing run to finish, then re-runs it; helpers take turns per repo, so two losers from one burst can't race each other again). A re-run counts for the PR's required check and reads the fresh token; Slack is alerted only if that fails
+* `test-templates` always runs, so the required check fails rather than passing as skipped when change detection fails or the run is cancelled
+* A push to main diffs against the previous main commit (not `main` itself), so post-merge runs actually test something
+* The silverfin-cli install happens outside the PR checkout
+
+_Caller requirements:_
+
+```yaml
+on:
+  pull_request:
+    branches: ["*"]
+  push:
+    branches: ["main"]
+  # retry-on-race dispatches this file on the default branch to re-run a losing PR run
+  workflow_dispatch:
+    inputs:
+      rerun_run_id:
+        description: "Run ID of the losing PR run to re-run (set by retry-on-race)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  run-tests:
+    # On this job only, so jobs added to the caller later don't inherit actions: write
+    permissions:
+      contents: read
+      actions: write
+    uses: silverfin/bso_github_actions/.github/workflows/run_tests_inline_auth.yml@main
+    secrets: inherit
+```
+
+Disable any scheduled `CONFIG_JSON` refresher (e.g. a `refresh_token.yml` cron) when switching: it
+races the inline refresh.
 
 ### Slack updates
 
@@ -263,7 +376,7 @@ _Prerequisites:_
 #### Run liquid sampler `(run_sampler.yml)`
 
 _Description_:
-Reusable workflow. Runs the Liquid Sampler (`silverfin-cli run-sampler`) for a single partner's changed reconciliation/account templates and posts the result on a PR. It is deliberately partner-agnostic and repo-layout-agnostic: given a partner id, a list of already-classified handles/account templates, and firm ids, it loads that partner's credentials, runs the sampler, and reports back. All market-specific logic (which templates changed, which partner they belong to) lives in the calling wrapper.
+Reusable workflow. Runs the Liquid Sampler (`silverfin-cli run-sampler`) for a single partner's changed reconciliation texts, account templates and shared parts and posts the result on a PR. It is deliberately partner-agnostic and repo-layout-agnostic: given a partner id, a list of already-classified handles/account templates/shared parts, and firm ids, it loads that partner's credentials, runs the sampler, and reports back. All market-specific logic (which templates changed, which partner they belong to) lives in the calling wrapper.
 
 _Trigger:_
 
@@ -274,21 +387,25 @@ _Inputs:_
 * `partner` (required) — partner environment id (must be authorized — see `PARTNER_CONFIG_JSON` secret).
 * `handles` (optional) — reconciliation text handles to sample, **one per line** (directory names under `reconciliation_texts/`). Optional if `account_templates` is set.
 * `account_templates` (optional) — account template names to sample, **one per line** (directory names under `account_templates/`). Optional if `handles` is set.
-  * Both lists are newline-separated, **not** space-separated: account template directory names routinely contain spaces (e.g. `Investment- and depreciation details`), so a space-joined list is ambiguous and gets word-split into template names that don't exist (`Config file for account template "Investment-" not found`). Same convention as [`run_tests.yml`](#run-liquid-tests-run_testsyml). `firm_ids` is the exception — numeric, so it stays space-separated.
-  * A name that **starts with `-`** is rejected before the CLI is called, and the job fails with the directory to rename. `silverfin-cli`'s `-h`/`-at` are variadic options, so commander stops consuming values at the first `-`-prefixed token and would read such a name as a flag; a `--` separator does not protect variadic values. Only a leading `-` is affected — internal and trailing hyphens (`Cut-off`, `Investment- and depreciation details`) are fine.
+  * All three lists are newline-separated, **not** space-separated: account template directory names routinely contain spaces (e.g. `Investment- and depreciation details`), so a space-joined list is ambiguous and gets word-split into template names that don't exist (`Config file for account template "Investment-" not found`). Same convention as [`run_tests.yml`](#run-liquid-tests-run_testsyml). `firm_ids` is the exception — numeric, so it stays space-separated.
+  * A name that **starts with `-`** is rejected before the CLI is called, and the job fails with the directory to rename. `silverfin-cli`'s `-h`/`-at`/`-s` are variadic options, so commander stops consuming values at the first `-`-prefixed token and would read such a name as a flag; a `--` separator does not protect variadic values. Only a leading `-` is affected — internal and trailing hyphens (`Cut-off`, `Investment- and depreciation details`) are fine.
+* `shared_parts` (optional) — shared part names to sample, **one per line** (directory names under `shared_parts/`). Optional if `handles` or `account_templates` is set. The sampler backend expands each shared part to every reconciliation text / account detail template that includes it, so one name here can fan out to many rendered templates — no `used_in` expansion is needed on the caller's side.
 * `firm_ids` (required) — firm id(s) to sample against, space-separated. The backend 422s if empty.
 * `ref` (required) — git ref (commit SHA) to check out — the PR head, so sampled template content matches the PR under review.
 * `pull_request_number` (optional) — PR number to post the result comment on. If empty, no comment is posted (results still upload as an artifact).
 
 _Steps:_
 
-* Validates that at least one of `handles`/`account_templates`, and `firm_ids`, were supplied.
+* Validates that at least one of `handles`/`account_templates`/`shared_parts`, and `firm_ids`, were supplied.
 * Checks out the repo at `ref` and installs `silverfin-cli`.
 * Loads the partner's credentials from the `PARTNER_CONFIG_JSON` secret and captures the token on disk before the run.
-* Runs `run-sampler`, retrying on a cross-repo "already in progress" 422 (the backend allows only one sampler run per partner at a time; retries for up to 90 minutes).
+* Runs `run-sampler`, retrying on a cross-repo "already in progress" 422 (the backend allows only one sampler run per partner at a time; retries while at least 60 minutes of the step deadline remain, so a retried run can still finish).
+  * If the CLI stops polling and prints its `Timeout. Try to fetch the status by using the --id flag` line, the job re-attaches to the same run with `run-sampler --id <id>` (the id comes from the CLI's own `Sampler run started with ID:` line) instead of abandoning it — an abandoned run is still running server-side, so the next attempt collides with it on that same one-run-per-partner 422. `--id` is a single status read rather than a poll, so the job re-reads every 60 seconds until the step deadline (135 minutes after the job started, leaving ~45 minutes of the 180-minute cap for the token write-back, artifact uploads and PR comment); if the run is still going at that point the job fails loudly, since a "still in progress" read exits 0 on its own. Every CLI call runs under that same deadline, since the CLI's own poll lasts up to 2 hours.
 * Captures the token again after the run and writes it back to `PARTNER_CONFIG_JSON_<partner>` via `gh secret set` only if it rotated (401 refresh mid-run).
 * Downloads `results.zip`, best-effort adds a `diffs/` folder of before/after `view.html` for the entries the compact diff flagged, and uploads it as a 7-day workflow artifact.
+  * The artifact is uploaded with `compression-level: 0`. GitHub re-zips every upload, and `results.zip` is already per-file deflated, so a second DEFLATE pass saves ~nothing while turning the outer entry into one compressed stream spanning the whole file — which makes the inner zip's central directory unreachable by HTTP Range and forces a consumer to download all 20+ MB to read a handful of `view.html` files. Storing it keeps the inner offsets intact so partial fetches work.
 * Posts (or updates) a result comment on the PR with the compact diff and a link to the workflow artifact (kept 7 days; GitHub sign-in required) as the primary way to open the full report; falls back to the presigned report URL (short-lived, ~5 min) only if the artifact upload did not happen.
+  * The comment ends with a machine-readable `<!-- silverfin-sampler-provenance {...} -->` footer (invisible when rendered) carrying `repository`, `run_id`, `run_attempt`, `event_name`/`workflow_dispatch`, `partner`, `pr_number`, `ref`, `artifact_id` and `sampler_ok` (ids are JSON numbers, matching the Actions API), so a tool can resolve the artifact and the originating PR without scraping links. The `<!-- silverfin-sampler-result-<partner> -->` marker that identifies the comment for updates is unchanged and still last.
 * Fails the job if the sampler run did not complete successfully.
 
 _Authentication note:_

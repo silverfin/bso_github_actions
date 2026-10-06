@@ -1,0 +1,288 @@
+# Repairs one firm's dead CONFIG_JSON token pair by doing the OAuth code exchange in CI, so no
+# live token pair lands on a laptop. Get the code from this URL (not `silverfin authorize`, which
+# would do the exchange locally), logged into Silverfin as the "Github Actions" user.
+# SF_API_CLIENT_ID is in 1Password under "API Application: BSO Team CLI":
+#
+#   https://live.getsilverfin.com/f/<firm_id>/oauth/authorize?client_id=<SF_API_CLIENT_ID>&redirect_uri=urn:ietf:wg:oauth:2.0:oob&response_type=code&scope=administration:read+administration:write+financials:read+financials:write+workflows:read
+#
+# The whole CONFIG_JSON blob is written back, so a concurrent writer gets reverted. The check
+# below refuses while one is running; still, one firm at a time.
+name: Repair a firm's CI auth token pair
+
+on:
+  workflow_call:
+    inputs:
+      firm_id:
+        description: "Firm ID to repair. Must already be a key in CONFIG_JSON - this workflow refuses to add a new firm."
+        required: true
+        type: string
+      auth_code:
+        description: "The one-time authorization code from that firm's OAuth authorize screen (single-use, short-lived)."
+        required: true
+        type: string
+      writer_workflows:
+        description: >-
+          Whitespace-separated workflow filenames in the calling repo that write CONFIG_JSON (e.g.
+          "run_tests.yml push_to_review_firm.yml"). The caller's own file is added automatically.
+        required: true
+        type: string
+    # Declared, so callers pass exactly these instead of `secrets: inherit`.
+    secrets:
+      SF_API_CLIENT_ID:
+        description: "Silverfin API OAuth client id, for the token exchange."
+        required: true
+      SF_API_SECRET:
+        description: "Silverfin API OAuth client secret, for the token exchange."
+        required: true
+      CONFIG_JSON:
+        description: "silverfin-cli credentials file content; the repaired firm's token pair is written into it."
+        required: true
+      REPO_ACCESS_TOKEN:
+        description: "PAT that can list this repo's workflow runs and write its CONFIG_JSON secret."
+        required: true
+
+permissions: {}
+
+jobs:
+  repair-firm-auth:
+    runs-on: ubuntu-latest
+    # No GITHUB_TOKEN permissions: `gh` authenticates with REPO_ACCESS_TOKEN.
+    permissions: {}
+    steps:
+      # Via env:, never spliced into run: - that would be shell injection, not just a mask gap.
+      - name: Mask the authorization code
+        env:
+          AUTH_CODE: ${{ inputs.auth_code }}
+        run: |
+          # Line by line (::add-mask:: masks one line, and inputs.* aren't auto-masked), skipping short
+          # or blank lines, which would redact that text from every later log line.
+          while IFS= read -r LINE; do
+            if [[ -n "${LINE//[[:space:]]/}" && "${#LINE}" -ge 8 ]]; then
+              echo "::add-mask::${LINE}"
+            fi
+          done <<< "${AUTH_CODE}"
+
+      # Best-effort, not a lock: a writer that starts after this check isn't caught.
+      - name: Check for other CONFIG_JSON writers
+        env:
+          GH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          WRITER_WORKFLOWS: ${{ inputs.writer_workflows }}
+          # In a called workflow this is the caller's file - itself a writer, so always watched.
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          # A re-run reuses the single-use auth_code, so it can only fail.
+          if [[ "${RUN_ATTEMPT}" != "1" ]]; then
+            echo "::error::this is attempt ${RUN_ATTEMPT}, and this workflow cannot be re-run: a re-run reuses the same auth_code input, which is single-use and already spent or discarded. Get a fresh code from the authorize screen and start a NEW dispatch."
+            exit 1
+          fi
+
+          # createdAt from the API (github.run_started_at doesn't exist); on a re-run it stays at the
+          # first dispatch, the conservative anchor.
+          if ! RUN_QUEUED_AT=$(gh run view "${RUN_ID}" --json createdAt --jq '.createdAt // empty'); then
+            echo "::error::could not query this run's own creation time (check REPO_ACCESS_TOKEN's actions:read scope) - without it this check cannot tell which writers finished after this run's secret snapshot was taken, so it cannot run safely. The authorization code has NOT been used - discard it and start a new dispatch with a fresh one."
+            exit 1
+          fi
+          if [[ -z "${RUN_QUEUED_AT}" ]]; then
+            echo "::error::could not read this run's own creation time - without it this check cannot tell which writers finished after this run's secret snapshot was taken, so it cannot run safely. The authorization code has NOT been used - discard it and start a new dispatch with a fresh one."
+            exit 1
+          fi
+
+          # owner/repo/.github/workflows/<file>@<ref> -> <file>. First `@`: a branch name may hold one.
+          SELF_WORKFLOW="${CALLER_WORKFLOW_REF%%@*}"
+          SELF_WORKFLOW="${SELF_WORKFLOW##*/}"
+          # Both would vanish in the unquoted split below and leave writers unwatched.
+          if [[ -z "${SELF_WORKFLOW}" || -z "${WRITER_WORKFLOWS//[[:space:]]/}" ]]; then
+            echo "::error::writer_workflows is empty, or the caller's own workflow file could not be derived - fix the caller. The authorization code has NOT been used - discard it and start a new dispatch with a fresh one."
+            exit 1
+          fi
+          # Plain filenames only: a leading `-` would be read as a flag. Split unquoted on purpose,
+          # with set -f so `*.yml` isn't globbed.
+          set -f
+          WRITERS=()
+          for WF in ${WRITER_WORKFLOWS} ${SELF_WORKFLOW}; do
+            if [[ ! "${WF}" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*\.ya?ml$ ]]; then
+              echo "::error::writer_workflows entry is not a plain workflow filename (${#WF} characters) - fix the caller. The authorization code has NOT been used - discard it and start a new dispatch with a fresh one."
+              exit 1
+            fi
+            [[ " ${WRITERS[*]} " == *" ${WF} "* ]] || WRITERS+=("${WF}")
+          done
+
+          # Per workflow: a repo-wide `gh run list` window is sized in runs, not time, so a long
+          # writer could fall out of it. By filename, since gh's workflowName is the `name:` key.
+          # A name that doesn't resolve fails: it means a wrong name or an unreachable repo/token.
+          RECENT_RUNS='[]'
+          for WF in "${WRITERS[@]}"; do
+            if ! WF_RUNS=$(gh run list --workflow "${WF}" --limit 50 \
+                 --json databaseId,status,workflowName,url,updatedAt 2> /tmp/wf-list-err); then
+              echo "::error::could not list runs of ${WF} while checking for other CONFIG_JSON writers - refusing to write the secret blind. Either the name in this workflow's writer list is wrong, or REPO_ACCESS_TOKEN can no longer see this repo. The authorization code has NOT been used - discard it and start a new dispatch with a fresh one: $(tr '\n\r' '  ' < /tmp/wf-list-err)"
+              exit 1
+            fi
+            if ! RECENT_RUNS=$(jq -s 'add' <<< "${RECENT_RUNS}"$'\n'"${WF_RUNS}"); then
+              echo "::error::could not merge the run listing for ${WF} while checking for other CONFIG_JSON writers - refusing to write the secret blind. The authorization code has NOT been used - discard it and start a new dispatch with a fresh one."
+              exit 1
+            fi
+          done
+
+          # Fatal: a writer still in flight, or one that completed after this run was queued (its write
+          # isn't in our snapshot). A null updatedAt counts as recent.
+          if ! IN_FLIGHT=$(jq --arg t "${RUN_QUEUED_AT}" --arg self "${RUN_ID}" '
+            [ .[]
+              | select((.databaseId | tostring) != $self)
+              | select(.status != "completed" or .updatedAt == null or .updatedAt >= $t)
+            ]
+          ' <<< "${RECENT_RUNS}"); then
+            echo "::error::could not parse the run listing while checking for other CONFIG_JSON writers - refusing to write the secret blind. The authorization code has NOT been used - discard it and start a new dispatch with a fresh one."
+            exit 1
+          fi
+          COUNT=$(jq 'length' <<< "${IN_FLIGHT}")
+          if [[ "${COUNT}" -gt 0 ]]; then
+            echo "::error::${COUNT} CONFIG_JSON-writing run(s) are in flight, or completed after this run was queued - either way this job's snapshot of the secret is already stale and writing it back would silently revert them. The authorization code has NOT been used, but it is now recorded in this run's dispatch inputs - discard it. Wait for these to finish, then start a new dispatch with a fresh code:"
+            jq -r '.[] | "  - \(.workflowName): \(.url)"' <<< "${IN_FLIGHT}"
+            exit 1
+          fi
+          echo "No CONFIG_JSON-writing runs in flight or completed since this run was queued - proceeding."
+
+      - name: Exchange the authorization code and write CONFIG_JSON
+        env:
+          FIRM_ID: ${{ inputs.firm_id }}
+          AUTH_CODE: ${{ inputs.auth_code }}
+          SF_API_CLIENT_ID: ${{ secrets.SF_API_CLIENT_ID }}
+          SF_API_SECRET: ${{ secrets.SF_API_SECRET }}
+          CURRENT_CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+          GH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          echo "::add-mask::${CURRENT_CONFIG_JSON}"
+
+          # Stripped: a stray space would be rejected and reported as an expired code.
+          AUTH_CODE="${AUTH_CODE//[[:space:]]/}"
+          echo "::add-mask::${AUTH_CODE}"
+          if [[ -z "${AUTH_CODE}" ]]; then
+            echo "::error::auth_code is empty once whitespace is stripped - paste the one-time code from the firm's authorize screen"
+            exit 1
+          fi
+
+          # Stripped of whitespace, in pure bash (xargs chokes on quotes).
+          FIRM_ID="${FIRM_ID//[[:space:]]/}"
+          if [[ -z "${FIRM_ID}" ]]; then
+            echo "::error::firm_id is empty once whitespace is stripped - supply the ID of the firm to repair. The authorization code has NOT been used."
+            exit 1
+          fi
+          # CONFIG_JSON's non-firm keys (defaultFirmIDs, partnerCredentials) are objects too.
+          if [[ ! "${FIRM_ID}" =~ ^[0-9]+$ ]]; then
+            echo "::error::firm_id must be a numeric firm ID (received ${#FIRM_ID} characters). The authorization code has NOT been used."
+            exit 1
+          fi
+
+          if ! jq -e 'type == "object"' <<< "${CURRENT_CONFIG_JSON}" > /dev/null 2>&1; then
+            echo "::error::the CONFIG_JSON secret is empty or not a single JSON object - nothing to repair against"
+            exit 1
+          fi
+
+          if ! jq -e --arg firm "${FIRM_ID}" '.[$firm] | type == "object"' <<< "${CURRENT_CONFIG_JSON}" > /dev/null 2>&1; then
+            echo "::error::firm ${FIRM_ID} is not present in CONFIG_JSON - refusing to add a new firm through this workflow. Authorize it once through the normal flow first."
+            exit 1
+          fi
+
+          # Before the exchange: a bad app credential would otherwise read as an expired auth code,
+          # and the operator would burn a fresh one for nothing.
+          if [[ -z "${SF_API_CLIENT_ID}" || -z "${SF_API_SECRET}" ]]; then
+            echo "::error::SF_API_CLIENT_ID and/or SF_API_SECRET are not set in this repo's secrets, so the exchange cannot be attempted. The authorization code has NOT been used - this needs the secrets fixed, not a fresh code."
+            exit 1
+          fi
+
+          HOST=$(jq -r '.host // "https://live.getsilverfin.com"' <<< "${CURRENT_CONFIG_JSON}")
+          # The same fixed redirect_uri the CLI sends; --data-urlencode encodes it once below.
+          REDIRECT_URI="urn:ietf:wg:oauth:2.0:oob"
+          # Only the firm ID is encoded here: it goes in the URL path, the rest via --data-urlencode.
+          FIRM_ID_ENC=$(jq -rn --arg v "${FIRM_ID}" '$v|@uri')
+          TOKEN_URL="${HOST}/f/${FIRM_ID_ENC}/oauth/token"
+
+          # POST body, not query string: less likely to end up in a proxy or access log.
+          # `|| true`: a transport failure has no HTTP status and is handled by the check below.
+          HTTP_STATUS=$(curl --request POST --silent --show-error --connect-timeout 10 --max-time 30 \
+            --output /tmp/repair-response.json --write-out '%{http_code}' \
+            --data-urlencode "client_id=${SF_API_CLIENT_ID}" \
+            --data-urlencode "client_secret=${SF_API_SECRET}" \
+            --data-urlencode "redirect_uri=${REDIRECT_URI}" \
+            --data-urlencode "grant_type=authorization_code" \
+            --data-urlencode "code=${AUTH_CODE}" \
+            "${TOKEN_URL}") || true
+
+          # %{http_code} is "000" when there was no response at all.
+          if [[ ! "${HTTP_STATUS}" =~ ^[0-9]{3}$ ]] || [[ "${HTTP_STATUS}" == "000" ]]; then
+            echo "::error::the request to ${HOST} failed before getting an HTTP response (network error, DNS, TLS, or timeout) - confirm that host is reachable and correct"
+            exit 1
+          fi
+
+          if [[ "${HTTP_STATUS}" != "200" ]]; then
+            ERROR_DESCRIPTION=$(jq -r '.error_description // .error // .message // empty' /tmp/repair-response.json 2>/dev/null || echo "response was not valid JSON")
+            # jq prints nothing on an empty body (e.g. a proxy 502), so `//` never fires.
+            if [[ -z "${ERROR_DESCRIPTION}" ]]; then
+              ERROR_DESCRIPTION="no recognisable error detail in the response body"
+            fi
+            # Flattened (\n and \r): server text must not escape the annotation or start a command.
+            ERROR_DESCRIPTION="${ERROR_DESCRIPTION//[$'\n'$'\r']/ }"
+            echo "::error::token exchange failed for firm ${FIRM_ID} (HTTP ${HTTP_STATUS}): ${ERROR_DESCRIPTION}. The auth code is single-use and short-lived - if it was already used or has expired, get a fresh one and start a new dispatch."
+            exit 1
+          fi
+
+          # Type-checked: `jq -r` turns any JSON value into non-empty text.
+          if ! jq -e '
+            (.access_token | (type == "string" and length > 0)) and
+            (.refresh_token | (type == "string" and length > 0))
+          ' /tmp/repair-response.json > /dev/null 2>&1; then
+            echo "::error::token exchange returned HTTP 200 but access_token/refresh_token are missing or not non-empty strings - refusing to write a malformed credential. The authorization code WAS consumed - get a fresh code and start a new dispatch."
+            exit 1
+          fi
+          ACCESS_TOKEN=$(jq -r '.access_token' /tmp/repair-response.json)
+          REFRESH_TOKEN=$(jq -r '.refresh_token' /tmp/repair-response.json)
+          # Line by line, as for the auth code above.
+          for SECRET_VALUE in "${ACCESS_TOKEN}" "${REFRESH_TOKEN}"; do
+            while IFS= read -r LINE; do
+              if [[ -n "${LINE//[[:space:]]/}" && "${#LINE}" -ge 8 ]]; then
+                echo "::add-mask::${LINE}"
+              fi
+            done <<< "${SECRET_VALUE}"
+          done
+
+          # Only these two fields change; everything else is carried through.
+          if ! NEW_CONFIG_JSON=$(jq -c --arg firm "${FIRM_ID}" --arg access "${ACCESS_TOKEN}" --arg refresh "${REFRESH_TOKEN}" \
+            '.[$firm].accessToken = $access | .[$firm].refreshToken = $refresh' <<< "${CURRENT_CONFIG_JSON}"); then
+            echo "::error::could not build the updated CONFIG_JSON blob. The authorization code WAS consumed and a live token pair was issued but not stored - get a fresh code and start a new dispatch."
+            exit 1
+          fi
+          echo "::add-mask::${NEW_CONFIG_JSON}"
+
+          # Retried harder than elsewhere: the auth code is already spent, so giving up costs a new one.
+          MAX_ATTEMPTS=5
+          ATTEMPT=1
+          while true; do
+            if ERR=$(echo "${NEW_CONFIG_JSON}" | gh secret set CONFIG_JSON 2>&1); then
+              break
+            fi
+            # 403 is transient only with rate-limit wording; a plain 403 is a permanent scope failure.
+            IS_TRANSIENT=0
+            if grep -qiE 'HTTP (5[0-9]{2}|429)|timeout|connection reset|EOF|temporary failure|no such host' <<< "${ERR}"; then
+              IS_TRANSIENT=1
+            elif grep -qiE 'HTTP 403' <<< "${ERR}" && grep -qiE 'rate.?limit|retry.?after|abuse detection|try again later' <<< "${ERR}"; then
+              IS_TRANSIENT=1
+            fi
+            if [[ "${IS_TRANSIENT}" -eq 0 ]]; then
+              echo "::error::failed to write CONFIG_JSON (non-transient failure). The authorization code WAS consumed and a live token pair was issued but not stored - get a fresh code and start a new dispatch: ${ERR//[$'\n'$'\r']/ }"
+              exit 1
+            fi
+            if (( ATTEMPT >= MAX_ATTEMPTS )); then
+              echo "::error::failed to write CONFIG_JSON after ${MAX_ATTEMPTS} attempts. The authorization code WAS consumed and a live token pair was issued but not stored - get a fresh code and start a new dispatch: ${ERR//[$'\n'$'\r']/ }"
+              exit 1
+            fi
+            SLEEP=$(( 5 * 2 ** (ATTEMPT - 1) ))
+            echo "::warning::gh secret set CONFIG_JSON failed with a transient error (attempt ${ATTEMPT}/${MAX_ATTEMPTS}), retrying in ${SLEEP}s"
+            sleep "${SLEEP}"
+            ATTEMPT=$((ATTEMPT+1))
+          done
+
+          echo "Firm ${FIRM_ID}'s token pair was repaired and written to CONFIG_JSON."

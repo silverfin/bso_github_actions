@@ -49,11 +49,8 @@ runs:
       uses: actions/setup-node@v6
       with:
         node-version: 22
-    # Pinned to the same reviewed commit push_to_review_firm.yml and run_tests.yml pin their own
-    # CLI install to: this step runs with real Silverfin API credentials and a secret-writable
-    # PAT, so an unpinned install would let a later push to silverfin-cli's default branch alter
-    # credential-handling code with no workflow diff to review. Revert to unpinned once
-    # silverfin-cli#273 merges, same as those two files.
+    # Same pinned CLI commit as the callers: this step holds real API credentials and a
+    # secret-writing PAT. Unpin once silverfin-cli#273 merges.
     - name: Add silverfin-cli package (pinned)
       shell: bash
       run: |
@@ -67,10 +64,8 @@ runs:
       run: |
         mkdir -p "$HOME/.silverfin/"
         printf '%s' "${CONFIG_JSON}" > "$HOME/.silverfin/config.json"
-    # A failing firm must not abort the loop: under `bash -e` the first failure skipped the
-    # write-back below, discarding renewals already made and starving later firms of refreshes.
-    # Record failures and fail the action in a later step instead. Firm IDs are logged on purpose -
-    # they are not secrets, and a caller's alert has to name the firm that was not refreshed.
+    # A failing firm doesn't abort the loop (that would skip refreshing the rest); failures are
+    # recorded and fail the action in a later step. Firm IDs aren't secret and the alert needs them.
     - name: Refresh tokens
       id: refresh
       shell: bash
@@ -90,7 +85,8 @@ runs:
           exit 1
         fi
         echo "EXPECTED_FIRM_IDS=$(tr '\n' ' ' <<< "${FIRM_IDS}")" >> "$GITHUB_ENV"
-        MAX_ERROR_LINE_LEN=200
+        # 260: fits the standard ~228-character invalid_grant description.
+        MAX_ERROR_LINE_LEN=260
         MAX_SUMMARY_LEN=4000
         if [[ "${SEED_NO_AUTO_RENEW}" == "true" ]]; then
           if ARRIVED_WITHOUT=$(jq -r 'to_entries | map(select((.key|test("^[0-9]+$")) and (.value|type == "object") and ((.value.autoRenew|type) != "boolean")) | .key) | join(" ")' "$HOME/.silverfin/config.json"); then
@@ -126,16 +122,20 @@ runs:
         FAILED_SUMMARY=""
         while IFS= read -r FIRM_ID; do
           echo "[Action] refreshing token for firm ${FIRM_ID}"
-          if ! node ./node_modules/silverfin-cli/bin/cli.js config --refresh-token "${FIRM_ID}" 2>&1 | tee /tmp/refresh-"${FIRM_ID}".log; then
+          # To the log file only: the CLI's error path can echo tokens, and only the extracted
+          # ERROR_LINE below is redacted.
+          if ! node ./node_modules/silverfin-cli/bin/cli.js config --refresh-token "${FIRM_ID}" > /tmp/refresh-"${FIRM_ID}".log 2>&1; then
             ERROR_LINE=$(grep -E 'Response Status|Error description' /tmp/refresh-"${FIRM_ID}".log | paste -sd' ' - || true)
             if [[ -z "${ERROR_LINE}" ]]; then
+              # No HTTP response: skip the CLI's generic "Try running the authentication process again"
+              # line and take the useful one after it.
+              ERROR_LINE=$(grep -E '^\[error\]' /tmp/refresh-"${FIRM_ID}".log | grep -v 'Try running the authentication process again' | head -1 || true)
+            fi
+            if [[ -z "${ERROR_LINE}" ]]; then
+              # Last resort: no recognizable [error]/Response Status line at all.
               ERROR_LINE=$(grep -v '^[[:space:]]*$' /tmp/refresh-"${FIRM_ID}".log | tail -1 || true)
             fi
-            # The CLI's own refresh request carries client_secret/refresh_token/access_token, and
-            # its error path can echo the request or response body verbatim (including on the
-            # fallback line above, which is not restricted to a known-safe field) - this line goes
-            # to an external Slack webhook, so redact known-sensitive key/value pairs before it's
-            # ever stored, not just before display.
+            # Redact token-shaped pairs: this line goes to a Slack webhook.
             ERROR_LINE=$(sed -E 's/(client_secret|refresh_token|access_token)("?[[:space:]]*[:=][[:space:]]*"?)[^&"'"'"',[:space:]]+/\1\2[REDACTED]/g; s/(Authorization:[[:space:]]*Bearer[[:space:]]+)[^[:space:]]+/\1[REDACTED]/g' <<< "${ERROR_LINE}")
             if [[ ${#ERROR_LINE} -gt ${MAX_ERROR_LINE_LEN} ]]; then
               ERROR_LINE="${ERROR_LINE:0:${MAX_ERROR_LINE_LEN}}... (truncated, see the job log)"
@@ -158,11 +158,7 @@ runs:
           echo "failed_firms_summary=${FAILED_SUMMARY}"
           echo "refresh_completed=true"
         } >> "$GITHUB_OUTPUT"
-    # `always()`: runs even when the refresh step above failed a firm, so it can see
-    # REFRESH_FAILED_FIRMS and refuse to write rather than being skipped silently. It does NOT mean
-    # "write anyway" - see the REFRESH_FAILED_FIRMS check below for why a partial success no longer
-    # gets written back here (unlike check_auth.yml's own always-write, which is safe because it
-    # has no concurrent sibling writers to race against).
+    # `always()` so a failed firm is seen and the write refused, not skipped silently.
     - name: Prepare and store updated CONFIG_JSON as secret
       id: write-back
       if: always()
@@ -172,28 +168,15 @@ runs:
         GH_REPO: ${{ github.repository }}
       run: |
         if [[ "${REFRESH_COMPLETED}" != "true" ]]; then
-          # Covers both an early abort (before EXPECTED_FIRM_IDS is even set - the CONFIG_JSON
-          # shape check, or no firms found) and a *mid-loop* abort (EXPECTED_FIRM_IDS already set,
-          # but the per-firm loop or the autoRenew-seeding step died before reaching the end and
-          # writing REFRESH_COMPLETED/REFRESH_FAILED_FIRMS) - checking EXPECTED_FIRM_IDS alone
-          # missed the second case, since it's set well before the loop finishes. Not
-          # write_back_failed: the refresh step itself never completed, so no write-back was ever
-          # attempted. A caller checks WRITE_BACK_FAILED before REFRESH_COMPLETED - setting it here
-          # would misreport a refresh failure as "every firm refreshed, but the write failed".
+          # The refresh step didn't finish (early or mid-loop abort). Not write_back_failed: no
+          # write-back was attempted, and callers check that one first.
           echo "::error::[Action] refresh did not complete, refusing to write CONFIG_JSON"
           exit 1
         fi
         if [[ -n "${REFRESH_FAILED_FIRMS}" ]]; then
-          # Concurrent jobs each read their own start-of-run snapshot and each independently
-          # refresh every firm - no concurrency group can cover this (composite actions can't join
-          # one). A firm that failed here almost always means a sibling job already spent this same
-          # refresh token and won; this job's local copy of that firm is now stale, not just
-          # unrefreshed. Writing the rest of this file back anyway would carry that stale entry
-          # along and can overwrite the sibling's good pair if this write lands second - confirmed
-          # 2026-09-07, firm 6056 went permanently dead this way. Skipping the whole write and
-          # deferring to a later successful run (every consumer run attempts a full refresh, so one
-          # is never far away) is the only safe option without a way to re-read the secret's
-          # current value mid-job.
+          # A failed firm almost always means a concurrent job already spent its refresh token, so this
+          # job's copy is stale. Writing back anyway could overwrite the winner's good pair; skip the
+          # write and let the next run refresh.
           echo "::error::[Action] firm(s) ${REFRESH_FAILED_FIRMS} failed to refresh - refusing to write CONFIG_JSON so this job's stale copy of them can't overwrite a fresher pair a concurrent job may have already written"
           exit 1
         fi
