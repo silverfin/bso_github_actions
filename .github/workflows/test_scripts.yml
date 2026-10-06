@@ -1,0 +1,43 @@
+# Runs this repo's own bash test suites (scripts/test/*.test.sh). Not a
+# reusable workflow - market repos don't call it.
+name: test-scripts
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/**'
+      - '.github/workflows/test_scripts.yml'
+
+jobs:
+  test-scripts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Run every scripts/test/*.test.sh
+        shell: bash
+        run: |
+          shopt -s nullglob
+          suites=(scripts/test/*.test.sh)
+          if (( ${#suites[@]} == 0 )); then
+            echo "::error::no scripts/test/*.test.sh found"
+            exit 1
+          fi
+          failed=0
+          for suite in "${suites[@]}"; do
+            echo "::group::${suite}"
+            if bash "${suite}"; then
+              echo "::endgroup::"
+            else
+              echo "::endgroup::"
+              echo "::error::${suite} failed"
+              failed=1
+            fi
+          done
+          exit "${failed}"
