@@ -198,6 +198,8 @@ jobs:
             exit 0
           fi
           gh run rerun "${RERUN_RUN_ID}" --failed --repo "${REPO}"
+          # From here the re-run alerts on its own failure; this helper must not claim it never started.
+          echo "RERUN_STARTED=true" >> "$GITHUB_ENV"
           echo "::notice::Re-running the failed jobs of https://github.com/${REPO}/actions/runs/${RERUN_RUN_ID}"
           # Hold the queue until the re-run's refresh step has finished (it writes CONFIG_JSON back).
           # The re-run is already started and alerts on its own failure, so a problem here only
@@ -207,6 +209,7 @@ jobs:
             sleep 10
             if ! JOB=$(gh api "repos/${REPO}/actions/runs/${RERUN_RUN_ID}/attempts/2/jobs" \
                  --jq '[.jobs[] | select(.name | endswith("test-templates"))][0]'); then
+              echo "could not read the re-run's jobs - retrying"
               continue
             fi
             [[ -z "${JOB}" || "${JOB}" == "null" ]] && continue
@@ -221,7 +224,7 @@ jobs:
       # triggering_actor, not actor: actor stays the bot on a re-run.
       - name: Alert Slack if the re-run could not be started
         if: |
-          (failure() || cancelled()) &&
+          (failure() || cancelled()) && env.RERUN_STARTED != 'true' &&
           (github.triggering_actor == 'github-actions[bot]' || env.REACHED_WAIT == 'true')
         env:
           SLACK: ${{ secrets.SLACK_CI_ALERTS_WEBHOOK_URL }}
