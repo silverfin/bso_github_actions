@@ -148,18 +148,18 @@ test_resolve_fanout_consumers_malformed_config() {
   local actual rc stderr_out
   stderr_out=$(mktemp)
   actual=$(resolve_fanout_consumers "shared_parts/broken_fixture" "$root" 2>"$stderr_out") && rc=0 || rc=$?
-  assert_eq "resolve_fanout_consumers (malformed config.json): exit 0, non-blocking" "0" "$rc"
+  assert_eq "resolve_fanout_consumers (malformed config.json): exit 1, the gate fails loud" "1" "$rc"
   assert_eq "resolve_fanout_consumers (malformed config.json): empty output" "" "$actual"
-  if grep -q "WARN:.*unparseable config.json" "$stderr_out"; then
-    echo "PASS: resolve_fanout_consumers (malformed config.json) warns on stderr"
+  if grep -q "ERROR:.*unparseable config.json" "$stderr_out"; then
+    echo "PASS: resolve_fanout_consumers (malformed config.json) errors on stderr"
   else
-    echo "FAIL: resolve_fanout_consumers (malformed config.json) should warn on stderr, got: $(cat "$stderr_out")"
+    echo "FAIL: resolve_fanout_consumers (malformed config.json) should error on stderr, got: $(cat "$stderr_out")"
     failures=$((failures + 1))
   fi
   rm -f "$stderr_out"
 }
 
-# Regression case: used_in itself is a scalar, not an array (e.g. bad data
+# used_in itself is a scalar, not an array (e.g. bad data
 # from a hand-edit or a partial write). `.used_in[]?` alone swallows this
 # completely - the `?` suppresses jq's own "cannot iterate over string"
 # error, so it exits 0 with empty output and no warning at all, unlike
@@ -179,12 +179,12 @@ JSON
   local actual rc stderr_out
   stderr_out=$(mktemp)
   actual=$(resolve_fanout_consumers "shared_parts/scalar_used_in_fixture" "$root" 2>"$stderr_out") && rc=0 || rc=$?
-  assert_eq "resolve_fanout_consumers (scalar used_in): exit 0, non-blocking" "0" "$rc"
+  assert_eq "resolve_fanout_consumers (scalar used_in): exit 1, the gate fails loud" "1" "$rc"
   assert_eq "resolve_fanout_consumers (scalar used_in): empty output" "" "$actual"
-  if grep -q "WARN:.*unparseable config.json" "$stderr_out"; then
-    echo "PASS: resolve_fanout_consumers (scalar used_in) warns on stderr"
+  if grep -q "ERROR:.*unparseable config.json" "$stderr_out"; then
+    echo "PASS: resolve_fanout_consumers (scalar used_in) errors on stderr"
   else
-    echo "FAIL: resolve_fanout_consumers (scalar used_in) should warn on stderr, got: $(cat "$stderr_out")"
+    echo "FAIL: resolve_fanout_consumers (scalar used_in) should error on stderr, got: $(cat "$stderr_out")"
     failures=$((failures + 1))
   fi
   rm -f "$stderr_out"
@@ -679,6 +679,68 @@ test_cli_github_output_carries_report() {
   rm -f "$github_output"
 }
 
+# nl_market's reconciliation_texts/model_condensed has handle
+# model_profit_loss_condensed; the skill names the doc after the handle.
+test_cli_rt_doc_named_after_handle_not_folder() {
+  local root
+  root=$(new_fixture_root)
+  mkdir -p "$root/reconciliation_texts/model_condensed/template_info"
+  echo '{"handle": "model_profit_loss_condensed"}' > "$root/reconciliation_texts/model_condensed/config.json"
+  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/reconciliation_texts/model_condensed/template_info/model_profit_loss_condensed.md"
+  run_cli "$root" "reconciliation_texts/model_condensed/main.liquid" \
+    "reconciliation_texts/model_condensed/template_info/model_profit_loss_condensed.md"
+  assert_eq "CLI: RT doc named after its config handle passes" "0" "$cli_rc"
+
+  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/reconciliation_texts/model_condensed/template_info/model_condensed.md"
+  run_cli "$root" "reconciliation_texts/model_condensed/main.liquid" \
+    "reconciliation_texts/model_condensed/template_info/model_profit_loss_condensed.md"
+  assert_eq "CLI: an extra folder-named RT doc fails" "1" "$cli_rc"
+  assert_contains "CLI: folder-named RT doc is stray" "template_info/model_condensed.md (expected only" "$cli_out"
+}
+
+test_resolve_fanout_consumers_rt_handle_differs_from_folder() {
+  local root
+  root=$(new_fixture_root)
+  mkdir -p "$root/shared_parts/sp" "$root/reconciliation_texts/model_condensed/template_info"
+  echo '{"used_in":[{"type":"reconciliation","handle":"model_profit_loss_condensed"}]}' > "$root/shared_parts/sp/config.json"
+  echo '{"handle": "model_profit_loss_condensed"}' > "$root/reconciliation_texts/model_condensed/config.json"
+  echo '# doc' > "$root/reconciliation_texts/model_condensed/template_info/model_profit_loss_condensed.md"
+  assert_eq "resolve_fanout_consumers finds an RT whose folder differs from its handle" \
+    "reconciliation_texts/model_condensed" "$(resolve_fanout_consumers "shared_parts/sp" "$root" 2>/dev/null)"
+}
+
+test_cli_malformed_shared_part_config_fails() {
+  local root
+  root=$(new_fixture_root)
+  mkdir -p "$root/shared_parts/broken"
+  printf '{ not json' > "$root/shared_parts/broken/config.json"
+  run_cli "$root" "shared_parts/broken/broken.liquid"
+  assert_eq "CLI: unparseable shared-part config fails the gate" "1" "$cli_rc"
+  assert_contains "CLI: names the unparseable config" "shared_parts/broken has an unparseable config.json" "$cli_out"
+}
+
+test_cli_deleting_only_the_doc_fails() {
+  local root deleted_file rc out
+  root=$(new_fixture_root)
+  mkdir -p "$root/reconciliation_texts/vol_1"
+  printf '' > "$SCRIPT_DIR/fixtures/changed-files-deleted-only.txt"
+  deleted_file="$SCRIPT_DIR/fixtures/changed-files-deleted.txt"
+  printf '%s\n' "reconciliation_texts/vol_1/template_info/vol_1.md" > "$deleted_file"
+  out=$(bash "$SCRIPT_DIR/../check-template-docs.sh" "$SCRIPT_DIR/fixtures/changed-files-deleted-only.txt" "$root" "$deleted_file" 2>&1) && rc=0 || rc=$?
+  assert_eq "CLI: deleting only the doc fails" "1" "$rc"
+  assert_contains "CLI: deleted doc is reported as missing" "reconciliation_texts/vol_1/template_info/vol_1.md" "$out"
+}
+
+test_cli_deleting_a_whole_template_passes() {
+  local root deleted_file rc
+  root=$(new_fixture_root)
+  printf '' > "$SCRIPT_DIR/fixtures/changed-files-deleted-only.txt"
+  deleted_file="$SCRIPT_DIR/fixtures/changed-files-deleted.txt"
+  printf '%s\n' "reconciliation_texts/gone/main.liquid" "reconciliation_texts/gone/template_info/gone.md" > "$deleted_file"
+  bash "$SCRIPT_DIR/../check-template-docs.sh" "$SCRIPT_DIR/fixtures/changed-files-deleted-only.txt" "$root" "$deleted_file" > /dev/null 2>&1 && rc=0 || rc=$?
+  assert_eq "CLI: deleting a whole template needs no doc" "0" "$rc"
+}
+
 test_extract_template_dirs
 test_extract_template_dirs_with_spaces_and_metacharacters
 test_extract_shared_part_dirs
@@ -715,6 +777,11 @@ test_cli_account_template_with_trailing_space_and_metacharacters
 test_cli_validates_changed_doc_structure
 test_cli_unreadable_changed_files
 test_cli_github_output_carries_report
+test_cli_rt_doc_named_after_handle_not_folder
+test_resolve_fanout_consumers_rt_handle_differs_from_folder
+test_cli_malformed_shared_part_config_fails
+test_cli_deleting_only_the_doc_fails
+test_cli_deleting_a_whole_template_passes
 
 if [[ $failures -gt 0 ]]; then
   echo "$failures test(s) failed"

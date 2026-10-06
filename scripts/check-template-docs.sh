@@ -27,13 +27,39 @@ extract_shared_part_dirs() {
     | sort -u
 }
 
-# $1 = template dir (e.g. reconciliation_texts/vol_1). Prints the path of its
-# template-specific md, as written by silverfin-uni-create-template-specific-md:
-# <dir>/template_info/<handle>.md. For an account template the "handle" is the
+# $1 = template dir (e.g. reconciliation_texts/vol_1), $2 = optional repo_root.
+# Prints the path of its template-specific md, as written by
+# silverfin-uni-create-template-specific-md: <dir>/template_info/<handle>.md.
+# A reconciliation text's handle comes from its config.json (the folder can
+# differ, e.g. nl_market's model_condensed); an account template's is its
 # folder name, verbatim (spaces, accents, trailing space and all).
 doc_path_for_dir() {
-  local dir="$1"
-  printf '%s/template_info/%s.md\n' "$dir" "${dir#*/}"
+  local dir="$1" repo_root="${2:-}" name="${1#*/}"
+  if [[ "$dir" == reconciliation_texts/* && -n "$repo_root" && -f "$repo_root/$dir/config.json" ]]; then
+    local handle
+    handle=$(jq -r '.handle | strings' "$repo_root/$dir/config.json" 2>/dev/null) || handle=""
+    if [[ -n "$handle" && "$handle" != */* ]]; then
+      name="$handle"
+    fi
+  fi
+  printf '%s/template_info/%s.md\n' "$dir" "$name"
+}
+
+# $1 = reconciliation text handle, $2 = repo_root. Prints its folder
+# (reconciliation_texts/<x>). Usually the folder is the handle; otherwise it
+# is found by config.json. Prints nothing when no folder (or several) match.
+resolve_rt_dir() {
+  local handle="$1" repo_root="$2"
+  if [[ -f "$repo_root/reconciliation_texts/$handle/config.json" ]]; then
+    printf 'reconciliation_texts/%s\n' "$handle"
+    return 0
+  fi
+  local matches
+  matches=$(cd "$repo_root" && jq -r --arg h "$handle" 'select(.handle == $h) | input_filename' reconciliation_texts/*/config.json 2>/dev/null) || matches=""
+  if [[ -n "$matches" && "$matches" != *$'\n'* ]]; then
+    printf '%s\n' "${matches%/config.json}"
+  fi
+  return 0
 }
 
 # $1 = shared part dir (e.g. shared_parts/be_legal), relative to $2 = repo_root.
@@ -72,15 +98,16 @@ resolve_fanout_consumers() {
       error("used_in must be an array")
     end
   ' "$config_path" 2>&1); then
-    echo "WARN: $shared_part_dir has an unparseable config.json (jq failed: $jq_output), skipping fan-out" >&2
-    return 0
+    # A gate must not pass because it could not work out what to check.
+    echo "ERROR: $shared_part_dir has an unparseable config.json (jq failed: $jq_output) - cannot tell which consumer docs are required" >&2
+    return 1
   fi
 
   local results=()
   if [[ -n "$jq_output" ]]; then
     local type handle
     while IFS=$'\t' read -r type handle; do
-      if [[ "$handle" == "null" || -z "$handle" ]]; then
+      if [[ "$handle" == "null" || -z "$handle" || "$handle" == */* ]]; then
         echo "WARN: $shared_part_dir used_in has a $type entry with no handle (common for account templates) - cannot resolve automatically, skipping" >&2
         continue
       fi
@@ -92,7 +119,13 @@ resolve_fanout_consumers() {
       # Not a rare case: reconciliation outnumbers reconciliationText in
       # be_market's committed shared_parts/*/config.json (495 vs 268).
       case "$type" in
-        reconciliationText|reconciliation|reconciliation_text) dir="reconciliation_texts/$handle" ;;
+        reconciliationText|reconciliation|reconciliation_text)
+          dir=$(resolve_rt_dir "$handle" "$repo_root")
+          if [[ -z "$dir" ]]; then
+            echo "WARN: $shared_part_dir used_in names reconciliation text '$handle', which matches no single folder, skipping" >&2
+            continue
+          fi
+          ;;
         accountTemplate|account_detail_template|account_template) dir="account_templates/$handle" ;;
         *)
           echo "WARN: $shared_part_dir used_in has unknown type '$type', skipping" >&2
@@ -100,7 +133,7 @@ resolve_fanout_consumers() {
           ;;
       esac
       local doc
-      doc=$(doc_path_for_dir "$dir")
+      doc=$(doc_path_for_dir "$dir" "$repo_root")
       if [[ -f "$repo_root/$doc" ]]; then
         results+=("$dir")
       fi
@@ -126,15 +159,18 @@ compute_expected_docs() {
   local results=()
   while IFS= read -r dir; do
     [[ -z "$dir" ]] && continue
-    results+=("$(doc_path_for_dir "$dir")")
+    results+=("$(doc_path_for_dir "$dir" "$repo_root")")
   done <<< "$template_dirs"
 
+  local consumers
   while IFS= read -r sp_dir; do
     [[ -z "$sp_dir" ]] && continue
+    # Captured, not `< <(...)`: a process substitution hides the failure.
+    consumers=$(resolve_fanout_consumers "$sp_dir" "$repo_root") || return 1
     while IFS= read -r consumer_dir; do
       [[ -z "$consumer_dir" ]] && continue
-      results+=("$(doc_path_for_dir "$consumer_dir")")
-    done < <(resolve_fanout_consumers "$sp_dir" "$repo_root")
+      results+=("$(doc_path_for_dir "$consumer_dir" "$repo_root")")
+    done <<< "$consumers"
   done <<< "$shared_part_dirs"
 
   (( ${#results[@]} )) && printf '%s\n' "${results[@]}" | sort -u
@@ -233,12 +269,10 @@ find_stray_docs() {
   [[ -d "$info_dir" ]] || return 0
 
   local expected found
-  expected="$repo_root/$(doc_path_for_dir "$dir")"
-  # find's own status checked separately: a read error must not look like
-  # "no stray docs".
+  expected="$repo_root/$(doc_path_for_dir "$dir" "$repo_root")"
   if ! found=$(find "$info_dir" -type f -iname '*.md' -print); then
-    echo "$dir/template_info (could not be listed)"
-    return 0
+    echo "ERROR: could not list $dir/template_info" >&2
+    return 1
   fi
   local path
   while IFS= read -r path; do
@@ -250,12 +284,13 @@ find_stray_docs() {
 # CLI entrypoint - only runs when this file is executed directly, not when sourced.
 main() {
   if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <changed_files_path> <repo_root>" >&2
+    echo "Usage: $0 <changed_files_path> <repo_root> [deleted_files_path]" >&2
     return 1
   fi
 
   local changed_files_path="$1"
   local repo_root="$2"
+  local deleted_files_path="${3:-}"
 
   if [[ ! -r "$changed_files_path" ]]; then
     echo "ERROR: changed-files list '$changed_files_path' is missing or unreadable" >&2
@@ -266,11 +301,28 @@ main() {
     return 1
   fi
 
-  local expected_path
+  if [[ -n "$deleted_files_path" && ! -r "$deleted_files_path" ]]; then
+    echo "ERROR: deleted-files list '$deleted_files_path' is unreadable" >&2
+    return 1
+  fi
+
+  # Templates touched = changed files, plus deletions inside a template that
+  # still exists (deleting only the doc must not pass). Deletions never count
+  # as updating a doc: find_missing compares against changed files only.
+  local touched_path expected_path
+  touched_path=$(mktemp)
   expected_path=$(mktemp)
   # shellcheck disable=SC2064
-  trap "rm -f '$expected_path'" RETURN
-  compute_expected_docs "$changed_files_path" "$repo_root" > "$expected_path"
+  trap "rm -f '$touched_path' '$expected_path'" RETURN
+  cat "$changed_files_path" > "$touched_path"
+  if [[ -n "$deleted_files_path" ]]; then
+    local deleted deleted_dir
+    while IFS= read -r deleted; do
+      deleted_dir=$(extract_template_dirs <<< "$deleted")
+      [[ -n "$deleted_dir" && -d "$repo_root/$deleted_dir" ]] && printf '%s\n' "$deleted" >> "$touched_path"
+    done < "$deleted_files_path"
+  fi
+  compute_expected_docs "$touched_path" "$repo_root" > "$expected_path"
 
   local missing
   missing=$(find_missing "$expected_path" "$changed_files_path")
@@ -294,20 +346,23 @@ main() {
     # template-root README.md (developer notes) are not template docs at all.
     [[ "$changed" =~ ^((reconciliation_texts|account_templates)/[^/]+)/template_info/ ]] || continue
     dir="${BASH_REMATCH[1]}"
-    [[ "$changed" == "$(doc_path_for_dir "$dir")" ]] || continue
+    [[ "$changed" == "$(doc_path_for_dir "$dir" "$repo_root")" ]] || continue
     [[ -f "$repo_root/$changed" ]] || continue
     errors=$(validate_doc_structure "$repo_root/$changed") || invalid+=("$changed: $errors")
   done < "$changed_files_path"
 
   local stray=()
   local template_dirs stray_out
-  template_dirs=$(extract_template_dirs < "$changed_files_path")
+  template_dirs=$(extract_template_dirs < "$touched_path")
   while IFS= read -r dir; do
     [[ -z "$dir" ]] && continue
-    stray_out=$(find_stray_docs "$dir" "$repo_root")
+    if ! stray_out=$(find_stray_docs "$dir" "$repo_root"); then
+      invalid+=("$dir/template_info: could not be listed")
+      continue
+    fi
     [[ -z "$stray_out" ]] && continue
     while IFS= read -r doc; do
-      stray+=("$doc (expected only $(doc_path_for_dir "$dir"))")
+      stray+=("$doc (expected only $(doc_path_for_dir "$dir" "$repo_root"))")
     done <<< "$stray_out"
   done <<< "$template_dirs"
 
@@ -325,7 +380,7 @@ main() {
     invalid_report+=$(printf '%s\n' "${invalid[@]}" | sed 's/^/  - /')$'\n'
   fi
   if (( ${#stray[@]} )); then
-    invalid_report+="These files in template_info/ are misnamed or extra - one <handle>.md per template, named exactly after the template folder:"$'\n'
+    invalid_report+="These files in template_info/ are misnamed or extra - one <handle>.md per template (an account template's handle is its folder name):"$'\n'
     invalid_report+=$(printf '  - %s\n' "${stray[@]}")$'\n'
   fi
 

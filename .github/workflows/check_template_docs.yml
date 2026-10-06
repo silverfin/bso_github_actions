@@ -44,19 +44,23 @@ jobs:
           files: |
             **/**.{liquid,yml,yaml,json,md,MD,Md,mD}
 
-      - name: Write changed files to a plain list
+      - name: Write changed and deleted files to plain lists
         env:
           # Passed via env (not inlined into the shell body), so a path with quotes/spaces/
           # metacharacters cannot break the script or be interpreted as shell syntax.
           ALL_CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
+          DELETED_FILES: ${{ steps.changed-files.outputs.deleted_files }}
         run: |
-          # Fail loudly if the changed-files output is not valid JSON. A silent jq failure
-          # here would empty the changed-files list and let every template through unchecked.
-          if ! printf '%s' "${ALL_CHANGED_FILES:-[]}" | jq -e . > /dev/null; then
-            echo "::error::changed-files output is not valid JSON, refusing to skip the check silently"
-            exit 1
-          fi
+          # Fail loudly if either output is not valid JSON. A silent jq failure here would
+          # empty a list and let templates through unchecked.
+          for VAR in ALL_CHANGED_FILES DELETED_FILES; do
+            if ! printf '%s' "${!VAR:-[]}" | jq -e 'type == "array"' > /dev/null; then
+              echo "::error::changed-files ${VAR} output is not a JSON array, refusing to skip the check silently"
+              exit 1
+            fi
+          done
           printf '%s' "${ALL_CHANGED_FILES:-[]}" | jq -r '.[]' > /tmp/changed_files.txt
+          printf '%s' "${DELETED_FILES:-[]}" | jq -r '.[]' > /tmp/deleted_files.txt
 
       - name: Fetch check-template-docs.sh
         run: |
@@ -67,7 +71,7 @@ jobs:
         id: check-template-docs
         env:
           REPO_ROOT: ${{ github.workspace }}
-        run: bash /tmp/check-template-docs.sh /tmp/changed_files.txt "${REPO_ROOT}"
+        run: bash /tmp/check-template-docs.sh /tmp/changed_files.txt "${REPO_ROOT}" /tmp/deleted_files.txt
 
       - name: Summarize failures
         if: failure()
@@ -75,6 +79,12 @@ jobs:
           MISSING_DOCS: ${{ steps.check-template-docs.outputs.missing_docs }}
           INVALID_DOCS: ${{ steps.check-template-docs.outputs.invalid_docs }}
         run: |
+          # Both empty means the check never produced a report (fetch, input or script
+          # error), not that nothing is wrong.
+          if [[ -z "${MISSING_DOCS}${INVALID_DOCS}" ]]; then
+            echo "### Template docs check did not complete - see the step log" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           {
             echo "### Missing template-specific mds"
             printf '%s\n' "${MISSING_DOCS:-none}"
