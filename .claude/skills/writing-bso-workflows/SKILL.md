@@ -12,11 +12,8 @@ getting introduced in new workflow files, then caught in review, over and over -
 file that gets the pattern right in one step and wrong in the next step of the *same* diff.
 This skill is the checklist to apply BEFORE writing, so the reviewer doesn't have to.
 
-**Also read `.cursor/review-learnings/_syntax.md` in full** - it holds the platform-mechanics
-facts (GITHUB_OUTPUT limits, workflow_call boundaries, etc.) this skill builds on, kept there
-instead of duplicated here. If you're editing a workflow that already has its own topic file
-under `.cursor/review-learnings/` (check `INDEX.md`), read that file too - it has the specific
-history for that exact file.
+If `.cursor/review-learnings/_syntax.md` exists locally (it is not tracked in this repo),
+read it and the topic file for the workflow you're editing (see its `INDEX.md`).
 
 ## The checklist
 
@@ -73,8 +70,7 @@ history for that exact file.
      X=$(tr ... <<< "$X")
      ```
      Put `set -e` **immediately** after `RC=$?`. A follow-up `tr`/`sed` still inside the
-     `set +e` block (the residual after `run_sampler.yml`'s first RC-capture fix, be_market#3178
-     / this repo's #53) can fail silently, empty `X`, and skip a later text match while `RC`
+     `set +e` block can fail silently, empty `X`, and skip a later text match while `RC`
      still looks like `cmd1`'s. A single capture can use `RC=0; X=$(cmd1) || RC=$?` instead of
      the `set +e`/`set -e` pair - use `set +e ... set -e` only when you capture or check every
      command's status before re-enabling `-e`, not just the one you care about.
@@ -133,8 +129,8 @@ history for that exact file.
 
    **A guard that looks for other writers has to count its own workflow.** A run-listing check
    that names the *other* writers but not itself lets two dispatches of the same workflow pass
-   each other, and the second reverts the first. Match on `$GITHUB_WORKFLOW` (not a hand-copied
-   literal name) and exclude only your own run id. Two shapes are fatal, not one: a writer still
+   each other, and the second reverts the first. Identify your own workflow by filename (see
+   checklist 15) and exclude only your own run id. Two shapes are fatal, not one: a writer still
    in flight, **and** a writer that already completed *after* your run was queued - the latter is
    the one a naive `status != "completed"` filter misses, and it is precisely the write you are
    about to revert. Size any `gh run list --limit` against the longest writer's wall-clock, not a
@@ -178,18 +174,16 @@ history for that exact file.
      still matches once that migration lands.
 
 8. **A new reusable workflow needs a README.md entry** (Individual Action Documentation
-   section) - repo convention since #24, and README drift on this file is treated as a real
+   section) - README drift on this file is treated as a real
    regression here, not a nit.
 
 9. **A market repo consumes this repo's workflows one of three ways - know which before
    assuming a merge here reaches it:**
    - **`uses: .../X.yml@main`** - the default. Confirmed across all 4 market repos (be/nl/lu/uk)
-     for every wrapper except the two cases below. **A merge to `main` reaches this caller on
+     for every wrapper. **A merge to `main` reaches this caller on
      its very next run** - no gradual rollout, no opt-out short of the caller pinning itself.
-   - **`uses: .../X.yml@<sha>`** - pinned. Only be_market's `check_auth.yml`/
-     `refresh-config-json`, deliberately isolating the CI-auth pilot (see silverfin-cli's
-     `CI_AUTH_SAMPLER_PLAN.md`). A merge here does NOT reach that caller until its pin is
-     bumped.
+   - **`uses: .../X.yml@<sha>`** - pinned. A merge here does NOT reach that caller until its
+     pin is bumped. Check the caller for a pin before assuming it tracks `main`.
    - **Fully forked/inlined - no `uses:` reference at all.** Two shapes, both live: a permanent
      local reimplementation (be_market's `run_tests.yml`) and a *temporary* inlined copy carried
      while something upstream settles (`run_sampler.yml`, inlined in be/nl/lu - so that file
@@ -423,8 +417,8 @@ history for that exact file.
 | Only the first line of a multi-line secret ends up masked | `::add-mask::` is a line-based command; `inputs.*` isn't auto-masked | Register one mask per line |
 | An `::error::` annotation trails off mid-sentence | Server-controlled text contained a newline; the rest fell out of the annotation | Flatten to one line before interpolating |
 | A `jq -r '.x // "fallback"'` fallback silently didn't apply | Empty response body - jq exits 0 printing nothing, so `//` never fires | Also `-z`-check the captured result |
-| Two runs of the same workflow reverted each other's secret write | The writer-guard listed the *other* writers but not itself | Match `$GITHUB_WORKFLOW` too, excluding only your own run id |
-| A required check went green on a run that tested nothing | A job feeding it was `skipped` (upstream failed), and `skipped` passes branch protection | `if: !cancelled()` plus a fail-if-upstream-failed first step - see checklist 12 |
+| Two runs of the same workflow reverted each other's secret write | The writer-guard listed the *other* writers but not itself | Include your own workflow by filename, excluding only your own run id - see checklist 15 |
+| A required check went green on a run that tested nothing | A job feeding it was `skipped` (upstream failed), and `skipped` passes branch protection | `if: always()` plus a fail-if-upstream-failed guard step - see checklist 12 |
 | A `workflow_dispatch` input arrived empty despite `required: true` | `required` is a presence check, not a non-empty one; empty then falls through an `&&/||` ternary to the next branch | Validate the input's shape in a first step (e.g. `^[0-9a-f]{40}$` for a SHA) |
 | `tj-actions/changed-files` started hard-failing on `push`/`pull_request` after a retry fix | `fail_on_initial_diff_error` is global, not per-event - a force-pushed `event.before` or a rebased PR base is now fatal too | Intended, but document it and test both paths, not just the one you added it for |
 | Cancelling a run left a required check *passing* | The job carried `if: !cancelled()`, so it reported `skipped` (passes) instead of `cancelled` (blocks) | `always()` plus a guard step - see checklist 12 |
