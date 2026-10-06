@@ -84,13 +84,15 @@ jobs:
   # own failure, since the losing run's alert was suppressed.
   rerun-losing-run:
     if: github.event_name == 'workflow_dispatch'
-    # Serialises duplicate helpers for one run.
+    # One queue per repo, so losers from one burst are re-run one after another: each helper holds
+    # the queue until its re-run has written CONFIG_JSON back, and the next re-run's secret
+    # snapshot is taken after that. `queue: max` keeps every waiting helper (a bare group keeps one).
     concurrency:
-      group: rerun-losing-run-${{ github.event.inputs.rerun_run_id }}
-      cancel-in-progress: false
+      group: rerun-losing-run
+      queue: max
     runs-on: ubuntu-latest
-    # The loser finishes within minutes; the wait below is capped at 15.
-    timeout-minutes: 20
+    # Up to 15 min waiting for the loser, then up to 10 for its re-run's refresh.
+    timeout-minutes: 30
     # actions: write only. Anything the caller's job doesn't grant fails the whole run at startup.
     permissions:
       actions: write
@@ -167,9 +169,6 @@ jobs:
               exit 1
               ;;
           esac
-          # Losers from one burst finish together; jitter so their re-runs don't snapshot the same
-          # CONFIG_JSON and race again.
-          sleep $((RANDOM % 45))
           # Retried, not skipped: re-running on a stale read could duplicate a hand re-run.
           ATTEMPT=""
           for _ in 1 2 3; do
@@ -180,11 +179,11 @@ jobs:
             sleep 5
           done
           if [[ -z "${ATTEMPT}" ]]; then
-            echo "::error::could not re-read run ${RERUN_RUN_ID} after the jitter - not re-running it"
+            echo "::error::could not re-read run ${RERUN_RUN_ID} before re-running it - not re-running it"
             exit 1
           fi
           if [[ "${ATTEMPT}" != "1" ]]; then
-            echo "::notice::run ${RERUN_RUN_ID} was already re-run during the jitter - leaving it alone"
+            echo "::notice::run ${RERUN_RUN_ID} was already re-run in the meantime - leaving it alone"
             exit 0
           fi
           # The run's pull_requests lists only open PRs, with their current head: none means
@@ -199,12 +198,33 @@ jobs:
             exit 0
           fi
           gh run rerun "${RERUN_RUN_ID}" --failed --repo "${REPO}"
+          # From here the re-run alerts on its own failure; this helper must not claim it never started.
+          echo "RERUN_STARTED=true" >> "$GITHUB_ENV"
           echo "::notice::Re-running the failed jobs of https://github.com/${REPO}/actions/runs/${RERUN_RUN_ID}"
+          # Hold the queue until the re-run's refresh step has finished (it writes CONFIG_JSON back).
+          # The re-run is already started and alerts on its own failure, so a problem here only
+          # warns: the next helper then just goes ahead, as it did before this wait existed.
+          DEADLINE=$(( $(date +%s) + 600 ))
+          while (( $(date +%s) < DEADLINE )); do
+            sleep 10
+            if ! JOB=$(gh api "repos/${REPO}/actions/runs/${RERUN_RUN_ID}/attempts/2/jobs" \
+                 --jq '[.jobs[] | select(.name | endswith("test-templates"))][0]'); then
+              echo "could not read the re-run's jobs - retrying"
+              continue
+            fi
+            [[ -z "${JOB}" || "${JOB}" == "null" ]] && continue
+            if [[ "$(jq -r '.status' <<< "${JOB}")" == "completed" ]] \
+               || jq -e '[.steps[]? | select(.name == "Refresh CONFIG_JSON" and .status == "completed")] | length > 0' <<< "${JOB}" > /dev/null; then
+              echo "Re-run's refresh is done - releasing the queue"
+              exit 0
+            fi
+          done
+          echo "::warning::re-run's refresh didn't finish within 10 minutes - releasing the queue anyway"
       # Bot-dispatched helpers always page; a hand dispatch only pages past validation.
       # triggering_actor, not actor: actor stays the bot on a re-run.
       - name: Alert Slack if the re-run could not be started
         if: |
-          (failure() || cancelled()) &&
+          (failure() || cancelled()) && env.RERUN_STARTED != 'true' &&
           (github.triggering_actor == 'github-actions[bot]' || env.REACHED_WAIT == 'true')
         env:
           SLACK: ${{ secrets.SLACK_CI_ALERTS_WEBHOOK_URL }}
