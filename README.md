@@ -262,7 +262,7 @@ sees). Markets switch to it one at a time; once all have, it replaces `run_tests
 _Differences from `run_tests.yml`:_
 
 * Refreshes tokens inline via the `refresh-config-json` action, seeding `autoRenew: false`, and blanks the refresh token on disk before tests run
-* If a concurrent run wins a refresh race, the losing PR run's failed jobs are re-run once (`retry-on-race` dispatches a small helper run that waits for the losing run to finish, then re-runs it). A re-run counts for the PR's required check and reads the fresh token; Slack is alerted only if that fails
+* If a concurrent run wins a refresh race, the losing PR run's failed jobs are re-run once (`retry-on-race` dispatches a small helper run that waits for the losing run to finish, then re-runs it; helpers take turns per repo, so two losers from one burst can't race each other again). A re-run counts for the PR's required check and reads the fresh token; Slack is alerted only if that fails
 * `test-templates` always runs, so the required check fails rather than passing as skipped when change detection fails or the run is cancelled
 * A push to main diffs against the previous main commit (not `main` itself), so post-merge runs actually test something
 * The silverfin-cli install happens outside the PR checkout
