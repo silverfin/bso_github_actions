@@ -20,7 +20,7 @@ test_extract_template_dirs() {
   local input
   input=$(printf '%s\n' \
     "reconciliation_texts/foo/main.liquid" \
-    "reconciliation_texts/foo/README.md" \
+    "reconciliation_texts/foo/template_info/foo.md" \
     "reconciliation_texts/bar/config.json" \
     "account_templates/Baz/main.liquid" \
     "shared_parts/qux/qux.liquid" \
@@ -66,9 +66,9 @@ setup_shared_part_consumers_fixture() {
   local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
   rm -rf "$root"
   mkdir -p "$root/shared_parts/be_legal_fixture"
-  mkdir -p "$root/reconciliation_texts/vol_1_fixture"
-  mkdir -p "$root/reconciliation_texts/vol_2_fixture"
-  mkdir -p "$root/account_templates/AT_fixture"
+  mkdir -p "$root/reconciliation_texts/vol_1_fixture/template_info"
+  mkdir -p "$root/reconciliation_texts/vol_2_fixture/template_info"
+  mkdir -p "$root/account_templates/AT_fixture/template_info"
 
   cat > "$root/shared_parts/be_legal_fixture/config.json" << 'JSON'
 {
@@ -83,12 +83,12 @@ setup_shared_part_consumers_fixture() {
 JSON
 
   echo '{}' > "$root/reconciliation_texts/vol_1_fixture/config.json"
-  echo '# Vol 1' > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  echo '# Vol 1' > "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md"
   echo '{}' > "$root/reconciliation_texts/vol_2_fixture/config.json"
-  # vol_2_fixture deliberately has no README.md
+  # vol_2_fixture deliberately has no template-specific md
 
   echo '{}' > "$root/account_templates/AT_fixture/config.json"
-  echo '# AT Fixture' > "$root/account_templates/AT_fixture/README.md"
+  echo '# AT Fixture' > "$root/account_templates/AT_fixture/template_info/AT_fixture.md"
 }
 
 # Regression case: a changed path with a space AND a shell metacharacter
@@ -116,7 +116,7 @@ test_resolve_fanout_consumers() {
   expected=$(printf '%s\n' \
     "account_templates/AT_fixture" \
     "reconciliation_texts/vol_1_fixture")
-  assert_eq "resolve_fanout_consumers (existing-README only, null handle skipped)" "$expected" "$actual"
+  assert_eq "resolve_fanout_consumers (existing-doc only, null handle skipped)" "$expected" "$actual"
 }
 
 test_resolve_fanout_consumers_empty_result() {
@@ -194,10 +194,10 @@ test_resolve_fanout_consumers_legacy_type_aliases() {
   local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
   rm -rf "$root"
   mkdir -p "$root/shared_parts/legacy_types_fixture"
-  mkdir -p "$root/reconciliation_texts/legacy_rt_fixture"
-  mkdir -p "$root/reconciliation_texts/legacy_rt2_fixture"
-  mkdir -p "$root/account_templates/legacy_at_fixture"
-  mkdir -p "$root/account_templates/legacy_at2_fixture"
+  mkdir -p "$root/reconciliation_texts/legacy_rt_fixture/template_info"
+  mkdir -p "$root/reconciliation_texts/legacy_rt2_fixture/template_info"
+  mkdir -p "$root/account_templates/legacy_at_fixture/template_info"
+  mkdir -p "$root/account_templates/legacy_at2_fixture/template_info"
 
   cat > "$root/shared_parts/legacy_types_fixture/config.json" << 'JSON'
 {
@@ -212,13 +212,13 @@ test_resolve_fanout_consumers_legacy_type_aliases() {
 JSON
 
   echo '{}' > "$root/reconciliation_texts/legacy_rt_fixture/config.json"
-  echo '# Legacy RT' > "$root/reconciliation_texts/legacy_rt_fixture/README.md"
+  echo '# Legacy RT' > "$root/reconciliation_texts/legacy_rt_fixture/template_info/legacy_rt_fixture.md"
   echo '{}' > "$root/reconciliation_texts/legacy_rt2_fixture/config.json"
-  echo '# Legacy RT 2' > "$root/reconciliation_texts/legacy_rt2_fixture/README.md"
+  echo '# Legacy RT 2' > "$root/reconciliation_texts/legacy_rt2_fixture/template_info/legacy_rt2_fixture.md"
   echo '{}' > "$root/account_templates/legacy_at_fixture/config.json"
-  echo '# Legacy AT' > "$root/account_templates/legacy_at_fixture/README.md"
+  echo '# Legacy AT' > "$root/account_templates/legacy_at_fixture/template_info/legacy_at_fixture.md"
   echo '{}' > "$root/account_templates/legacy_at2_fixture/config.json"
-  echo '# Legacy AT 2' > "$root/account_templates/legacy_at2_fixture/README.md"
+  echo '# Legacy AT 2' > "$root/account_templates/legacy_at2_fixture/template_info/legacy_at2_fixture.md"
 
   local actual
   actual=$(resolve_fanout_consumers "shared_parts/legacy_types_fixture" "$root" 2>/dev/null)
@@ -231,7 +231,7 @@ JSON
   assert_eq "resolve_fanout_consumers (pre-migration type aliases: reconciliation, reconciliation_text, account_detail_template, account_template)" "$expected" "$actual"
 }
 
-test_compute_expected_readmes() {
+test_compute_expected_docs() {
   setup_shared_part_consumers_fixture
   local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
   local changed
@@ -239,31 +239,31 @@ test_compute_expected_readmes() {
     "shared_parts/be_legal_fixture/be_legal_fixture.liquid" \
     "reconciliation_texts/vol_1_fixture/main.liquid")
   local actual
-  actual=$(compute_expected_readmes <(echo "$changed") "$root" 2>/dev/null)
+  actual=$(compute_expected_docs <(echo "$changed") "$root" 2>/dev/null)
   local expected
   expected=$(printf '%s\n' \
-    "account_templates/AT_fixture/README.md" \
-    "reconciliation_texts/vol_1_fixture/README.md")
-  assert_eq "compute_expected_readmes" "$expected" "$actual"
+    "account_templates/AT_fixture/template_info/AT_fixture.md" \
+    "reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md")
+  assert_eq "compute_expected_docs" "$expected" "$actual"
 }
 
-test_compute_expected_readmes_empty_input() {
+test_compute_expected_docs_empty_input() {
   setup_shared_part_consumers_fixture
   local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
   local changed
   changed=$(printf '%s\n' "docs/README.md" ".github/workflows/foo.yml")
   local actual rc
-  actual=$(compute_expected_readmes <(echo "$changed") "$root" 2>/dev/null) && rc=0 || rc=$?
-  assert_eq "compute_expected_readmes (empty input): exit 0" "0" "$rc"
-  assert_eq "compute_expected_readmes (empty input): empty output" "" "$actual"
+  actual=$(compute_expected_docs <(echo "$changed") "$root" 2>/dev/null) && rc=0 || rc=$?
+  assert_eq "compute_expected_docs (empty input): exit 0" "0" "$rc"
+  assert_eq "compute_expected_docs (empty input): empty output" "" "$actual"
 }
 
 test_find_missing() {
   local expected changed actual
-  expected=$(printf '%s\n' "account_templates/AT_fixture/README.md" "reconciliation_texts/vol_1_fixture/README.md")
-  changed=$(printf '%s\n' "reconciliation_texts/vol_1_fixture/README.md" "reconciliation_texts/vol_1_fixture/main.liquid")
+  expected=$(printf '%s\n' "account_templates/AT_fixture/template_info/AT_fixture.md" "reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md")
+  changed=$(printf '%s\n' "reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md" "reconciliation_texts/vol_1_fixture/main.liquid")
   actual=$(find_missing <(echo "$expected") <(echo "$changed"))
-  assert_eq "find_missing" "account_templates/AT_fixture/README.md" "$actual"
+  assert_eq "find_missing" "account_templates/AT_fixture/template_info/AT_fixture.md" "$actual"
 }
 
 test_find_missing_unreadable_input() {
@@ -281,16 +281,16 @@ test_find_missing_unreadable_input() {
   rm -f "$stderr_out"
 }
 
-test_validate_readme_structure_valid() {
+test_validate_doc_structure_valid() {
   local out rc
-  out=$(validate_readme_structure "$SCRIPT_DIR/fixtures/readmes/valid.README.md") && rc=0 || rc=$?
-  assert_eq "valid README: no errors" "" "$out"
-  assert_eq "valid README: exit 0" "0" "$rc"
+  out=$(validate_doc_structure "$SCRIPT_DIR/fixtures/readmes/valid.README.md") && rc=0 || rc=$?
+  assert_eq "valid doc: no errors" "" "$out"
+  assert_eq "valid doc: exit 0" "0" "$rc"
 }
 
-test_validate_readme_structure_missing_heading() {
+test_validate_doc_structure_missing_heading() {
   local out rc
-  out=$(validate_readme_structure "$SCRIPT_DIR/fixtures/readmes/missing-heading.README.md") && rc=0 || rc=$?
+  out=$(validate_doc_structure "$SCRIPT_DIR/fixtures/readmes/missing-heading.README.md") && rc=0 || rc=$?
   assert_eq "missing heading: exit 1" "1" "$rc"
   if [[ "$out" != *"## FAQ / support answers"* ]]; then
     echo "FAIL: missing-heading output should name the missing heading, got: $out"
@@ -300,9 +300,9 @@ test_validate_readme_structure_missing_heading() {
   fi
 }
 
-test_validate_readme_structure_unresolved_placeholder() {
+test_validate_doc_structure_unresolved_placeholder() {
   local out rc
-  out=$(validate_readme_structure "$SCRIPT_DIR/fixtures/readmes/unresolved-placeholder.README.md") && rc=0 || rc=$?
+  out=$(validate_doc_structure "$SCRIPT_DIR/fixtures/readmes/unresolved-placeholder.README.md") && rc=0 || rc=$?
   assert_eq "unresolved placeholder: exit 1" "1" "$rc"
   if [[ "$out" != *"unresolved placeholder"* ]]; then
     echo "FAIL: unresolved-placeholder output should mention it, got: $out"
@@ -312,9 +312,9 @@ test_validate_readme_structure_unresolved_placeholder() {
   fi
 }
 
-test_validate_readme_structure_pii_leak() {
+test_validate_doc_structure_pii_leak() {
   local out rc
-  out=$(validate_readme_structure "$SCRIPT_DIR/fixtures/readmes/pii-leak.README.md") && rc=0 || rc=$?
+  out=$(validate_doc_structure "$SCRIPT_DIR/fixtures/readmes/pii-leak.README.md") && rc=0 || rc=$?
   assert_eq "pii leak: exit 1" "1" "$rc"
   if [[ "$out" != *"possible PII"* ]]; then
     echo "FAIL: pii-leak output should flag possible PII, got: $out"
@@ -327,13 +327,13 @@ test_validate_readme_structure_pii_leak() {
 test_cli_passes_when_nothing_missing_and_all_valid() {
   setup_shared_part_consumers_fixture
   local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
-  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/reconciliation_texts/vol_1_fixture/README.md"
-  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/account_templates/AT_fixture/README.md"
+  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md"
+  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/account_templates/AT_fixture/template_info/AT_fixture.md"
   local changed
   changed=$(printf '%s\n' \
     "reconciliation_texts/vol_1_fixture/main.liquid" \
-    "reconciliation_texts/vol_1_fixture/README.md" \
-    "account_templates/AT_fixture/README.md")
+    "reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md" \
+    "account_templates/AT_fixture/template_info/AT_fixture.md")
   local changed_file rc
   changed_file="$SCRIPT_DIR/fixtures/changed-files.txt"
   echo "$changed" > "$changed_file"
@@ -349,25 +349,18 @@ test_cli_fails_when_readme_missing() {
   changed_file="$SCRIPT_DIR/fixtures/changed-files-missing.txt"
   echo "$changed" > "$changed_file"
   bash "$SCRIPT_DIR/../check-template-docs.sh" "$changed_file" "$root" > /dev/null 2>&1 && rc=0 || rc=$?
-  assert_eq "CLI fails when a required README is missing from the diff" "1" "$rc"
+  assert_eq "CLI fails when a required doc is missing from the diff" "1" "$rc"
 }
 
-# Regression case: main()'s structural-validation loop used to match any
-# CHANGED path ending in "README.md" (a substring/suffix match), which also
-# hits nested liquid-test docs like reconciliation_texts/<x>/tests/README.md
-# - a completely different, unrelated file that happens to share a
-# basename with the real template-root README. This test's nested README
-# is deliberately invalid (missing all four required headings): if main()
-# still matched it, the CLI would fail with "missing required section"
-# errors for a file that was never supposed to be validated at all. The
-# template-root README is included in the diff too, valid, so the only way
-# this test can pass is if the nested one is correctly ignored.
+# Regression case: a nested liquid-test doc (tests/README.md) is not a
+# template doc and must not be structurally validated. It is deliberately
+# invalid here, so the test only passes if it is ignored.
 test_cli_ignores_nested_tests_readme_for_structural_validation() {
   local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
   rm -rf "$root"
-  mkdir -p "$root/reconciliation_texts/some_fixture/tests"
+  mkdir -p "$root/reconciliation_texts/some_fixture/tests" "$root/reconciliation_texts/some_fixture/template_info"
 
-  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/reconciliation_texts/some_fixture/README.md"
+  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/reconciliation_texts/some_fixture/template_info/some_fixture.md"
   cat > "$root/reconciliation_texts/some_fixture/tests/README.md" << 'MD'
 # Liquid Testing
 
@@ -377,7 +370,7 @@ MD
   local changed changed_file rc out
   changed=$(printf '%s\n' \
     "reconciliation_texts/some_fixture/main.liquid" \
-    "reconciliation_texts/some_fixture/README.md" \
+    "reconciliation_texts/some_fixture/template_info/some_fixture.md" \
     "reconciliation_texts/some_fixture/tests/README.md")
   changed_file="$SCRIPT_DIR/fixtures/changed-files-nested-readme.txt"
   echo "$changed" > "$changed_file"
@@ -394,13 +387,13 @@ MD
 test_cli_github_output_all_valid() {
   setup_shared_part_consumers_fixture
   local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
-  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/reconciliation_texts/vol_1_fixture/README.md"
-  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/account_templates/AT_fixture/README.md"
+  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md"
+  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/account_templates/AT_fixture/template_info/AT_fixture.md"
   local changed
   changed=$(printf '%s\n' \
     "reconciliation_texts/vol_1_fixture/main.liquid" \
-    "reconciliation_texts/vol_1_fixture/README.md" \
-    "account_templates/AT_fixture/README.md")
+    "reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md" \
+    "account_templates/AT_fixture/template_info/AT_fixture.md")
   local changed_file rc github_output
   changed_file="$SCRIPT_DIR/fixtures/changed-files-all-valid.txt"
   echo "$changed" > "$changed_file"
@@ -424,7 +417,7 @@ test_cli_github_output_all_valid() {
 # the other, letters-only placeholders are caught, even if
 # `{plain-language answer}` itself is silently missed. This test isolates
 # a single hyphen/digit placeholder so that masking can't happen.
-test_validate_readme_structure_unresolved_placeholder_with_hyphen_and_digit() {
+test_validate_doc_structure_unresolved_placeholder_with_hyphen_and_digit() {
   local tmpfile
   tmpfile=$(mktemp)
   cat > "$tmpfile" << 'MD'
@@ -446,7 +439,7 @@ Something.
 **A:** `{plain-language answer}`
 MD
   local out rc
-  out=$(validate_readme_structure "$tmpfile") && rc=0 || rc=$?
+  out=$(validate_doc_structure "$tmpfile") && rc=0 || rc=$?
   rm -f "$tmpfile"
   assert_eq "unresolved placeholder with hyphen/digit: exit 1" "1" "$rc"
   if [[ "$out" == *"unresolved placeholder"* ]]; then
@@ -461,7 +454,7 @@ MD
 # must not be accepted. Plain -F is a substring search, and "### Metadata"
 # contains "## Metadata" as a substring (starting at its second character),
 # so this fails without -x (whole-line match).
-test_validate_readme_structure_wrong_heading_level() {
+test_validate_doc_structure_wrong_heading_level() {
   local tmpfile
   tmpfile=$(mktemp)
   cat > "$tmpfile" << 'MD'
@@ -483,7 +476,7 @@ Something.
 **A:** Because.
 MD
   local out rc
-  out=$(validate_readme_structure "$tmpfile") && rc=0 || rc=$?
+  out=$(validate_doc_structure "$tmpfile") && rc=0 || rc=$?
   rm -f "$tmpfile"
   assert_eq "wrong heading level (### instead of ##): exit 1" "1" "$rc"
   if [[ "$out" == *"missing required section: ## Metadata"* ]]; then
@@ -519,6 +512,173 @@ test_cli_usage_message_on_missing_args() {
   fi
 }
 
+assert_contains() {
+  local desc="$1" needle="$2" haystack="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "PASS: $desc"
+  else
+    echo "FAIL: $desc"
+    echo "  expected to contain: $needle"
+    echo "  actual: $haystack"
+    failures=$((failures + 1))
+  fi
+}
+
+# Runs the CLI against $root with the given changed paths. Sets cli_out/cli_rc.
+run_cli() {
+  local root="$1"; shift
+  local changed_file="$SCRIPT_DIR/fixtures/changed-files-run-cli.txt"
+  printf '%s\n' "$@" > "$changed_file"
+  cli_out=$(bash "$SCRIPT_DIR/../check-template-docs.sh" "$changed_file" "$root" 2>&1) && cli_rc=0 || cli_rc=$?
+}
+
+new_fixture_root() {
+  local root="$SCRIPT_DIR/fixtures/shared-part-consumers"
+  rm -rf "$root"
+  mkdir -p "$root"
+  echo "$root"
+}
+
+test_doc_path_for_dir() {
+  assert_eq "doc_path_for_dir (reconciliation text)" \
+    "reconciliation_texts/vol_1/template_info/vol_1.md" "$(doc_path_for_dir "reconciliation_texts/vol_1")"
+  assert_eq "doc_path_for_dir (account template with spaces and &)" \
+    "account_templates/Foo Bar & Baz/template_info/Foo Bar & Baz.md" "$(doc_path_for_dir "account_templates/Foo Bar & Baz")"
+  # be_market has a real account template folder ending in a space.
+  assert_eq "doc_path_for_dir (trailing space kept verbatim)" \
+    "account_templates/Trailing /template_info/Trailing .md" "$(doc_path_for_dir "account_templates/Trailing ")"
+}
+
+# A template-root README.md is developer notes, not a template doc: it must
+# neither count as an existing doc for fan-out nor satisfy the check.
+test_resolve_fanout_consumers_ignores_root_readme() {
+  local root
+  root=$(new_fixture_root)
+  mkdir -p "$root/shared_parts/sp" "$root/reconciliation_texts/wagenpark"
+  echo '{"used_in":[{"type":"reconciliationText","handle":"wagenpark"}]}' > "$root/shared_parts/sp/config.json"
+  echo '# Dev notes' > "$root/reconciliation_texts/wagenpark/README.md"
+  local actual
+  actual=$(resolve_fanout_consumers "shared_parts/sp" "$root" 2>/dev/null)
+  assert_eq "resolve_fanout_consumers ignores a template-root README.md" "" "$actual"
+}
+
+test_cli_root_readme_does_not_satisfy_check() {
+  local root
+  root=$(new_fixture_root)
+  mkdir -p "$root/reconciliation_texts/wagenpark"
+  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/reconciliation_texts/wagenpark/README.md"
+  run_cli "$root" "reconciliation_texts/wagenpark/main.liquid" "reconciliation_texts/wagenpark/README.md"
+  assert_eq "CLI: root README.md does not satisfy the check: exit 1" "1" "$cli_rc"
+  assert_contains "CLI: points at the skill when no doc exists yet" "no template-specific md yet" "$cli_out"
+  assert_contains "CLI: names the expected doc path" "reconciliation_texts/wagenpark/template_info/wagenpark.md" "$cli_out"
+}
+
+test_cli_distinguishes_not_updated_from_not_created() {
+  local root
+  root=$(new_fixture_root)
+  mkdir -p "$root/reconciliation_texts/has_doc/template_info" "$root/reconciliation_texts/no_doc"
+  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/reconciliation_texts/has_doc/template_info/has_doc.md"
+  run_cli "$root" "reconciliation_texts/has_doc/main.liquid" "reconciliation_texts/no_doc/main.liquid"
+  assert_eq "CLI: not-updated + not-created: exit 1" "1" "$cli_rc"
+  assert_contains "CLI: reports the existing doc as not updated" "was not updated in this PR:"$'\n'"  - reconciliation_texts/has_doc/template_info/has_doc.md" "$cli_out"
+  assert_contains "CLI: reports the absent doc as not created" "silverfin-uni-create-template-specific-md:"$'\n'"  - reconciliation_texts/no_doc/template_info/no_doc.md" "$cli_out"
+}
+
+test_cli_flags_misnamed_doc() {
+  local root
+  root=$(new_fixture_root)
+  mkdir -p "$root/reconciliation_texts/vol_1/template_info"
+  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/reconciliation_texts/vol_1/template_info/vol_1_v2.md"
+  run_cli "$root" "reconciliation_texts/vol_1/main.liquid" "reconciliation_texts/vol_1/template_info/vol_1_v2.md"
+  assert_eq "CLI: misnamed doc: exit 1" "1" "$cli_rc"
+  assert_contains "CLI: misnamed doc is reported as stray" "reconciliation_texts/vol_1/template_info/vol_1_v2.md (expected only" "$cli_out"
+  assert_contains "CLI: misnamed doc leaves the real one missing" "  - reconciliation_texts/vol_1/template_info/vol_1.md" "$cli_out"
+}
+
+test_cli_flags_case_variant_doc() {
+  local root
+  root=$(new_fixture_root)
+  mkdir -p "$root/reconciliation_texts/vol_1/template_info"
+  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/reconciliation_texts/vol_1/template_info/vol_1.MD"
+  run_cli "$root" "reconciliation_texts/vol_1/template_info/vol_1.MD"
+  assert_eq "CLI: .MD casing variant: exit 1" "1" "$cli_rc"
+  assert_contains "CLI: .MD casing variant is reported as stray" "template_info/vol_1.MD (expected only" "$cli_out"
+}
+
+# A pre-existing extra doc fails any PR touching the template, not just the
+# one that added it - one doc per template.
+test_cli_flags_extra_doc_already_on_disk() {
+  local root
+  root=$(new_fixture_root)
+  mkdir -p "$root/reconciliation_texts/vol_1/template_info/old"
+  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/reconciliation_texts/vol_1/template_info/vol_1.md"
+  echo '# legacy' > "$root/reconciliation_texts/vol_1/template_info/README.md"
+  echo '# nested' > "$root/reconciliation_texts/vol_1/template_info/old/vol_1.md"
+  run_cli "$root" "reconciliation_texts/vol_1/main.liquid" "reconciliation_texts/vol_1/template_info/vol_1.md"
+  assert_eq "CLI: extra docs on disk: exit 1" "1" "$cli_rc"
+  assert_contains "CLI: template_info/README.md is stray" "reconciliation_texts/vol_1/template_info/README.md (expected only" "$cli_out"
+  assert_contains "CLI: nested doc is stray" "reconciliation_texts/vol_1/template_info/old/vol_1.md (expected only" "$cli_out"
+}
+
+test_cli_non_md_files_in_template_info_are_ignored() {
+  local root
+  root=$(new_fixture_root)
+  mkdir -p "$root/reconciliation_texts/vol_1/template_info"
+  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/reconciliation_texts/vol_1/template_info/vol_1.md"
+  echo 'png' > "$root/reconciliation_texts/vol_1/template_info/screenshot.png"
+  run_cli "$root" "reconciliation_texts/vol_1/main.liquid" "reconciliation_texts/vol_1/template_info/vol_1.md"
+  assert_eq "CLI: non-.md files in template_info are ignored" "0" "$cli_rc"
+}
+
+test_cli_account_template_with_trailing_space_and_metacharacters() {
+  local root dir
+  root=$(new_fixture_root)
+  dir="account_templates/Op te stellen of  te ontvangen facturen - (680) & co "
+  mkdir -p "$root/$dir/template_info"
+  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/$dir/template_info/${dir#*/}.md"
+  run_cli "$root" "$dir/main.liquid" "$dir/template_info/${dir#*/}.md"
+  assert_eq "CLI: account template with double/trailing space and metacharacters passes" "0" "$cli_rc"
+}
+
+test_cli_validates_changed_doc_structure() {
+  local root
+  root=$(new_fixture_root)
+  mkdir -p "$root/reconciliation_texts/vol_1/template_info"
+  cp "$SCRIPT_DIR/fixtures/readmes/missing-heading.README.md" "$root/reconciliation_texts/vol_1/template_info/vol_1.md"
+  run_cli "$root" "reconciliation_texts/vol_1/template_info/vol_1.md"
+  assert_eq "CLI: structurally invalid doc: exit 1" "1" "$cli_rc"
+  assert_contains "CLI: structurally invalid doc names the section" "missing required section: ## FAQ / support answers" "$cli_out"
+}
+
+test_cli_unreadable_changed_files() {
+  local out rc
+  out=$(bash "$SCRIPT_DIR/../check-template-docs.sh" "/nonexistent/changed.txt" "$SCRIPT_DIR" 2>&1) && rc=0 || rc=$?
+  assert_eq "CLI: unreadable changed-files list: exit 1" "1" "$rc"
+  assert_contains "CLI: unreadable changed-files list is named" "missing or unreadable" "$out"
+}
+
+test_cli_github_output_carries_report() {
+  local root github_output rc
+  root=$(new_fixture_root)
+  mkdir -p "$root/reconciliation_texts/no_doc"
+  printf '%s\n' "reconciliation_texts/no_doc/main.liquid" > "$SCRIPT_DIR/fixtures/changed-files-gh-output.txt"
+  github_output=$(mktemp)
+  GITHUB_OUTPUT="$github_output" bash "$SCRIPT_DIR/../check-template-docs.sh" \
+    "$SCRIPT_DIR/fixtures/changed-files-gh-output.txt" "$root" > /dev/null 2>&1 && rc=0 || rc=$?
+  assert_eq "CLI with GITHUB_OUTPUT and a missing doc: exit 1" "1" "$rc"
+  local content delim
+  content=$(cat "$github_output")
+  delim=$(sed -n 's/^missing_docs<<//p' "$github_output")
+  assert_contains "GITHUB_OUTPUT: missing_docs carries the expected path" "reconciliation_texts/no_doc/template_info/no_doc.md" "$content"
+  if [[ "$delim" =~ ^EOF_[0-9a-f]{32}$ ]] && [[ $(grep -cxF "$delim" "$github_output") -eq 2 ]]; then
+    echo "PASS: GITHUB_OUTPUT uses a random delimiter, each closed once"
+  else
+    echo "FAIL: GITHUB_OUTPUT delimiter malformed: '$delim'"
+    failures=$((failures + 1))
+  fi
+  rm -f "$github_output"
+}
+
 test_extract_template_dirs
 test_extract_template_dirs_with_spaces_and_metacharacters
 test_extract_shared_part_dirs
@@ -528,21 +688,33 @@ test_resolve_fanout_consumers_empty_result
 test_resolve_fanout_consumers_malformed_config
 test_resolve_fanout_consumers_scalar_used_in
 test_resolve_fanout_consumers_legacy_type_aliases
-test_compute_expected_readmes
-test_compute_expected_readmes_empty_input
+test_compute_expected_docs
+test_compute_expected_docs_empty_input
 test_find_missing
 test_find_missing_unreadable_input
-test_validate_readme_structure_valid
-test_validate_readme_structure_missing_heading
-test_validate_readme_structure_unresolved_placeholder
-test_validate_readme_structure_unresolved_placeholder_with_hyphen_and_digit
-test_validate_readme_structure_wrong_heading_level
-test_validate_readme_structure_pii_leak
+test_validate_doc_structure_valid
+test_validate_doc_structure_missing_heading
+test_validate_doc_structure_unresolved_placeholder
+test_validate_doc_structure_unresolved_placeholder_with_hyphen_and_digit
+test_validate_doc_structure_wrong_heading_level
+test_validate_doc_structure_pii_leak
 test_cli_passes_when_nothing_missing_and_all_valid
 test_cli_fails_when_readme_missing
 test_cli_ignores_nested_tests_readme_for_structural_validation
 test_cli_github_output_all_valid
 test_cli_usage_message_on_missing_args
+test_doc_path_for_dir
+test_resolve_fanout_consumers_ignores_root_readme
+test_cli_root_readme_does_not_satisfy_check
+test_cli_distinguishes_not_updated_from_not_created
+test_cli_flags_misnamed_doc
+test_cli_flags_case_variant_doc
+test_cli_flags_extra_doc_already_on_disk
+test_cli_non_md_files_in_template_info_are_ignored
+test_cli_account_template_with_trailing_space_and_metacharacters
+test_cli_validates_changed_doc_structure
+test_cli_unreadable_changed_files
+test_cli_github_output_carries_report
 
 if [[ $failures -gt 0 ]]; then
   echo "$failures test(s) failed"

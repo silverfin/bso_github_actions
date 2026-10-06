@@ -42,7 +42,7 @@ jobs:
           safe_output: false
           quotepath: false
           files: |
-            **/**.{liquid,yml,yaml,json,md}
+            **/**.{liquid,yml,yaml,json,md,MD,Md,mD}
 
       - name: Write changed files to a plain list
         env:
@@ -65,14 +65,19 @@ jobs:
 
       - name: Check template docs
         id: check-template-docs
-        run: bash /tmp/check-template-docs.sh /tmp/changed_files.txt "${{ github.workspace }}"
+        env:
+          REPO_ROOT: ${{ github.workspace }}
+        run: bash /tmp/check-template-docs.sh /tmp/changed_files.txt "${REPO_ROOT}"
 
       - name: Summarize failures
         if: failure()
+        env:
+          MISSING_DOCS: ${{ steps.check-template-docs.outputs.missing_docs }}
+          INVALID_DOCS: ${{ steps.check-template-docs.outputs.invalid_docs }}
         run: |
           {
-            echo "### Missing READMEs"
-            echo '${{ steps.check-template-docs.outputs.missing_readmes }}'
-            echo "### README structural problems"
-            echo '${{ steps.check-template-docs.outputs.invalid_readmes }}'
+            echo "### Missing template-specific mds"
+            printf '%s\n' "${MISSING_DOCS:-none}"
+            echo "### Template-specific md problems"
+            printf '%s\n' "${INVALID_DOCS:-none}"
           } >> "$GITHUB_STEP_SUMMARY"

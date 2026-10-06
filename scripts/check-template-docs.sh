@@ -27,9 +27,18 @@ extract_shared_part_dirs() {
     | sort -u
 }
 
+# $1 = template dir (e.g. reconciliation_texts/vol_1). Prints the path of its
+# template-specific md, as written by silverfin-uni-create-template-specific-md:
+# <dir>/template_info/<handle>.md. For an account template the "handle" is the
+# folder name, verbatim (spaces, accents, trailing space and all).
+doc_path_for_dir() {
+  local dir="$1"
+  printf '%s/template_info/%s.md\n' "$dir" "${dir#*/}"
+}
+
 # $1 = shared part dir (e.g. shared_parts/be_legal), relative to $2 = repo_root.
-# Prints consumer dirs (relative to repo_root) whose README.md already
-# exists. Skips any used_in entry with a null/empty handle, warning on
+# Prints consumer dirs (relative to repo_root) whose template-specific md
+# already exists. Skips any used_in entry with a null/empty handle, warning on
 # stderr.
 resolve_fanout_consumers() {
   local shared_part_dir="$1"
@@ -90,7 +99,9 @@ resolve_fanout_consumers() {
           continue
           ;;
       esac
-      if [[ -f "$repo_root/$dir/README.md" ]]; then
+      local doc
+      doc=$(doc_path_for_dir "$dir")
+      if [[ -f "$repo_root/$doc" ]]; then
         results+=("$dir")
       fi
     done <<< "$jq_output"
@@ -102,7 +113,7 @@ resolve_fanout_consumers() {
 
 # $1 = path to file of changed files (newline-separated), or process substitution.
 # $2 = repo_root.
-compute_expected_readmes() {
+compute_expected_docs() {
   local changed_files_path="$1"
   local repo_root="$2"
   local changed
@@ -115,14 +126,14 @@ compute_expected_readmes() {
   local results=()
   while IFS= read -r dir; do
     [[ -z "$dir" ]] && continue
-    results+=("$dir/README.md")
+    results+=("$(doc_path_for_dir "$dir")")
   done <<< "$template_dirs"
 
   while IFS= read -r sp_dir; do
     [[ -z "$sp_dir" ]] && continue
     while IFS= read -r consumer_dir; do
       [[ -z "$consumer_dir" ]] && continue
-      results+=("$consumer_dir/README.md")
+      results+=("$(doc_path_for_dir "$consumer_dir")")
     done < <(resolve_fanout_consumers "$sp_dir" "$repo_root")
   done <<< "$shared_part_dirs"
 
@@ -130,7 +141,7 @@ compute_expected_readmes() {
   return 0
 }
 
-# $1 = path to file of expected README paths. $2 = path to file of changed files.
+# $1 = path to file of expected doc paths. $2 = path to file of changed files.
 find_missing() {
   local expected_path="$1"
   local changed_path="$2"
@@ -161,9 +172,9 @@ REQUIRED_HEADINGS=(
   "## FAQ / support answers"
 )
 
-# $1 = path to a README.md. Prints one ERROR: line per problem to stdout,
-# nothing on success. Returns 0 if valid, 1 otherwise.
-validate_readme_structure() {
+# $1 = path to a template-specific md. Prints one ERROR: line per problem to
+# stdout, nothing on success. Returns 0 if valid, 1 otherwise.
+validate_doc_structure() {
   local readme_path="$1"
   local ok=0
 
@@ -184,7 +195,7 @@ validate_readme_structure() {
   done
 
   # Unresolved skeleton placeholders: backtick-quoted {word} left as-is,
-  # e.g. `{handle}`, `{situation}`. A filled-in README should have none.
+  # e.g. `{handle}`, `{situation}`. A filled-in doc should have none.
   # Character class includes digits/hyphen/comma/period, not just letters
   # and spaces: the skill's own skeleton examples include placeholder text
   # like `{plain-language answer}` and a hyphen-free class misses it
@@ -211,6 +222,31 @@ validate_readme_structure() {
   return $ok
 }
 
+# $1 = template dir, $2 = repo_root. Prints one line per .md file under
+# <dir>/template_info/ other than the expected one: a misnamed doc
+# (`{handle}_v2.md`, a `.MD` casing variant, a `README.md`), a second doc, or
+# one nested deeper. The skill allows exactly one doc per template.
+find_stray_docs() {
+  local dir="$1"
+  local repo_root="$2"
+  local info_dir="$repo_root/$dir/template_info"
+  [[ -d "$info_dir" ]] || return 0
+
+  local expected found
+  expected="$repo_root/$(doc_path_for_dir "$dir")"
+  # find's own status checked separately: a read error must not look like
+  # "no stray docs".
+  if ! found=$(find "$info_dir" -type f -iname '*.md' -print); then
+    echo "$dir/template_info (could not be listed)"
+    return 0
+  fi
+  local path
+  while IFS= read -r path; do
+    [[ -z "$path" || "$path" == "$expected" ]] && continue
+    echo "${path#"$repo_root"/}"
+  done <<< "$found"
+}
+
 # CLI entrypoint - only runs when this file is executed directly, not when sourced.
 main() {
   if [[ $# -lt 2 ]]; then
@@ -221,58 +257,99 @@ main() {
   local changed_files_path="$1"
   local repo_root="$2"
 
+  if [[ ! -r "$changed_files_path" ]]; then
+    echo "ERROR: changed-files list '$changed_files_path' is missing or unreadable" >&2
+    return 1
+  fi
+  if [[ ! -d "$repo_root" ]]; then
+    echo "ERROR: repo root '$repo_root' is not a directory" >&2
+    return 1
+  fi
+
   local expected_path
   expected_path=$(mktemp)
-  compute_expected_readmes "$changed_files_path" "$repo_root" > "$expected_path"
+  # shellcheck disable=SC2064
+  trap "rm -f '$expected_path'" RETURN
+  compute_expected_docs "$changed_files_path" "$repo_root" > "$expected_path"
 
   local missing
   missing=$(find_missing "$expected_path" "$changed_files_path")
 
+  local not_created=() not_updated=()
+  local doc
+  while IFS= read -r doc; do
+    [[ -z "$doc" ]] && continue
+    if [[ -f "$repo_root/$doc" ]]; then
+      not_updated+=("$doc")
+    else
+      not_created+=("$doc")
+    fi
+  done <<< "$missing"
+
   local invalid=()
+  local changed dir errors
   while IFS= read -r changed; do
-    # Anchored to the exact shape compute_expected_readmes can produce -
-    # reconciliation_texts/<x>/README.md or account_templates/<x>/README.md
-    # at the template ROOT only. A plain suffix match (*"README.md") would
-    # also hit e.g. reconciliation_texts/<x>/tests/README.md (liquid-test
-    # scenario docs, unrelated to this check) and falsely flag them as
-    # invalid template READMEs for missing the four required headings.
-    [[ "$changed" =~ ^(reconciliation_texts|account_templates)/[^/]+/README\.md$ ]] || continue
-    local full_path="$repo_root/$changed"
-    [[ -f "$full_path" ]] || continue
-    local errors
-    errors=$(validate_readme_structure "$full_path") || invalid+=("$changed: $errors")
+    # Only the exact <dir>/template_info/<handle>.md is validated. Misnamed
+    # files are reported by find_stray_docs below; tests/README.md and a
+    # template-root README.md (developer notes) are not template docs at all.
+    [[ "$changed" =~ ^((reconciliation_texts|account_templates)/[^/]+)/template_info/ ]] || continue
+    dir="${BASH_REMATCH[1]}"
+    [[ "$changed" == "$(doc_path_for_dir "$dir")" ]] || continue
+    [[ -f "$repo_root/$changed" ]] || continue
+    errors=$(validate_doc_structure "$repo_root/$changed") || invalid+=("$changed: $errors")
   done < "$changed_files_path"
 
-  local exit_code=0
+  local stray=()
+  local template_dirs stray_out
+  template_dirs=$(extract_template_dirs < "$changed_files_path")
+  while IFS= read -r dir; do
+    [[ -z "$dir" ]] && continue
+    stray_out=$(find_stray_docs "$dir" "$repo_root")
+    [[ -z "$stray_out" ]] && continue
+    while IFS= read -r doc; do
+      stray+=("$doc (expected only $(doc_path_for_dir "$dir"))")
+    done <<< "$stray_out"
+  done <<< "$template_dirs"
 
-  if [[ -n "$missing" ]]; then
-    echo "The following templates changed but their README.md was not updated in this PR:"
-    echo "$missing" | sed 's/^/  - /'
-    exit_code=1
+  local missing_report="" invalid_report=""
+  if (( ${#not_created[@]} )); then
+    missing_report+="These templates changed but have no template-specific md yet - create it with silverfin-uni-create-template-specific-md:"$'\n'
+    missing_report+=$(printf '  - %s\n' "${not_created[@]}")$'\n'
+  fi
+  if (( ${#not_updated[@]} )); then
+    missing_report+="These templates changed but their template-specific md was not updated in this PR:"$'\n'
+    missing_report+=$(printf '  - %s\n' "${not_updated[@]}")$'\n'
+  fi
+  if (( ${#invalid[@]} )); then
+    invalid_report+="These template-specific mds have structural problems:"$'\n'
+    invalid_report+=$(printf '%s\n' "${invalid[@]}" | sed 's/^/  - /')$'\n'
+  fi
+  if (( ${#stray[@]} )); then
+    invalid_report+="These files in template_info/ are misnamed or extra - one <handle>.md per template, named exactly after the template folder:"$'\n'
+    invalid_report+=$(printf '  - %s\n' "${stray[@]}")$'\n'
   fi
 
-  if [[ ${#invalid[@]} -gt 0 ]]; then
-    echo "The following README(s) have structural problems:"
-    printf '%s\n' "${invalid[@]}" | sed 's/^/  - /'
-    exit_code=1
-  fi
+  [[ -n "$missing_report" ]] && printf '%s' "$missing_report"
+  [[ -n "$invalid_report" ]] && printf '%s' "$invalid_report"
 
   if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    local delim
+    delim="EOF_$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    if [[ "$missing_report$invalid_report" == *"$delim"* ]]; then
+      echo "ERROR: GITHUB_OUTPUT delimiter collided with the report" >&2
+      return 1
+    fi
     {
-      echo "missing_readmes<<EOF"
-      echo "$missing"
-      echo "EOF"
-      echo "invalid_readmes<<EOF"
-      (( ${#invalid[@]} )) && printf '%s\n' "${invalid[@]}"
-      echo "EOF"
+      printf 'missing_docs<<%s\n%s\n%s\n' "$delim" "$missing_report" "$delim"
+      printf 'invalid_docs<<%s\n%s\n%s\n' "$delim" "$invalid_report" "$delim"
     } >> "$GITHUB_OUTPUT"
   fi
 
-  if [[ $exit_code -eq 0 ]]; then
-    echo "All changed templates have an up-to-date, structurally valid README."
+  if [[ -n "$missing_report$invalid_report" ]]; then
+    return 1
   fi
-
-  return $exit_code
+  echo "All changed templates have an up-to-date, structurally valid template-specific md."
+  return 0
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
