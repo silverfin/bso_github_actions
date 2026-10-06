@@ -5,15 +5,18 @@ One-off, per market, before its sync_notion_docs.yml caller can run.
 1. In the `template-specific documentation` Notion page, create a child
    page named `<flag emoji> <MARKET> market`.
 2. Under it, create two databases: `Reconciliation Texts` and
-   `Account Templates`, each with these properties:
-   - `Name` (title)
+   `Account Templates`, each with exactly these property names and types
+   (the sync checks them before every run and alerts instead of syncing if
+   one is missing or has another type):
+   - `Name` (title) - set only when the sync creates a row, never overwritten
    - `Handle` (text) - "Matches config.json handle field" for RT, "Folder
      name in account_templates/" for AT
-   - `Market` (select, one option: the market code)
-   - `Package` (multi-select) - leave empty, humans fill this in over time
-   - `Last synced` (date)
-   - `Source commit` (text)
-   - `Repo path` (text)
+   - `Market` (select, one option: the market code) - set only on create
+   - `Package` (multi-select) - leave empty, humans fill this in over time;
+     the sync never writes it
+   - `Last Updated` (date) - stamped with the sync date on every write
+   Pre-seed one row per template (Name, Handle, Market) so the sync updates
+   rows instead of creating them; a created row raises a Slack alert.
 3. Confirm the workspace's internal integration (the one already connected
    to BE market - check Settings -> Connections) is also connected to the
    new market's page. Do NOT create a second integration per market (see
@@ -59,12 +62,12 @@ One-off, per market, before its sync_notion_docs.yml caller can run.
    on:
      push:
        branches: [main]
-       # Only start the job when a template README actually changed - without
+       # Only start the job when a template-specific md changed - without
        # this, every push to main pays for a full-history checkout just to
        # discover there is nothing to sync.
        paths:
-         - "reconciliation_texts/**/README.md"
-         - "account_templates/**/README.md"
+         - "reconciliation_texts/*/template_info/**"
+         - "account_templates/*/template_info/**"
    jobs:
      sync-notion-docs:
        uses: silverfin/bso_github_actions/.github/workflows/sync_notion_docs.yml@<pin to a commit SHA on bso_github_actions main, not a branch>

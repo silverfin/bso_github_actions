@@ -43,7 +43,35 @@ resolve_handle() {
     return 1
   fi
 
+  # The doc is named after the folder (template_info/<folder>.md) but the
+  # Notion row is found by config.json's handle. If the two disagree, it is
+  # unclear which row the doc belongs to, so refuse rather than guess.
+  if [[ "$jq_output" != "${template_dir#*/}" ]]; then
+    echo "ERROR: $template_dir has config.json handle '$jq_output', which differs from its folder name" >&2
+    return 1
+  fi
+
   echo "$jq_output"
+}
+
+# $1 = string. Prints it with leading/trailing whitespace removed (interior
+# whitespace untouched). Notion trims text properties on write, so a folder
+# name ending in a space can only ever match its Handle once trimmed.
+trim_ws() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+# $1 = changed path. Prints the template dir when the path is exactly
+# <reconciliation_texts|account_templates>/<folder>/template_info/<folder>.md,
+# the file silverfin-uni-create-template-specific-md writes. Returns 1 otherwise.
+template_dir_for_doc() {
+  local path="$1"
+  [[ "$path" =~ ^((reconciliation_texts|account_templates)/([^/]+))/template_info/([^/]+)$ ]] || return 1
+  [[ "${BASH_REMATCH[4]}" == "${BASH_REMATCH[3]}.md" ]] || return 1
+  printf '%s' "${BASH_REMATCH[1]}"
 }
 
 # $1 = template dir, $2 = repo_root.
@@ -196,17 +224,15 @@ notion_request() {
   return 1
 }
 
-# $1 = data_source_id, $2 = handle to search for.
-# stdout: the page ID on exactly one match; empty string on zero matches;
-# the literal string DUPLICATE (plus a stderr warning) on 2+ matches - the
-# caller must treat DUPLICATE as skip-and-alert, never guess which page.
+# $1 = data_source_id, $2 = handle to search for (trimmed before use).
+# stdout: the page ID on exactly one row whose Handle equals the handle;
+# empty string on zero rows; DUPLICATE on 2+ exact rows; MISMATCH when Notion
+# returned rows but none carries this exact Handle. The caller must treat
+# DUPLICATE and MISMATCH as skip-and-alert, never write or create.
 find_page_by_handle() {
   local data_source_id="$1"
-  local handle="$2"
-  # Guarded like the structurally identical `jq -n` body builds in
-  # sync_readme: unguarded, a jq failure here would trip `set -e` deep inside
-  # this function and report itself to the caller as whatever the surrounding
-  # context happens to blame, rather than as "could not build the query body".
+  local handle
+  handle=$(trim_ws "$2")
   local body
   if ! body=$(jq -n --arg h "$handle" '{filter: {property: "Handle", rich_text: {equals: $h}}}'); then
     echo "ERROR: find_page_by_handle: could not build the query body for handle '$handle'" >&2
@@ -216,58 +242,85 @@ find_page_by_handle() {
   local response
   response=$(notion_request POST "/v1/data_sources/$data_source_id/query" "$body") || return 1
 
-  # Guard explicitly against jq failing (e.g. a malformed/unexpected
-  # response body) - a bare `count=$(echo ... | jq ...)` would trip
-  # `set -e` deep inside this function and kill the calling script before
-  # it ever sees a return value, same hazard class as the fixes already
-  # applied in resolve_handle and notion_request.
-  #
-  # `.results | length` on its own is not enough: if `.results` is absent or
-  # `null`, jq's `length` treats that as 0, not an error - a 2xx response
-  # with an unexpected shape (Notion API change, a proxy returning something
-  # unrelated) would then look exactly like "zero matches" and this function
-  # would tell sync_readme to CREATE a brand new page instead of failing
-  # loudly. Forcing an explicit type check turns that into a real jq error,
-  # caught by the same guard below.
-  local count
-  if ! count=$(echo "$response" | jq '
+  # `.results` must be an array: `length` on a missing/null field is 0, which
+  # would read as "no row" and create a duplicate page.
+  local total
+  if ! total=$(echo "$response" | jq '
       if (.results | type) == "array" then .results | length
       else error("`.results` is missing or not an array") end
     ' 2>&1); then
-    echo "ERROR: find_page_by_handle: unparseable response from Notion for handle '$handle' (jq failed: $count)" >&2
+    echo "ERROR: find_page_by_handle: unparseable response from Notion for handle '$handle' (jq failed: $total)" >&2
     return 1
   fi
 
-  if [[ "$count" == "0" ]]; then
-    echo ""
-    return 0
-  elif [[ "$count" == "1" ]]; then
-    # -er, matching the create-response extraction in sync_readme: plain -r
-    # would print the literal string "null" (exit 0) for a result object that
-    # has no .id, and that "null" would then be handed back as a real page id.
-    local page_id
-    if ! page_id=$(echo "$response" | jq -er '.results[0].id'); then
-      echo "ERROR: find_page_by_handle: the page matching handle '$handle' has no id" >&2
-      return 1
-    fi
-    echo "$page_id"
-    return 0
-  else
+  # Re-check every returned row's Handle ourselves, byte for byte after
+  # trimming: the write goes to whatever id this returns, and a wrong id
+  # overwrites another template's page with no error anywhere.
+  local exact_ids
+  if ! exact_ids=$(echo "$response" | jq -r --arg h "$handle" '
+      [.results[]
+        | select(((.properties.Handle.rich_text // []) | map(.plain_text // "") | join("")
+                  | sub("^\\s+"; "") | sub("\\s+$"; "")) == $h)
+        | .id]
+      | if all(type == "string" and length > 0) then .[] else error("a matching row has no id") end
+    ' 2>&1); then
+    echo "ERROR: find_page_by_handle: could not read Handle/id from Notion's rows for '$handle' (jq failed: $exact_ids)" >&2
+    return 1
+  fi
+
+  local count=0
+  [[ -n "$exact_ids" ]] && count=$(printf '%s\n' "$exact_ids" | wc -l | tr -d ' ')
+
+  if (( count == 1 )); then
+    echo "$exact_ids"
+  elif (( count > 1 )); then
     echo "WARN: Handle '$handle' matches $count pages in data source $data_source_id - skipping, needs manual dedup" >&2
     echo "DUPLICATE"
-    return 0
+  elif (( total > 0 )); then
+    echo "WARN: Notion returned $total row(s) for '$handle' but none has exactly that Handle - skipping, check the row" >&2
+    echo "MISMATCH"
+  else
+    echo ""
   fi
+  return 0
+}
+
+# $1 = data_source_id. Fails unless the data source has every property this
+# script writes or filters on, with the right type. Checked before any page
+# is touched: a missing column would otherwise only surface on the metadata
+# PATCH, after the page body had already been replaced.
+check_data_source_schema() {
+  local data_source_id="$1"
+  local response
+  response=$(notion_request GET "/v1/data_sources/$data_source_id") || return 1
+  local problems
+  if ! problems=$(echo "$response" | jq -r '
+      if (.properties | type) != "object" then error("`.properties` is missing or not an object") else . end
+      | . as $ds
+      | {"Name": "title", "Handle": "rich_text", "Market": "select", "Last Updated": "date"}
+      | to_entries[]
+      | select(($ds.properties[.key].type // "missing") != .value)
+      | "\(.key) (want \(.value), got \($ds.properties[.key].type // "missing"))"
+    ' 2>&1); then
+    echo "ERROR: data source $data_source_id: unparseable schema response (jq failed: $problems)" >&2
+    return 1
+  fi
+  if [[ -n "$problems" ]]; then
+    echo "ERROR: data source $data_source_id is missing required properties: ${problems//$'\n'/, }" >&2
+    return 1
+  fi
+  return 0
 }
 
 SYNC_CALLOUT='<callout icon="🤖">This page is generated from the repo and will be overwritten on the next merge. Leave feedback as a comment - comments survive the sync.</callout>
 
 '
 
-# $1 = readme_path, $2 = template_dir, $3 = repo_root, $4 = data_source_id,
-# $5 = market, $6 = commit_sha.
+# $1 = doc path, $2 = template_dir, $3 = repo_root, $4 = data_source_id,
+# $5 = market.
 sync_readme() {
   local readme_path="$1" template_dir="$2" repo_root="$3"
-  local data_source_id="$4" market="$5" commit_sha="$6"
+  local data_source_id="$4" market="$5"
 
   local handle
   handle=$(resolve_handle "$template_dir" "$repo_root") || { echo "FAILED: could not resolve handle"; return 0; }
@@ -279,6 +332,10 @@ sync_readme() {
     echo "DUPLICATE"
     return 0
   fi
+  if [[ "$existing_page_id" == "MISMATCH" ]]; then
+    echo "FAILED: Notion row for '$handle' does not carry exactly that Handle"
+    return 0
+  fi
 
   local markdown_body readme_content
   if ! readme_content=$(cat "$readme_path"); then
@@ -287,24 +344,20 @@ sync_readme() {
   fi
   markdown_body="$SYNC_CALLOUT$readme_content"
 
-  # Name/Market are resolved unconditionally (not just on create) so the
-  # follow-up metadata-stamp PATCH below can refresh them on the update
-  # path too - the script owns these properties on every page it manages,
-  # not just the ones it creates.
+  # Name and Market are hand-curated on the pre-seeded rows (an account
+  # template's Name is English, its Handle Dutch), so they are only ever set
+  # on a page this script creates. Package is never written.
   local name
   name=$(resolve_name "$template_dir" "$repo_root") || { echo "FAILED: could not resolve name"; return 0; }
 
   local page_id result
   if [[ -z "$existing_page_id" ]]; then
-    # Name/Market are deliberately not set here - the metadata-stamp PATCH
-    # below is their single owner and runs on every successful path
-    # (create and update alike), so setting them here too would just be
-    # duplicated, driftable state.
     local create_body
     if ! create_body=$(jq -n \
       --arg ds "$data_source_id" \
-      --arg handle "$handle" --arg md "$markdown_body" \
-      '{parent: {data_source_id: $ds}, properties: {Handle: {rich_text: [{text: {content: $handle}}]}}, markdown: $md}'); then
+      --arg handle "$(trim_ws "$handle")" --arg md "$markdown_body" \
+      --arg name "$name" --arg market "$market" \
+      '{parent: {data_source_id: $ds}, properties: {Handle: {rich_text: [{text: {content: $handle}}]}, Name: {title: [{text: {content: $name}}]}, Market: {select: {name: $market}}}, markdown: $md}'); then
       echo "FAILED: could not build create request body"
       return 0
     fi
@@ -337,12 +390,8 @@ sync_readme() {
     echo "FAILED: could not compute today's date"
     return 0
   fi
-  local short_sha="${commit_sha:0:7}"
   local stamp_body
-  if ! stamp_body=$(jq -n \
-    --arg date "$today" --arg sha "$short_sha" --arg path "$template_dir" \
-    --arg name "$name" --arg market "$market" \
-    '{properties: {"Last synced": {date: {start: $date}}, "Source commit": {rich_text: [{text: {content: $sha}}]}, "Repo path": {rich_text: [{text: {content: $path}}]}, Name: {title: [{text: {content: $name}}]}, Market: {select: {name: $market}}}}'); then
+  if ! stamp_body=$(jq -n --arg date "$today" '{properties: {"Last Updated": {date: {start: $date}}}}'); then
     echo "FAILED: could not build metadata stamp body"
     return 0
   fi
@@ -382,9 +431,9 @@ write_config_abort_alert() {
   fi
 }
 
-# CLI entrypoint. $1 = path to a newline-separated list of changed README
-# paths (relative to repo_root), $2 = repo_root, $3 = market (e.g. BE),
-# $4 = commit_sha, $5 = optional path to the market -> data-source-id config
+# CLI entrypoint. $1 = path to a newline-separated list of changed
+# template_info/<folder>.md paths (relative to repo_root), $2 = repo_root,
+# $3 = market (e.g. BE), $4 = commit_sha (unused, kept for the CLI contract), $5 = optional path to the market -> data-source-id config
 # (defaults to repo_root/scripts/notion-config.json). This is a post-merge
 # job with nothing left to block, so it always exits 0; failures are
 # reported via $GITHUB_OUTPUT instead, for the workflow's Slack step.
@@ -392,7 +441,6 @@ main() {
   local changed_readmes_path="$1"
   local repo_root="$2"
   local market="$3"
-  local commit_sha="$4"
   local config_path="${5:-$repo_root/scripts/notion-config.json}"
 
   # Guarded like every other jq call in this file: a missing or unparseable
@@ -428,10 +476,18 @@ main() {
   # under `set -e` and the run dies with exit 1, no output and no Slack signal
   # at all - the single worst failure shape for this script.
   if [[ ! -f "$changed_readmes_path" || ! -r "$changed_readmes_path" ]]; then
-    echo "ERROR: changed-README list '$changed_readmes_path' does not exist or is not readable" >&2
+    echo "ERROR: changed-doc list '$changed_readmes_path' does not exist or is not readable" >&2
     write_config_abort_alert "config-error:missing-list"
     return 0
   fi
+
+  local ds
+  for ds in "$rt_ds" "$at_ds"; do
+    if ! check_data_source_schema "$ds"; then
+      write_config_abort_alert "config-error:schema:${market}"
+      return 0
+    fi
+  done
 
   local failed=()
   local created=()
@@ -439,15 +495,20 @@ main() {
   while IFS= read -r readme_path; do
     [[ -z "$readme_path" ]] && continue
     local template_dir
-    template_dir=$(dirname "$readme_path")
+    # Anything but the exact template_info/<folder>.md is not synced, but is
+    # reported: a misnamed doc that got merged would otherwise never reach
+    # Notion and nobody would notice.
+    if ! template_dir=$(template_dir_for_doc "$readme_path"); then
+      echo "$readme_path: FAILED: not a <template>/template_info/<folder>.md path, not synced" >&2
+      failed+=("$readme_path")
+      continue
+    fi
 
     local data_source_id
     if [[ "$template_dir" == reconciliation_texts/* ]]; then
       data_source_id="$rt_ds"
-    elif [[ "$template_dir" == account_templates/* ]]; then
-      data_source_id="$at_ds"
     else
-      continue
+      data_source_id="$at_ds"
     fi
 
     local full_readme_path="$repo_root/$readme_path"
@@ -459,7 +520,7 @@ main() {
     # here. Guarded, so a future non-zero return degrades to one reported
     # failure instead of killing the whole run mid-list.
     local result
-    result=$(sync_readme "$full_readme_path" "$template_dir" "$repo_root" "$data_source_id" "$market" "$commit_sha") \
+    result=$(sync_readme "$full_readme_path" "$template_dir" "$repo_root" "$data_source_id" "$market") \
       || result="FAILED: unexpected error"
     echo "$template_dir: $result"
 

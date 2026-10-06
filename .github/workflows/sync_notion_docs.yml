@@ -35,14 +35,14 @@ jobs:
           # hardening gap (flagged by zizmor's artipacked check).
           persist-credentials: false
 
-      - name: Get changed README files in this push
+      - name: Get changed template docs in this push
         id: changed-files
         uses: tj-actions/changed-files@24d32ffd492484c1d75e0c0b894501ddb9d30d62 # v47
         with:
           base_sha: ${{ github.event.before }}
           dir_names: false
           # Emit the file list as a JSON array so paths containing spaces (e.g.
-          # account_templates/Dubieuze debiteuren/README.md) survive the
+          # account_templates/Dubieuze debiteuren/template_info/Dubieuze debiteuren.md) survive the
           # hand-off between steps intact. escape_json: false keeps it valid
           # JSON for jq (the default double-escapes the quotes). safe_output:
           # false stops backslash-escaping of shell metacharacters (& ( ) ...)
@@ -56,11 +56,14 @@ jobs:
           escape_json: false
           safe_output: false
           quotepath: false
+          # Every .md under template_info/, not just the well-named one: the
+          # script syncs <folder>/template_info/<folder>.md and reports
+          # anything else, so a misnamed doc can't silently skip Notion.
           files: |
-            reconciliation_texts/**/README.md
-            account_templates/**/README.md
+            reconciliation_texts/*/template_info/**/*.{md,MD,Md,mD}
+            account_templates/*/template_info/**/*.{md,MD,Md,mD}
 
-      - name: Write changed READMEs to a plain list
+      - name: Write changed docs to a plain list
         env:
           # Passed via env (not inlined into the shell body), so a path with
           # quotes/spaces/metacharacters cannot break the script or be

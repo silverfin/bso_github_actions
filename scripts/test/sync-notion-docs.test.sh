@@ -86,7 +86,7 @@ setup_resolve_fixture() {
   # Clear only the template dirs, NOT $root itself - $root also holds
   # stub-curl/curl, which every later test depends on being on PATH.
   rm -rf "$root/reconciliation_texts" "$root/account_templates"
-  mkdir -p "$root/reconciliation_texts/vol_1_fixture" "$root/account_templates/AT_fixture"
+  mkdir -p "$root/reconciliation_texts/vol_1_fixture/template_info" "$root/account_templates/AT_fixture/template_info"
   cat > "$root/reconciliation_texts/vol_1_fixture/config.json" << 'JSON'
 {"handle": "vol_1_fixture", "name_en": "Postponement of the general meeting"}
 JSON
@@ -325,7 +325,7 @@ echo "PASS: test script continued past the hard curl failure"
 
 test_find_page_by_handle_one_match() {
   setup_stub_curl
-  printf '200\t-\t{"results":[{"id":"page-123"}]}\n' > "$STUB_CURL_RESPONSES"
+  printf '200\t-\t{"results":[{"id":"page-123","properties":{"Handle":{"rich_text":[{"plain_text":"vol_1_fixture"}]}}}]}\n' > "$STUB_CURL_RESPONSES"
   local out
   out=$(NOTION_TOKEN="fake-token" find_page_by_handle "ds-abc" "vol_1_fixture")
   assert_eq "find_page_by_handle: one match returns its id" "page-123" "$out"
@@ -341,7 +341,7 @@ test_find_page_by_handle_no_match() {
 
 test_find_page_by_handle_duplicate() {
   setup_stub_curl
-  printf '200\t-\t{"results":[{"id":"page-1"},{"id":"page-2"}]}\n' > "$STUB_CURL_RESPONSES"
+  printf '200\t-\t{"results":[{"id":"page-1","properties":{"Handle":{"rich_text":[{"plain_text":"dup_handle"}]}}},{"id":"page-2","properties":{"Handle":{"rich_text":[{"plain_text":"dup_handle"}]}}}]}\n' > "$STUB_CURL_RESPONSES"
   local out
   out=$(NOTION_TOKEN="fake-token" find_page_by_handle "ds-abc" "dup_handle" 2>/dev/null)
   assert_eq "find_page_by_handle: 2 matches returns DUPLICATE" "DUPLICATE" "$out"
@@ -398,11 +398,11 @@ test_sync_readme_creates_when_missing() {
   setup_stub_curl
   setup_resolve_fixture
   local root="$SCRIPT_DIR/fixtures/notion-sync"
-  echo "# Vol 1 fixture content" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  echo "# Vol 1 fixture content" > "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md"
   printf '200\t-\t{"results":[]}\n200\t-\t{"id":"new-page-1"}\n200\t-\t{"id":"new-page-1"}\n' > "$STUB_CURL_RESPONSES"
   local out
   out=$(NOTION_TOKEN="fake-token" sync_readme \
-    "$root/reconciliation_texts/vol_1_fixture/README.md" \
+    "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md" \
     "reconciliation_texts/vol_1_fixture" "$root" "ds-abc" "BE" "abcdef1234567")
   assert_eq "sync_readme creates when no existing page" "CREATED" "$out"
 
@@ -421,21 +421,21 @@ test_sync_readme_creates_when_missing() {
   assert_contains "sync_readme stamp call: targets the new page id" "/v1/pages/new-page-1" "$stamp_call"
   assert_not_contains "sync_readme create body: never writes Package" "Package" "$create_call"
   assert_not_contains "sync_readme stamp body: never writes Package" "Package" "$stamp_call"
-  assert_contains "sync_readme stamp body: Repo path matches template_dir" \
-    "reconciliation_texts/vol_1_fixture" "$stamp_call"
-  assert_contains "sync_readme stamp body: Source commit truncated to 7 chars" "abcdef1" "$stamp_call"
-  assert_not_contains "sync_readme stamp body: Source commit not longer than 7 chars" "abcdef12" "$stamp_call"
+  assert_contains "sync_readme create body: sets Name on a new page" "Postponement of the general meeting" "$create_call"
+  assert_contains "sync_readme create body: sets Market on a new page" '"Market"' "$create_call"
+  assert_contains "sync_readme stamp body: sets Last Updated" '"Last Updated"' "$stamp_call"
+  assert_not_contains "sync_readme stamp body: never writes columns BE does not have" "Source commit" "$stamp_call"
 }
 
 test_sync_readme_updates_when_present() {
   setup_stub_curl
   setup_resolve_fixture
   local root="$SCRIPT_DIR/fixtures/notion-sync"
-  echo "# Vol 1 fixture content" > "$root/reconciliation_texts/vol_1_fixture/README.md"
-  printf '200\t-\t{"results":[{"id":"page-existing"}]}\n200\t-\t{"id":"page-existing"}\n200\t-\t{"id":"page-existing"}\n' > "$STUB_CURL_RESPONSES"
+  echo "# Vol 1 fixture content" > "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md"
+  printf '200\t-\t{"results":[{"id":"page-existing","properties":{"Handle":{"rich_text":[{"plain_text":"vol_1_fixture"}]}}}]}\n200\t-\t{"id":"page-existing"}\n200\t-\t{"id":"page-existing"}\n' > "$STUB_CURL_RESPONSES"
   local out
   out=$(NOTION_TOKEN="fake-token" sync_readme \
-    "$root/reconciliation_texts/vol_1_fixture/README.md" \
+    "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md" \
     "reconciliation_texts/vol_1_fixture" "$root" "ds-abc" "BE" "abcdef1234567")
   assert_eq "sync_readme updates when a page already exists" "UPDATED" "$out"
 
@@ -445,26 +445,22 @@ test_sync_readme_updates_when_present() {
   local stamp_call
   stamp_call=$(curl_call_block 3)
   assert_not_contains "sync_readme update-path stamp body: never writes Package" "Package" "$stamp_call"
-  # Global Constraint says the script owns Name/Handle/Market on every page
-  # it manages, with no update-time carve-out - so a name_en or Market
-  # change must reach an already-existing page too, not just a newly
-  # created one. Verifies Name/Market ride along on the same stamp PATCH
-  # that already runs on the update path.
-  assert_contains "sync_readme update-path stamp body: refreshes Name" \
-    "Postponement of the general meeting" "$stamp_call"
-  assert_contains "sync_readme update-path stamp body: refreshes Market" '"Market"' "$stamp_call"
-  assert_contains "sync_readme update-path stamp body: Market value is BE" "BE" "$stamp_call"
+  # Name/Market are hand-curated on pre-seeded rows (an AT's Name is
+  # English, its Handle Dutch): the update path must leave them alone.
+  assert_not_contains "sync_readme update-path stamp body: leaves Name alone" '"Name"' "$stamp_call"
+  assert_not_contains "sync_readme update-path stamp body: leaves Market alone" '"Market"' "$stamp_call"
+  assert_contains "sync_readme update-path stamp body: sets Last Updated" '"Last Updated"' "$stamp_call"
 }
 
 test_sync_readme_skips_on_duplicate() {
   setup_stub_curl
   setup_resolve_fixture
   local root="$SCRIPT_DIR/fixtures/notion-sync"
-  echo "# Vol 1 fixture content" > "$root/reconciliation_texts/vol_1_fixture/README.md"
-  printf '200\t-\t{"results":[{"id":"page-1"},{"id":"page-2"}]}\n' > "$STUB_CURL_RESPONSES"
+  echo "# Vol 1 fixture content" > "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md"
+  printf '200\t-\t{"results":[{"id":"page-1","properties":{"Handle":{"rich_text":[{"plain_text":"vol_1_fixture"}]}}},{"id":"page-2","properties":{"Handle":{"rich_text":[{"plain_text":"vol_1_fixture"}]}}}]}\n' > "$STUB_CURL_RESPONSES"
   local out
   out=$(NOTION_TOKEN="fake-token" sync_readme \
-    "$root/reconciliation_texts/vol_1_fixture/README.md" \
+    "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md" \
     "reconciliation_texts/vol_1_fixture" "$root" "ds-abc" "BE" "abcdef1234567" 2>/dev/null)
   assert_eq "sync_readme skips on duplicate Handle" "DUPLICATE" "$out"
 }
@@ -473,11 +469,11 @@ test_sync_readme_reports_failed_without_crashing() {
   setup_stub_curl
   setup_resolve_fixture
   local root="$SCRIPT_DIR/fixtures/notion-sync"
-  echo "# Vol 1 fixture content" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  echo "# Vol 1 fixture content" > "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md"
   printf '500\t-\t{"code":"error"}\n' > "$STUB_CURL_RESPONSES"
   local out rc
   out=$(NOTION_TOKEN="fake-token" sync_readme \
-    "$root/reconciliation_texts/vol_1_fixture/README.md" \
+    "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md" \
     "reconciliation_texts/vol_1_fixture" "$root" "ds-abc" "BE" "abcdef1234567" 2>/dev/null) && rc=0 || rc=$?
   assert_eq "sync_readme FAILED path: exits 0, doesn't crash the caller" "0" "$rc"
   assert_contains "sync_readme FAILED path: result line starts with FAILED:" "FAILED:" "$out"
@@ -487,7 +483,7 @@ test_sync_readme_create_response_missing_id() {
   setup_stub_curl
   setup_resolve_fixture
   local root="$SCRIPT_DIR/fixtures/notion-sync"
-  echo "# Vol 1 fixture content" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  echo "# Vol 1 fixture content" > "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md"
   # The create response is syntactically valid JSON (unlike the malformed-
   # response case already covered for find_page_by_handle) but simply has
   # no .id - a plain `jq -r '.id'` would print the literal string "null"
@@ -496,7 +492,7 @@ test_sync_readme_create_response_missing_id() {
   printf '200\t-\t{"results":[]}\n200\t-\t{"object":"page"}\n' > "$STUB_CURL_RESPONSES"
   local out rc
   out=$(NOTION_TOKEN="fake-token" sync_readme \
-    "$root/reconciliation_texts/vol_1_fixture/README.md" \
+    "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md" \
     "reconciliation_texts/vol_1_fixture" "$root" "ds-abc" "BE" "abcdef1234567" 2>/dev/null) && rc=0 || rc=$?
   assert_eq "sync_readme create response missing id: exits 0, doesn't crash" "0" "$rc"
   assert_contains "sync_readme create response missing id: reports FAILED" "FAILED:" "$out"
@@ -508,7 +504,7 @@ test_sync_readme_stamp_failure_names_result_and_page() {
   setup_stub_curl
   setup_resolve_fixture
   local root="$SCRIPT_DIR/fixtures/notion-sync"
-  echo "# Vol 1 fixture content" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  echo "# Vol 1 fixture content" > "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md"
   # lookup: no existing page (CREATE path) -> create succeeds -> stamp fails.
   # A plain "FAILED: metadata stamp failed" here would drop this page from
   # created_handles with no trace that a page WAS created and now sits
@@ -517,7 +513,7 @@ test_sync_readme_stamp_failure_names_result_and_page() {
   printf '200\t-\t{"results":[]}\n200\t-\t{"id":"new-page-1"}\n500\t-\t{"code":"error"}\n' > "$STUB_CURL_RESPONSES"
   local out
   out=$(NOTION_TOKEN="fake-token" sync_readme \
-    "$root/reconciliation_texts/vol_1_fixture/README.md" \
+    "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md" \
     "reconciliation_texts/vol_1_fixture" "$root" "ds-abc" "BE" "abcdef1234567")
   assert_contains "sync_readme stamp failure: still reports FAILED" "FAILED:" "$out"
   assert_contains "sync_readme stamp failure: names the already-known result (CREATED)" "CREATED" "$out"
@@ -531,20 +527,24 @@ test_sync_readme_reports_failed_without_crashing
 test_sync_readme_create_response_missing_id
 test_sync_readme_stamp_failure_names_result_and_page
 
+# Response for check_data_source_schema; main() makes one per data source
+# (RT, AT) before touching any page.
+SCHEMA_OK='200\t-\t{"properties":{"Name":{"type":"title"},"Handle":{"type":"rich_text"},"Market":{"type":"select"},"Last Updated":{"type":"date"}}}\n'
+
 test_cli_reports_failed_handles_via_github_output() {
   setup_stub_curl
   setup_resolve_fixture
   local root="$SCRIPT_DIR/fixtures/notion-sync"
-  echo "# Vol 1" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  echo "# Vol 1" > "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md"
   # one success (create), one duplicate
-  printf '200\t-\t{"results":[]}\n200\t-\t{"id":"new-page-1"}\n200\t-\t{"id":"new-page-1"}\n200\t-\t{"results":[{"id":"p1"},{"id":"p2"}]}\n' > "$STUB_CURL_RESPONSES"
+  printf "${SCHEMA_OK}${SCHEMA_OK}"'200\t-\t{"results":[]}\n200\t-\t{"id":"new-page-1"}\n200\t-\t{"id":"new-page-1"}\n200\t-\t{"results":[{"id":"p1","properties":{"Handle":{"rich_text":[{"plain_text":"AT_fixture"}]}}},{"id":"p2","properties":{"Handle":{"rich_text":[{"plain_text":"AT_fixture"}]}}}]}\n' > "$STUB_CURL_RESPONSES"
 
   local changed_file github_output
   changed_file="$SCRIPT_DIR/fixtures/notion-sync/changed-readmes.txt"
   printf '%s\n' \
-    "reconciliation_texts/vol_1_fixture/README.md" \
-    "account_templates/AT_fixture/README.md" > "$changed_file"
-  echo "# AT" > "$root/account_templates/AT_fixture/README.md"
+    "reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md" \
+    "account_templates/AT_fixture/template_info/AT_fixture.md" > "$changed_file"
+  echo "# AT" > "$root/account_templates/AT_fixture/template_info/AT_fixture.md"
 
   github_output="$SCRIPT_DIR/fixtures/notion-sync/github_output.txt"
   : > "$github_output"
@@ -578,17 +578,17 @@ test_cli_classifies_updated_and_failed_results() {
   setup_stub_curl
   setup_resolve_fixture
   local root="$SCRIPT_DIR/fixtures/notion-sync"
-  echo "# Vol 1" > "$root/reconciliation_texts/vol_1_fixture/README.md"
-  echo "# AT" > "$root/account_templates/AT_fixture/README.md"
+  echo "# Vol 1" > "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md"
+  echo "# AT" > "$root/account_templates/AT_fixture/template_info/AT_fixture.md"
   # vol_1_fixture: lookup finds an existing page -> UPDATED (3 calls: lookup,
   # update, stamp). AT_fixture: lookup itself errors -> FAILED:* (1 call).
-  printf '200\t-\t{"results":[{"id":"page-existing"}]}\n200\t-\t{"id":"page-existing"}\n200\t-\t{"id":"page-existing"}\n500\t-\t{"code":"error"}\n' > "$STUB_CURL_RESPONSES"
+  printf "${SCHEMA_OK}${SCHEMA_OK}"'200\t-\t{"results":[{"id":"page-existing","properties":{"Handle":{"rich_text":[{"plain_text":"vol_1_fixture"}]}}}]}\n200\t-\t{"id":"page-existing"}\n200\t-\t{"id":"page-existing"}\n500\t-\t{"code":"error"}\n' > "$STUB_CURL_RESPONSES"
 
   local changed_file github_output test_config
   changed_file="$SCRIPT_DIR/fixtures/notion-sync/changed-readmes.txt"
   printf '%s\n' \
-    "reconciliation_texts/vol_1_fixture/README.md" \
-    "account_templates/AT_fixture/README.md" > "$changed_file"
+    "reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md" \
+    "account_templates/AT_fixture/template_info/AT_fixture.md" > "$changed_file"
 
   github_output="$SCRIPT_DIR/fixtures/notion-sync/github_output.txt"
   : > "$github_output"
@@ -613,13 +613,13 @@ test_cli_stamp_failure_reports_both_failed_and_created() {
   setup_stub_curl
   setup_resolve_fixture
   local root="$SCRIPT_DIR/fixtures/notion-sync"
-  echo "# Vol 1" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  echo "# Vol 1" > "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md"
   # lookup: no existing page -> create succeeds -> stamp fails.
-  printf '200\t-\t{"results":[]}\n200\t-\t{"id":"new-page-1"}\n500\t-\t{"code":"error"}\n' > "$STUB_CURL_RESPONSES"
+  printf "${SCHEMA_OK}${SCHEMA_OK}"'200\t-\t{"results":[]}\n200\t-\t{"id":"new-page-1"}\n500\t-\t{"code":"error"}\n' > "$STUB_CURL_RESPONSES"
 
   local changed_file github_output test_config
   changed_file="$SCRIPT_DIR/fixtures/notion-sync/changed-readmes.txt"
-  printf '%s\n' "reconciliation_texts/vol_1_fixture/README.md" > "$changed_file"
+  printf '%s\n' "reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md" > "$changed_file"
 
   github_output="$SCRIPT_DIR/fixtures/notion-sync/github_output.txt"
   : > "$github_output"
@@ -638,39 +638,33 @@ JSON
     "created_handles=vol_1_fixture" "$(cat "$github_output")"
 }
 
-test_cli_reports_resolved_handle_not_dir_basename() {
+# The doc is named after the folder but the Notion row is found by
+# config.json's handle; if they differ the target row is ambiguous, so the
+# sync refuses instead of writing to either.
+test_cli_refuses_rt_whose_handle_differs_from_folder() {
   setup_stub_curl
   setup_resolve_fixture
   local root="$SCRIPT_DIR/fixtures/notion-sync"
-  # config.json's .handle can differ from the directory name for
-  # reconciliation_texts - reporting the directory basename here would
-  # undermine the created-page alert's own "check for a handle mismatch in
-  # config.json" guidance, since a real mismatch is exactly what the
-  # basename would hide instead of reveal.
-  mkdir -p "$root/reconciliation_texts/dir_name_fixture"
+  mkdir -p "$root/reconciliation_texts/dir_name_fixture/template_info"
   echo '{"handle": "actual_handle_value"}' > "$root/reconciliation_texts/dir_name_fixture/config.json"
-  echo "# Mismatched dir name" > "$root/reconciliation_texts/dir_name_fixture/README.md"
-  printf '200\t-\t{"results":[]}\n200\t-\t{"id":"new-page-1"}\n200\t-\t{"id":"new-page-1"}\n' > "$STUB_CURL_RESPONSES"
+  echo "# Mismatched dir name" > "$root/reconciliation_texts/dir_name_fixture/template_info/dir_name_fixture.md"
+  printf "${SCHEMA_OK}${SCHEMA_OK}" > "$STUB_CURL_RESPONSES"
 
   local changed_file github_output test_config
   changed_file="$SCRIPT_DIR/fixtures/notion-sync/changed-readmes.txt"
-  printf '%s\n' "reconciliation_texts/dir_name_fixture/README.md" > "$changed_file"
-
+  printf '%s\n' "reconciliation_texts/dir_name_fixture/template_info/dir_name_fixture.md" > "$changed_file"
   github_output="$SCRIPT_DIR/fixtures/notion-sync/github_output.txt"
   : > "$github_output"
-
-  test_config="$SCRIPT_DIR/fixtures/notion-sync/notion-config.json"
-  cat > "$test_config" << 'JSON'
-{"BE": {"reconciliation_texts": "ds-rt", "account_templates": "ds-at"}}
-JSON
+  test_config=$(write_cli_test_config BE)
 
   NOTION_TOKEN="fake-token" GITHUB_OUTPUT="$github_output" \
     bash "$SCRIPT_DIR/../sync-notion-docs.sh" "$changed_file" "$root" "BE" "abcdef1234567" "$test_config" > /dev/null 2>&1
 
-  assert_contains "CLI reports the resolved .handle, not the directory name" \
-    "created_handles=actual_handle_value" "$(cat "$github_output")"
-  assert_not_contains "CLI does not report the directory basename instead" \
-    "dir_name_fixture" "$(cat "$github_output")"
+  assert_eq "CLI handle/folder mismatch: reported as failed" \
+    "failed_handles=dir_name_fixture" "$(cat "$github_output")"
+  assert_eq "CLI handle/folder mismatch: no page lookup or write after the schema checks" \
+    "2" "$(curl_call_count)"
+  rm -rf "$root/reconciliation_texts/dir_name_fixture"
 }
 
 # --- CLI exit-0 safety contract -------------------------------------------
@@ -724,8 +718,8 @@ test_cli_malformed_config() {
 
   local changed_file github_output out rc
   changed_file="$root/changed-readmes.txt"
-  printf '%s\n' "reconciliation_texts/vol_1_fixture/README.md" > "$changed_file"
-  echo "# Vol 1" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  printf '%s\n' "reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md" > "$changed_file"
+  echo "# Vol 1" > "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md"
   github_output="$root/github_output.txt"
   : > "$github_output"
 
@@ -754,12 +748,12 @@ test_cli_market_not_in_config() {
   test_config=$(write_cli_test_config BE)
   # Enough queued responses that an unguarded run would happily complete a
   # full create+stamp cycle against the bogus "null" data source.
-  printf '200\t-\t{"results":[]}\n200\t-\t{"id":"new-page-1"}\n200\t-\t{"id":"new-page-1"}\n' > "$STUB_CURL_RESPONSES"
+  printf "${SCHEMA_OK}${SCHEMA_OK}"'200\t-\t{"results":[]}\n200\t-\t{"id":"new-page-1"}\n200\t-\t{"id":"new-page-1"}\n' > "$STUB_CURL_RESPONSES"
 
   local changed_file github_output out rc
   changed_file="$root/changed-readmes.txt"
-  printf '%s\n' "reconciliation_texts/vol_1_fixture/README.md" > "$changed_file"
-  echo "# Vol 1" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  printf '%s\n' "reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md" > "$changed_file"
+  echo "# Vol 1" > "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md"
   github_output="$root/github_output.txt"
   : > "$github_output"
 
@@ -788,12 +782,12 @@ test_cli_unwritable_github_output() {
   local test_config
   test_config=$(write_cli_test_config BE)
   # One clean create: lookup (no match), create, metadata stamp.
-  printf '200\t-\t{"results":[]}\n200\t-\t{"id":"new-page-1"}\n200\t-\t{"id":"new-page-1"}\n' > "$STUB_CURL_RESPONSES"
+  printf "${SCHEMA_OK}${SCHEMA_OK}"'200\t-\t{"results":[]}\n200\t-\t{"id":"new-page-1"}\n200\t-\t{"id":"new-page-1"}\n' > "$STUB_CURL_RESPONSES"
 
   local changed_file out rc
   changed_file="$root/changed-readmes.txt"
-  printf '%s\n' "reconciliation_texts/vol_1_fixture/README.md" > "$changed_file"
-  echo "# Vol 1" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  printf '%s\n' "reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md" > "$changed_file"
+  echo "# Vol 1" > "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md"
 
   # A directory can never be appended to, which is the simplest portable way
   # to make the `>>` redirection fail (running as root makes a chmod 000 file
@@ -811,8 +805,8 @@ test_cli_unwritable_github_output() {
     "WARN: could not write created_handles" "$out"
   assert_contains "CLI with an unwritable GITHUB_OUTPUT: the sync work itself still ran" \
     "reconciliation_texts/vol_1_fixture: CREATED" "$out"
-  assert_eq "CLI with an unwritable GITHUB_OUTPUT: all 3 calls were made before the failed append" \
-    "3" "$(curl_call_count)"
+  assert_eq "CLI with an unwritable GITHUB_OUTPUT: all 5 calls (2 schema + 3 sync) were made before the failed append" \
+    "5" "$(curl_call_count)"
   rm -rf "$github_output_dir"
 }
 
@@ -826,22 +820,22 @@ test_cli_joins_multiple_handles_readably() {
   local test_config
   test_config=$(write_cli_test_config BE)
 
-  mkdir -p "$root/account_templates/Dubieuze debiteuren"
+  mkdir -p "$root/account_templates/Dubieuze debiteuren/template_info"
   echo '{"id": {"542": 123}}' > "$root/account_templates/Dubieuze debiteuren/config.json"
-  echo "# AT one" > "$root/account_templates/Dubieuze debiteuren/README.md"
-  mkdir -p "$root/account_templates/Te ontvangen facturen"
+  echo "# AT one" > "$root/account_templates/Dubieuze debiteuren/template_info/Dubieuze debiteuren.md"
+  mkdir -p "$root/account_templates/Te ontvangen facturen/template_info"
   echo '{"id": {"542": 124}}' > "$root/account_templates/Te ontvangen facturen/config.json"
-  echo "# AT two" > "$root/account_templates/Te ontvangen facturen/README.md"
+  echo "# AT two" > "$root/account_templates/Te ontvangen facturen/template_info/Te ontvangen facturen.md"
 
   # Both templates are duplicates -> both land in failed_handles.
-  printf '200\t-\t{"results":[{"id":"p1"},{"id":"p2"}]}\n200\t-\t{"results":[{"id":"p3"},{"id":"p4"}]}\n' \
+  printf "${SCHEMA_OK}${SCHEMA_OK}"'200\t-\t{"results":[{"id":"p1","properties":{"Handle":{"rich_text":[{"plain_text":"Dubieuze debiteuren"}]}}},{"id":"p2","properties":{"Handle":{"rich_text":[{"plain_text":"Dubieuze debiteuren"}]}}}]}\n200\t-\t{"results":[{"id":"p3","properties":{"Handle":{"rich_text":[{"plain_text":"Te ontvangen facturen"}]}}},{"id":"p4","properties":{"Handle":{"rich_text":[{"plain_text":"Te ontvangen facturen"}]}}}]}\n' \
     > "$STUB_CURL_RESPONSES"
 
   local changed_file github_output
   changed_file="$root/changed-readmes.txt"
   printf '%s\n' \
-    "account_templates/Dubieuze debiteuren/README.md" \
-    "account_templates/Te ontvangen facturen/README.md" > "$changed_file"
+    "account_templates/Dubieuze debiteuren/template_info/Dubieuze debiteuren.md" \
+    "account_templates/Te ontvangen facturen/template_info/Te ontvangen facturen.md" > "$changed_file"
   github_output="$root/github_output.txt"
   : > "$github_output"
 
@@ -858,12 +852,190 @@ test_cli_joins_multiple_handles_readably() {
 test_cli_reports_failed_handles_via_github_output
 test_cli_classifies_updated_and_failed_results
 test_cli_stamp_failure_reports_both_failed_and_created
-test_cli_reports_resolved_handle_not_dir_basename
+test_cli_refuses_rt_whose_handle_differs_from_folder
 test_cli_missing_changed_readmes_file
 test_cli_malformed_config
 test_cli_market_not_in_config
 test_cli_unwritable_github_output
 test_cli_joins_multiple_handles_readably
+
+# --- template_info layout, handle trimming, row verification, schema ------
+
+test_trim_ws() {
+  assert_eq "trim_ws strips a trailing space" "Foo" "$(trim_ws "Foo ")"
+  assert_eq "trim_ws strips leading/trailing tabs and spaces" "Foo" "$(trim_ws $'\t Foo \t')"
+  assert_eq "trim_ws keeps interior double spaces" "Op te stellen of  te" "$(trim_ws "Op te stellen of  te ")"
+}
+
+test_template_dir_for_doc() {
+  assert_eq "template_dir_for_doc: RT doc" "reconciliation_texts/vol_1" \
+    "$(template_dir_for_doc "reconciliation_texts/vol_1/template_info/vol_1.md")"
+  assert_eq "template_dir_for_doc: AT doc with spaces and trailing space" "account_templates/Foo & Bar " \
+    "$(template_dir_for_doc "account_templates/Foo & Bar /template_info/Foo & Bar .md")"
+  local path rc
+  for path in \
+    "reconciliation_texts/wagenpark/README.md" \
+    "reconciliation_texts/vol_1/template_info/README.md" \
+    "reconciliation_texts/vol_1/template_info/vol_1_v2.md" \
+    "reconciliation_texts/vol_1/template_info/vol_1.MD" \
+    "reconciliation_texts/vol_1/template_info/old/vol_1.md" \
+    "reconciliation_texts/vol_1/tests/README.md" \
+    "shared_parts/x/template_info/x.md"; do
+    template_dir_for_doc "$path" > /dev/null && rc=0 || rc=$?
+    assert_eq "template_dir_for_doc rejects $path" "1" "$rc"
+  done
+}
+
+test_find_page_by_handle_trims_and_matches_trailing_space() {
+  setup_stub_curl
+  printf '200\t-\t{"results":[{"id":"page-t","properties":{"Handle":{"rich_text":[{"plain_text":"Facturen  creditnota"}]}}}]}\n' > "$STUB_CURL_RESPONSES"
+  local out
+  out=$(NOTION_TOKEN="fake-token" find_page_by_handle "ds-abc" "Facturen  creditnota ")
+  assert_eq "find_page_by_handle: trailing-space folder matches its trimmed Handle" "page-t" "$out"
+  assert_contains "find_page_by_handle: query sends the trimmed handle" '"equals": "Facturen  creditnota"' "$(curl_call_block 1)"
+}
+
+test_find_page_by_handle_rejects_non_exact_row() {
+  setup_stub_curl
+  printf '200\t-\t{"results":[{"id":"page-x","properties":{"Handle":{"rich_text":[{"plain_text":"VOL_1_fixture"}]}}}]}\n' > "$STUB_CURL_RESPONSES"
+  local out
+  out=$(NOTION_TOKEN="fake-token" find_page_by_handle "ds-abc" "vol_1_fixture" 2>/dev/null)
+  assert_eq "find_page_by_handle: a row with a different Handle is MISMATCH, not a target" "MISMATCH" "$out"
+}
+
+test_find_page_by_handle_row_without_handle_property() {
+  setup_stub_curl
+  printf '200\t-\t{"results":[{"id":"page-x"}]}\n' > "$STUB_CURL_RESPONSES"
+  local out rc
+  out=$(NOTION_TOKEN="fake-token" find_page_by_handle "ds-abc" "vol_1_fixture" 2>/dev/null) && rc=0 || rc=$?
+  assert_eq "find_page_by_handle: row without Handle exits 0" "0" "$rc"
+  assert_eq "find_page_by_handle: row without Handle is MISMATCH" "MISMATCH" "$out"
+}
+
+test_find_page_by_handle_picks_the_one_exact_row() {
+  setup_stub_curl
+  printf '200\t-\t{"results":[{"id":"page-other","properties":{"Handle":{"rich_text":[{"plain_text":"vol_1_fixture_old"}]}}},{"id":"page-exact","properties":{"Handle":{"rich_text":[{"plain_text":"vol_1_fixture"}]}}}]}\n' > "$STUB_CURL_RESPONSES"
+  local out
+  out=$(NOTION_TOKEN="fake-token" find_page_by_handle "ds-abc" "vol_1_fixture" 2>/dev/null)
+  assert_eq "find_page_by_handle: picks the single exact row among several" "page-exact" "$out"
+}
+
+test_find_page_by_handle_exact_row_without_id() {
+  setup_stub_curl
+  printf '200\t-\t{"results":[{"properties":{"Handle":{"rich_text":[{"plain_text":"vol_1_fixture"}]}}}]}\n' > "$STUB_CURL_RESPONSES"
+  local rc
+  NOTION_TOKEN="fake-token" find_page_by_handle "ds-abc" "vol_1_fixture" > /dev/null 2>&1 && rc=0 || rc=$?
+  assert_eq "find_page_by_handle: exact row with no id fails" "1" "$rc"
+}
+
+test_sync_readme_mismatch_writes_nothing() {
+  setup_stub_curl
+  setup_resolve_fixture
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  echo "# Vol 1" > "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md"
+  printf '200\t-\t{"results":[{"id":"page-x","properties":{"Handle":{"rich_text":[{"plain_text":"other"}]}}}]}\n' > "$STUB_CURL_RESPONSES"
+  local out
+  out=$(NOTION_TOKEN="fake-token" sync_readme \
+    "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md" \
+    "reconciliation_texts/vol_1_fixture" "$root" "ds-abc" "BE" 2>/dev/null)
+  assert_contains "sync_readme MISMATCH: reports FAILED" "FAILED:" "$out"
+  assert_eq "sync_readme MISMATCH: no create/update/stamp call" "1" "$(curl_call_count)"
+}
+
+test_sync_readme_create_trims_handle() {
+  setup_stub_curl
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  local dir="account_templates/Trailing space "
+  mkdir -p "$root/$dir/template_info"
+  echo '{}' > "$root/$dir/config.json"
+  echo "# AT" > "$root/$dir/template_info/Trailing space .md"
+  printf '200\t-\t{"results":[]}\n200\t-\t{"id":"new-page-1"}\n200\t-\t{"id":"new-page-1"}\n' > "$STUB_CURL_RESPONSES"
+  local out
+  out=$(NOTION_TOKEN="fake-token" sync_readme "$root/$dir/template_info/Trailing space .md" "$dir" "$root" "ds-at" "BE")
+  assert_eq "sync_readme trailing-space AT: CREATED" "CREATED" "$out"
+  assert_contains "sync_readme trailing-space AT: create sends trimmed Handle" '"content": "Trailing space"' "$(curl_call_block 2)"
+  rm -rf "${root:?}/$dir"
+}
+
+test_check_data_source_schema() {
+  setup_stub_curl
+  local rc out
+  printf "${SCHEMA_OK}" > "$STUB_CURL_RESPONSES"
+  NOTION_TOKEN="fake-token" check_data_source_schema "ds-abc" > /dev/null 2>&1 && rc=0 || rc=$?
+  assert_eq "check_data_source_schema: complete schema passes" "0" "$rc"
+  assert_contains "check_data_source_schema: GETs the data source" "-X GET https://api.notion.com/v1/data_sources/ds-abc" "$(curl_call_block 1)"
+
+  setup_stub_curl
+  printf '200\t-\t{"properties":{"Name":{"type":"title"},"Handle":{"type":"title"},"Market":{"type":"select"}}}\n' > "$STUB_CURL_RESPONSES"
+  out=$(NOTION_TOKEN="fake-token" check_data_source_schema "ds-abc" 2>&1) && rc=0 || rc=$?
+  assert_eq "check_data_source_schema: missing/wrong-typed property fails" "1" "$rc"
+  assert_contains "check_data_source_schema: names the missing property" "Last Updated (want date, got missing)" "$out"
+  assert_contains "check_data_source_schema: names the wrong-typed property" "Handle (want rich_text, got title)" "$out"
+
+  setup_stub_curl
+  printf '200\t-\t{"object":"data_source"}\n' > "$STUB_CURL_RESPONSES"
+  out=$(NOTION_TOKEN="fake-token" check_data_source_schema "ds-abc" 2>&1) && rc=0 || rc=$?
+  assert_eq "check_data_source_schema: response without properties fails" "1" "$rc"
+}
+
+test_cli_schema_problem_aborts_before_any_page_write() {
+  setup_stub_curl
+  setup_resolve_fixture
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  local test_config changed_file github_output
+  test_config=$(write_cli_test_config BE)
+  echo "# Vol 1" > "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md"
+  printf '200\t-\t{"properties":{"Name":{"type":"title"},"Handle":{"type":"rich_text"},"Market":{"type":"select"}}}\n200\t-\t{"results":[]}\n' > "$STUB_CURL_RESPONSES"
+  changed_file="$root/changed-readmes.txt"
+  printf '%s\n' "reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md" > "$changed_file"
+  github_output="$root/github_output.txt"
+  : > "$github_output"
+
+  NOTION_TOKEN="fake-token" GITHUB_OUTPUT="$github_output" \
+    bash "$SCRIPT_DIR/../sync-notion-docs.sh" "$changed_file" "$root" "BE" "abcdef1234567" "$test_config" > /dev/null 2>&1
+
+  assert_eq "CLI schema problem: alerts via GITHUB_OUTPUT" \
+    "failed_handles=config-error:schema:BE" "$(cat "$github_output")"
+  assert_eq "CLI schema problem: stops after the schema call" "1" "$(curl_call_count)"
+}
+
+test_cli_reports_non_template_info_paths() {
+  setup_stub_curl
+  setup_resolve_fixture
+  local root="$SCRIPT_DIR/fixtures/notion-sync"
+  local test_config changed_file github_output
+  test_config=$(write_cli_test_config BE)
+  echo "# dev notes" > "$root/reconciliation_texts/vol_1_fixture/README.md"
+  echo "# misnamed" > "$root/reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture_v2.md"
+  printf "${SCHEMA_OK}${SCHEMA_OK}" > "$STUB_CURL_RESPONSES"
+  changed_file="$root/changed-readmes.txt"
+  printf '%s\n' \
+    "reconciliation_texts/vol_1_fixture/README.md" \
+    "reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture_v2.md" > "$changed_file"
+  github_output="$root/github_output.txt"
+  : > "$github_output"
+
+  NOTION_TOKEN="fake-token" GITHUB_OUTPUT="$github_output" \
+    bash "$SCRIPT_DIR/../sync-notion-docs.sh" "$changed_file" "$root" "BE" "abcdef1234567" "$test_config" > /dev/null 2>&1
+
+  assert_eq "CLI non-template_info paths: both reported as failed, neither synced" \
+    "failed_handles=reconciliation_texts/vol_1_fixture/README.md, reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture_v2.md" \
+    "$(cat "$github_output")"
+  assert_eq "CLI non-template_info paths: only the schema calls ran" "2" "$(curl_call_count)"
+}
+
+test_trim_ws
+test_template_dir_for_doc
+test_find_page_by_handle_trims_and_matches_trailing_space
+test_find_page_by_handle_rejects_non_exact_row
+test_find_page_by_handle_row_without_handle_property
+test_find_page_by_handle_picks_the_one_exact_row
+test_find_page_by_handle_exact_row_without_id
+test_sync_readme_mismatch_writes_nothing
+test_sync_readme_create_trims_handle
+test_check_data_source_schema
+test_cli_schema_problem_aborts_before_any_page_write
+test_cli_reports_non_template_info_paths
 
 if [[ $failures -gt 0 ]]; then
   echo "$failures test(s) failed"
