@@ -1,25 +1,10 @@
-# Reusable workflow. Pushes the latest template code from the development PR(s)
-# linked to a functional-review Jira ticket to a Silverfin "review" firm.
+# Reusable workflow. Pushes the latest template code from the development PR(s) linked to a
+# functional-review Jira ticket to a Silverfin review firm. Market callers trigger it from a Jira
+# Automation button (repository_dispatch) or by hand (workflow_dispatch).
 #
-# A market repo wraps this with `repository_dispatch` (fired by a Jira Automation
-# button) and/or `workflow_dispatch`, passing the development ticket key(s) and the
-# product manager's review firm id.
-#
-# This file is currently only called by be_market, so the pilot behaviour below is
-# be_market-only in effect even though it lives in the shared repo. It refreshes
-# CONFIG_JSON itself before pushing: a Jira Automation button click can fire long after
-# the last cron tick, and the old reader-only design just failed cleanly on a stale
-# access token rather than refreshing first.
-#
-# The refresh runs as the `push` job's own first steps (the refresh-config-json
-# composite action), not as a separate `check-auth` job. That's deliberate, not a
-# simplification: a value one job writes to a secret is not visible to a later job in
-# the *same* run - confirmed empirically 2026-09-07, a downstream job's `secrets.*`
-# reflects the value at the moment the run was queued, not a sibling job's write
-# earlier in that run. `needs:` only orders jobs, it doesn't refresh what they see. So
-# `push` reads the local file the refresh step just wrote, never `secrets.CONFIG_JSON`
-# again after that. check_auth.yml itself is untouched by this - still correct for its
-# own callers, which have no same-run consumer to hand off to (the cron).
+# The `push` job refreshes CONFIG_JSON as its own first steps and then reads the local file the
+# refresh wrote: secrets.* is snapshotted when a run is created, so a separate refresh job's
+# write would never reach it.
 name: push-to-review-firm
 run-name: Push templates to a review firm (${{ inputs.dev_ticket_keys }})
 on:
@@ -70,14 +55,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Same message shapes as before, but the trigger now looks at the refresh outputs
-  # directly (`push`'s own outputs, sourced from the refresh-config-json action) rather
-  # than the whole job's result - `push` also runs the actual template push, and a
-  # generic "job failed" condition would misfire on an ordinary push failure that has
-  # nothing to do with auth. `always()` plus checking `refresh_completed`/`failed_firms`/
-  # `auto_renew_lost` directly still catches a zero-step startup_failure/cancellation
-  # (those outputs come back empty in that case too), it just doesn't also fire on an
-  # unrelated push error.
+  # Keys off the refresh outputs, not the job result, so an ordinary push failure doesn't page.
+  # Empty outputs (startup failure, cancel) still count as a failed refresh.
   alert-on-check-auth-failure:
     needs: push
     if: |
@@ -95,10 +74,7 @@ jobs:
             echo "No SLACK_CI_ALERTS_WEBHOOK_URL secret in this repository, skipping alert"
             exit 0
           fi
-          # Checked first: refresh_completed/failed_firms/auto_renew_lost are all set to their
-          # pre-write-back (healthy) values when the write-back itself is what failed, so this
-          # would otherwise fall through to the "everything succeeded" branch below and never
-          # alert on a genuine secret-persistence failure.
+          # Checked first: on a write-back failure the other outputs look healthy.
           if [[ "${WRITE_BACK_FAILED}" == "true" ]]; then
             FIRMS="none"
             DETAIL="every firm refreshed, but writing CONFIG_JSON back to the secret failed - check the job log"
@@ -136,14 +112,8 @@ jobs:
 
   push:
     runs-on: ubuntu-latest
-    # No `concurrency: group: refresh-tokens` here, even though the first step refreshes
-    # CONFIG_JSON: that group applies for the job's whole duration, not just the refresh, and
-    # this job's own duration isn't reliably short - it also checks out the repo, installs the
-    # CLI, and runs the full multi-PR template-push loop below. Serializing all of that against
-    # the cron would block it for however long a push run takes, same reasoning as test-templates
-    # in run_tests.yml. Accepted trade: this job's own refresh can race a concurrent cron/other-
-    # caller refresh with no GitHub-level serialization - bounded and loud (a clean exit 2 via the
-    # autoRenew interceptor), never silent.
+    # No concurrency group: it would hold for the whole push, not just the refresh. A lost refresh
+    # race fails loudly (failed_firms, and the write-back is refused).
     outputs:
       failed_firms: ${{ steps.refresh.outputs.failed_firms }}
       failed_firms_summary: ${{ steps.refresh.outputs.failed_firms_summary }}
@@ -164,15 +134,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Full owner/repo/path@ref, not a local `./` path: this workflow lives in
-      # bso_github_actions, but a reusable workflow's job runs in the CALLING repo's context
-      # (be_market here) - `actions/checkout` above checks out be_market, not this repo, so a
-      # `./`-path reference to an action defined in this same file's own repo never resolves,
-      # no matter where checkout runs. Confirmed the hard way: moving checkout earlier alone
-      # still fails with "Can't find action.yml" - only a fully-qualified remote reference
-      # works here, same as be_market's own run_tests.yml already does for this action.
-      # Pin to a full commit SHA; bump it whenever
-      # .github/actions/refresh-config-json/action.yml changes.
+      # Fully qualified: a reusable workflow runs in the caller's repo, so a `./` path never resolves.
+      # Pinned SHA; bump it whenever .github/actions/refresh-config-json/action.yml changes.
       - name: Refresh CONFIG_JSON
         id: refresh
         uses: silverfin/bso_github_actions/.github/actions/refresh-config-json@7d9fcbb581b6dee3d78b7973af50a9b48da44db4
@@ -210,8 +173,7 @@ jobs:
           FIRM_ID: ${{ steps.firm.outputs.firm_id }}
           DEV_KEYS: ${{ inputs.dev_ticket_keys }}
         run: |
-          # Reads the local file the refresh step already wrote, not secrets.CONFIG_JSON again -
-          # it already reflects this run's own refresh, which the secret itself would not.
+          # The local file, which has this run's refresh; the secret itself doesn't.
           IS_AUTHORIZED=$(jq -r --arg f "${FIRM_ID}" 'del(.defaultFirmIDs, .host) | has($f)' "$HOME/.silverfin/config.json" 2>/dev/null || echo "false")
           if [ "${IS_AUTHORIZED}" != "true" ]; then
             echo "::error::Review firm ${FIRM_ID} is not authorized for this repository (no OAuth tokens for it in CONFIG_JSON). Ask the developer who implemented ${DEV_KEYS} to authorize firm ${FIRM_ID} with the Silverfin CLI ('silverfin authorize') and add it to the repository's CONFIG_JSON secret."
@@ -265,10 +227,7 @@ jobs:
         with:
           node-version: 20
 
-      # Pinned to a SHA, not the branch name: silverfin-cli#273 is open and unmerged, so the
-      # branch ref is mutable - a later push or a force-push would change what this secret-writing
-      # job installs with no workflow diff to review. Same reasoning as run_tests.yml's own pin.
-      # Revert to unpinned once #273 merges.
+      # Pinned SHA of the open silverfin-cli#273 branch (a mutable ref). Unpin once it merges.
       - name: Install silverfin-cli
         run: |
           npm install https://github.com/silverfin/silverfin-cli.git#b072a6027f447437993728645a39bed2a0f6f5c9
@@ -279,9 +238,8 @@ jobs:
         env:
           FIRM_ID: ${{ steps.firm.outputs.firm_id }}
         run: |
-          # Credentials file already exists - the refresh step wrote it. The autoRenew
-          # interceptor gate reads only that flag, never the refreshToken's own value, so this
-          # job never legitimately needs a working refresh token on disk for its own runtime.
+          # The refresh step wrote the credentials file. The pinned CLI's renew gate checks autoRenew,
+          # not the refreshToken, so this job never needs a working refresh token on disk.
           jq 'to_entries | map(if (.key|test("^[0-9]+$")) then .value.refreshToken = "" else . end) | from_entries' \
             "$HOME/.silverfin/config.json" > "$HOME/.silverfin/config.stripped.json"
           mv "$HOME/.silverfin/config.stripped.json" "$HOME/.silverfin/config.json"
@@ -336,9 +294,7 @@ jobs:
               [ -z "${DIR}" ] && continue
               if [ -n "${PUSHED[$DIR]+x}" ]; then
                 echo "Skip ${DIR} — already pushed (PR #${FIRST_PR[$DIR]})."
-                # Stripped, not fenced - same technique already used below for ${OUT} - since DIR
-                # is a repo-tree directory name and a backtick in it would otherwise break out of
-                # this markdown code span.
+                # Backticks stripped: DIR is a repo directory name going into a markdown code span.
                 SAFE_DIR=$(tr -d '`|' <<< "${DIR}")
                 DUP_WARNINGS+=("\`${SAFE_DIR}\` was changed in PR #${FIRST_PR[$DIR]} and PR #${NUM} — kept PR #${FIRST_PR[$DIR]}'s version.")
                 continue
@@ -428,8 +384,7 @@ jobs:
               echo "| Template | PR | Result |"
               echo "|---|---|---|"
               for D in "${ORDER[@]}"; do
-                # A pipe in D would also break this table's own column structure, not just the
-                # code span - stripped for the same reason as the DUP_WARNINGS case above.
+                # Pipes stripped too: they'd break the table.
                 SAFE_D=$(tr -d '`|' <<< "${D}")
                 echo "| \`${SAFE_D}\` | #${FIRST_PR[$D]} | ${PUSHED[$D]} |"
               done
