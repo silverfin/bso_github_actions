@@ -33,16 +33,23 @@ jobs:
       # Step 3: Print list of changed files (internal maintenance)
       - name: Print list of changed yml/yaml files
         id: print-changed-yaml-files
+        # Passed via env (not inlined into the script), same convention as run_tests.yml: a
+        # changed filename is PR-author-controlled, and splicing it directly into `run:` would
+        # let a crafted filename (backticks, $(...)) execute as shell code before bash even sees
+        # the rest of this script.
+        env:
+          CHANGED_FILES: ${{ steps.get-changed-yaml-files.outputs.all_changed_files }}
         run: |
-          echo "Changed files: ${{ steps.get-changed-yaml-files.outputs.all_changed_files }}"
+          echo "Changed files: ${CHANGED_FILES}"
       # Step 4: Confirm if at least 1 YAML file has been changed
       - name: Confirm if at least 1 YAML file has been changed
         id: yaml_files_changed
+        env:
+          CHANGED_FILES: ${{ steps.get-changed-yaml-files.outputs.all_changed_files }}
         run: |
-          changed_files="${{ steps.get-changed-yaml-files.outputs.all_changed_files }}"
-          if [ -n "$changed_files" ]; then
+          if [ -n "${CHANGED_FILES}" ]; then
             echo "YAML files updated"
-            echo "Changed files: ${{ steps.get-changed-yaml-files.outputs.all_changed_files }}"
+            echo "Changed files: ${CHANGED_FILES}"
             exit 0
           else
             echo "YAML files NOT updated"
