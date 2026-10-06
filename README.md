@@ -53,6 +53,8 @@ The document will go over all the Github Actions that currently automate a coupl
   * [Liquid sampler](#liquid-sampler)
     * [Run liquid sampler (run_sampler.yml)](#run-liquid-sampler-run_sampleryml)
     * [Authorizing a partner for staging (scripts/authorize-partner-secret.sh)](#authorizing-a-partner-for-staging-scriptsauthorize-partner-secretsh)
+  * [Template documentation](#template-documentation)
+    * [Sync template docs to Notion (sync_notion_docs.yml)](#sync-template-docs-to-notion-sync_notion_docsyml)
 
 
 ## Overview
@@ -478,3 +480,16 @@ _When you need to re-run this:_
 
 * **Not needed for normal 401s.** A partner token that's simply gone stale (>24h old) self-heals — the sampler workflow's own refresh call authenticates on a digest match, not the token's age, so it mints a fresh token automatically mid-run and writes it back itself.
 * **Re-run this script only after a staging DB snapshot/reset**, which overwrites the partner's stored credentials server-side — that invalidates any token you're holding client-side, including the refresh path, so the sampler workflow's automatic 401 recovery also fails. Signature: a partner token fails on first use *and* on the workflow's automatic refresh attempt in the same run. Get a backend/console regeneration of the partner's api_key first, then re-run this script with the new key.
+
+### Template documentation
+
+#### Sync template docs to Notion `(sync_notion_docs.yml)`
+
+_Description:_
+On push to a market repo's `main`, mirrors every changed template-specific md (`<template folder>/template_info/<handle>.md`, created by `silverfin-uni-create-template-specific-md` in bso-cursor-rules) into that template's row in the market's Notion database, replacing the page body. Rows are found by `Handle`, compared with leading/trailing whitespace stripped (Notion trims text properties), and each returned row's `Handle` is re-checked before writing. Only `Last Updated` is stamped on an existing row; `Name` and `Market` are set only when a row has to be created, and `Package` is never written.
+
+Before syncing, it checks both databases have `Name` (title), `Handle` (text), `Market` (select) and `Last Updated` (date). A reconciliation text's doc is named after its `config.json` handle, an account template's after its folder. Duplicate or non-matching rows, a misnamed `.md` under `template_info/`, account-template folders that trim to the same `Handle`, and schema or Notion-reachability problems are all skipped and reported to Slack with a link to the run; so is a job that fails before it syncs. The sync script itself always exits 0.
+
+The workflow fetches the script and `notion-config.json` from the commit pinned in its `REF`, so a change to either must bump `REF` too; `check_sync_notion_ref.yml` fails the PR until `REF` serves exactly the PR's files.
+
+_Trigger:_ `workflow_call` with `market` (e.g. `BE`), from a market repo's `push` to `main`. Needs `NOTION_TOKEN`; `SLACK_CI_ALERTS_WEBHOOK_URL` is optional. Per-market setup: [docs/notion-market-setup.md](docs/notion-market-setup.md).

@@ -2,3 +2,18 @@
 /stats
 .env
 .DS_Store
+
+# scripts/test/fixtures/notion-sync/: setup_resolve_fixture (and friends) in
+# sync-notion-docs.test.sh delete-and-recreate reconciliation_texts/ and
+# account_templates/ on every run, and several tests write scratch files
+# (logs, response queues, generated README.md/config.json) directly into
+# this directory. Only stub-curl/ holds real, hand-authored fixtures - every
+# path below is disposable test output, never meant to be committed.
+scripts/test/fixtures/notion-sync/reconciliation_texts/
+scripts/test/fixtures/notion-sync/account_templates/
+scripts/test/fixtures/notion-sync/curl.log
+scripts/test/fixtures/notion-sync/curl-responses.tsv
+scripts/test/fixtures/notion-sync/changed-readmes.txt
+scripts/test/fixtures/notion-sync/github_output.txt
+scripts/test/fixtures/notion-sync/notion-config.json
+scripts/test/fixtures/notion-sync/sleep.log

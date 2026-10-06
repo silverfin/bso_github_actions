@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Fake sleep for tests, in the same stub directory (already prepended to
+# PATH by setup_stub_curl) so it's picked up wherever the real `sleep` would
+# be. Records its argument to $STUB_SLEEP_LOG instead of actually pausing -
+# lets a test assert on the exact backoff sequence notion_request slept
+# (e.g. "1 2 4 8 16") without the suite paying for the real wall-clock time.
+set -euo pipefail
+echo "$1" >> "${STUB_SLEEP_LOG:?STUB_SLEEP_LOG not set}"
