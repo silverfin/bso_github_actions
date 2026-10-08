@@ -256,7 +256,7 @@ _Prerequisites:_
 #### Push templates to review firm `(push_to_review_firm.yml)`
 
 _Description_:
-Reusable workflow. Pushes the latest template code from the development Pull Request(s) linked to a functional-review Jira ticket to a Silverfin "review" firm, so a product manager can populate their review environment with one click. It is the dispatch-driven, multi-PR, parameterised generalisation of `update_templates_review.yml`.
+Reusable workflow. Pushes the latest template code from the development Pull Request(s) linked to a functional-review Jira ticket to a Silverfin "review" firm, so a product manager can populate their review environment with one click.
 
 A market repo wraps this workflow with a `repository_dispatch` trigger (fired by a Jira Automation button on the functional-review ticket) and/or `workflow_dispatch` for manual testing, passing the development ticket key(s) and the product manager's review firm id.
 
