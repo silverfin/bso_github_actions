@@ -112,20 +112,20 @@ read it and the topic file for the workflow you're editing (see its `INDEX.md`).
    file* - it never re-reads `${{ secrets.CONFIG_JSON }}`, which is still the queue-time
    snapshot even within the same job. The secret context itself doesn't update mid-run; only a
    local write-back does. `needs: some-refresher-job` does NOT imply your job reads the
-   refreshed value either, even if that job runs first - `run_tests.yml`'s `test-templates`
-   job `needs: check-auth` but is a genuinely separate job, and still loads
-   `${{ secrets.CONFIG_JSON }}` (the queue-time snapshot) directly, not a same-run refresh.
-   Whether that's actually safe depends on whether the consumer can tolerate a secret that's
-   at most as stale as the queue-time snapshot (e.g. an access token still well inside its
-   normal validity window) - know which case you're in before assuming `needs:` bought you
-   freshness.
+   refreshed value either, even if that job runs first: a separate job still loads the
+   run-creation snapshot. That is why the old `run_tests.yml` (separate `check-auth` job, since
+   removed) was replaced by `run_tests_inline_auth.yml`, whose `test-templates` refreshes as its
+   own first step.
 
    **A `concurrency:` group does NOT fix a stale-snapshot race between two runs** - it is the
    obvious-looking fix and it does not work. Serializing makes the second run *wait*, but its
    snapshot was already taken when it was **queued**, so it still writes back a blob predating
    the first run's write. The winner's write is reverted just as silently, only later. For a
    read-whole-blob/write-whole-blob secret the workable pattern is **detect and refuse**: check
-   for other writers and fail loudly, rather than queueing behind them.
+   for other writers and fail loudly, rather than queueing behind them. A queue does work when
+   the thing that waits is what *creates* the next run: `run_tests_inline_auth.yml`'s
+   `rerun-losing-run` helpers share one `queue: max` group and each holds it until its re-run
+   has written `CONFIG_JSON` back, so the next re-run is created (and snapshots) after that write.
 
    **A guard that looks for other writers has to count its own workflow.** A run-listing check
    that names the *other* writers but not itself lets two dispatches of the same workflow pass
@@ -137,12 +137,13 @@ read it and the topic file for the workflow you're editing (see its `INDEX.md`).
    run count (in a busy repo 30 runs can be well under an hour, while a single test run has taken
    ~52m).
 
-   **Dispatching a fresh run is the only way to pick up another job's secret write, and it is
-   not a guarantee.** Because the snapshot is taken at run creation, the `gh workflow run` call
-   *is* the snapshot point. So a deliberate delay before dispatching is load-bearing for
-   freshness, not just anti-collision jitter - dispatch instantly and the new run can snapshot
-   the same stale value and fail identically. Don't write "guaranteed to see the winner's
-   write"; it is the only option that *can* see it.
+   **A new run or a re-run picks up another job's secret write; a running job never does.**
+   Measured in lu_market: `gh run rerun --failed` reads the *current* secret, not the original
+   run's snapshot. The creation of the run or re-run *is* the snapshot point, so create it only
+   after the write you need has landed (see the queue pattern above) - created too early, it
+   snapshots the same stale value and fails identically. To retry a PR run, re-run it rather
+   than dispatching a fresh one: only `pull_request`-event runs count toward the PR's required
+   check (see checklist 12).
 
 6. **`tj-actions/changed-files` needs `safe_output: false` and `quotepath: false`** when
    piping its output through `jq`. The default `safe_output: true` backslash-escapes shell
@@ -161,17 +162,10 @@ read it and the topic file for the workflow you're editing (see its `INDEX.md`).
      about what the workflow actually installs.
    - **A currently-open, unmerged CLI PR touches credential-handling code this workflow relies
      on**, so an ordinary `@main` merge elsewhere could change how secrets are handled here
-     with zero visible diff in *this* repo. `push_to_review_firm.yml` pins for this reason
-     (against open silverfin-cli#273), reverting once it merges. This is NOT "every
-     secret-writing workflow must always pin" - `check_auth.yml` also writes a secret
-     (`CONFIG_JSON`) and stays deliberately unpinned, because at the time of writing there's
-     no open CLI PR whose unmerged state it needs shielding from. Pin against a specific named
-     risk, not against the general category of "handles credentials."
-   - **This file's design is itself mid-migration** (e.g. the CI-auth pilot currently piloted
-     in `be_market` is expected to become the standard auth flow repo-wide) - treat any
-     specific-file example in this skill about auth/credential workflows as time-bound. Verify
-     against the current file rather than assuming `check_auth.yml`'s shape described here
-     still matches once that migration lands.
+     with zero visible diff in *this* repo. `run_tests_inline_auth.yml`,
+     `push_to_review_firm.yml` and `refresh-config-json` pin the same commit for this reason
+     (silverfin-cli#273, which honours the `autoRenew` flag), reverting once it merges. Pin
+     against a specific named risk, not against the general category of "handles credentials."
 
 8. **A new reusable workflow needs a README.md entry** (Individual Action Documentation
    section) - README drift on this file is treated as a real
@@ -184,11 +178,10 @@ read it and the topic file for the workflow you're editing (see its `INDEX.md`).
      its very next run** - no gradual rollout, no opt-out short of the caller pinning itself.
    - **`uses: .../X.yml@<sha>`** - pinned. A merge here does NOT reach that caller until its
      pin is bumped. Check the caller for a pin before assuming it tracks `main`.
-   - **Fully forked/inlined - no `uses:` reference at all.** Two shapes, both live: a permanent
-     local reimplementation (be_market's `run_tests.yml`) and a *temporary* inlined copy carried
-     while something upstream settles (`run_sampler.yml`, inlined in be/nl/lu - so that file
-     currently has **zero** `uses:` consumers and a merge to it changes nothing at runtime).
-     A merge here never reaches either automatically - only a human re-syncing does.
+   - **Inlined - no `uses:` reference at all.** A temporary copy carried while something
+     upstream settles: be/nl/lu each run their own copy of `run_sampler.yml`, so that file has
+     **zero** `uses:` consumers and a merge to it changes nothing at runtime. A merge here never
+     reaches an inlined copy - only a human re-syncing does.
 
    **Don't state the census from memory - it goes stale.** `push_to_review_firm.yml` was
    "be_market only" in this repo's own learnings until uk_market added a wrapper. Re-derive it
@@ -203,8 +196,9 @@ read it and the topic file for the workflow you're editing (see its `INDEX.md`).
    ```
 
    Design changes to an *existing* `uses:`-consumed workflow to be backward-compatible for
-   `@main` callers, or coordinate the merge explicitly; this is why this repo's own merge
-   policy restricts changes to "non-breaking for the non-pilot markets."
+   `@main` callers, or coordinate the merge explicitly: a change here reaches every market at
+   once. A changed `workflow_dispatch` input contract or a new job-level permission (see 18)
+   breaks callers without any diff in their repo.
 
 10. **Workflow commands are line-based - a newline ends the command.** Verified directly:
     `echo "::add-mask::${VAL}"` on a two-line value registers **only the first line** as a mask
@@ -304,11 +298,11 @@ read it and the topic file for the workflow you're editing (see its `INDEX.md`).
     only the guard step's ordering stopping the job from proceeding on nothing. Add the `!= ''`
     half to the condition rather than relying on step order.
 
-    **The corollary bites any dispatch-based retry.** A `workflow_dispatch` run's check runs
-    anchor to the dispatched ref's commit - the PR head SHA - and required checks match by name
-    with the latest winning. So a retry run supersedes the original red check. If anything in
-    that retry can skip or no-op the required job, the retry is a way to turn the gate green
-    having tested nothing. Check that before adding a retry, not after.
+    **A dispatched retry never clears a PR's red check.** Measured in lu_market: the PR's
+    check rollup only counts `pull_request`-event runs, so a `workflow_dispatch` run on the same
+    commit is ignored and the PR stays red. A re-run of the PR run (`gh run rerun`) does replace
+    the check. If anything in that re-run can skip or no-op the required job, it turns the gate
+    green having tested nothing - check that before adding a retry, not after.
 
 13. **Give any job a downstream alert `needs:` an explicit `timeout-minutes`.** The default is
     360. A job whose real work is a sleep plus two `gh` calls will, on one hung API call, hold
@@ -344,7 +338,7 @@ read it and the topic file for the workflow you're editing (see its `INDEX.md`).
     Query **per workflow** instead, which gives each one its own window (the same 50-run limit
     reached back days per writer):
     ```bash
-    for WF in run_tests.yml refresh_token.yml push_to_review_firm.yml; do
+    for WF in run_tests.yml push_to_review_firm.yml repair_firm_auth.yml; do
       gh run list --workflow "${WF}" --limit 50 --json databaseId,status,url,updatedAt
     done
     ```
@@ -404,6 +398,15 @@ read it and the topic file for the workflow you're editing (see its `INDEX.md`).
       grep -c '<<<<<<<'
     ```
 
+18. **A job-level `permissions:` in a reusable workflow can only narrow what the calling job
+    grants.** Ask for a scope a caller's job doesn't grant and GitHub rejects that caller's whole
+    run at startup: `startup_failure`, zero jobs, and a required check that never reports, so every
+    PR blocks. Neither actionlint nor a diff review sees it, because the callers live in other
+    repos. Shipped once (`pull-requests: read` on `rerun-losing-run`, fixed in #66): every
+    lu_market run failed until the hotfix. Keep each job inside the caller contract documented
+    in the workflow's header, and before merging, dispatch a market caller pointed at your branch
+    (a throwaway branch in the market repo) - the startup failure shows even on a dispatch run.
+
 ## Common mistakes (from review history, don't re-litigate)
 
 | Symptom | Cause | Fix |
@@ -432,13 +435,14 @@ read it and the topic file for the workflow you're editing (see its `INDEX.md`).
 | The operator read the annotation and missed "needs manual re-authorization" | Raw multi-line tool stderr was interpolated *before* the actionable sentence, and a newline ends the `::error::` command | Flatten (`tr '\n\r' '  '`) **and** put the instruction first, tool output last |
 | A PR's `postinstall` ran with `SF_API_SECRET` in env | `npm install` ran with cwd inside the checked-out PR tree | Install before checkout into `$RUNNER_TEMP` - see checklist 16 |
 | A merge silently reverted another PR's fix to the same line | Both PRs showed MERGEABLE; GitHub only checks each branch against `main` | `git merge-tree` the pair and fix the merge order - see checklist 17 |
+| Every caller's run became `startup_failure` with zero jobs | A reusable workflow's job asked for a permission the caller's job doesn't grant | Stay inside the caller contract; smoke-test via a market caller pointed at the branch - see checklist 18 |
+| A retry went green but the PR stayed red | The retry was a `workflow_dispatch` run; the PR only counts `pull_request`-event runs | Re-run the losing PR run instead - see checklist 12 |
 
 ## Also worth knowing
 
-- **The 5xx-only retry predicate in `check_auth.yml` and `refresh-config-json/action.yml` has not
-  caught up with the rule above.** Both are `grep -qE 'HTTP 5[0-9]{2}'` with `MAX_ATTEMPTS=3`, so
-  the rate-limit 403 / 429 guidance in this skill is currently ahead of those two implementations.
-  Worth knowing before you cite either as the reference to copy - copy the rule, not the file.
+- **The 5xx-only retry predicate in `refresh-config-json/action.yml` has not caught up with the
+  rule above.** It is `grep -qE 'HTTP 5[0-9]{2}'` with `MAX_ATTEMPTS=3`, so the rate-limit 403 /
+  429 guidance in this skill is ahead of it. Copy the rule, not that file.
 - **`github.run_started_at` does not exist.** It reads like it should, and it is a real field -
   but on the REST *run object*, not in the `github` context (whose properties stop at `run_id`,
   `run_number`, `run_attempt`). Interpolated it yields an empty string silently. Get a run's
@@ -458,5 +462,5 @@ read it and the topic file for the workflow you're editing (see its `INDEX.md`).
   own bump after a squash-merge.
 - After a token has already rotated server-side, a single failed `gh secret set` strands a
   dead stored credential. Retry transient GitHub errors (5xx, 429, and 403 only when the body
-  says rate-limit/`retry-after`); fail immediately on a plain 403. `check_auth.yml` and
+  says rate-limit/`retry-after`); fail immediately on a plain 403. `repair_firm_auth.yml` and
   `run_sampler.yml` are the reference write-backs.

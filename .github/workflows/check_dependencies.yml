@@ -2,7 +2,7 @@
 # changed in the PR. Triggered only when the `code-review` label is added.
 # Reusable workflow: call from a consumer repo with pull_request (labeled) and/or workflow_dispatch.
 #
-# Does not run check_auth: that job updates CONFIG_JSON via gh secret set, which notifies
+# Doesn't refresh CONFIG_JSON: writing it back via gh secret set notifies
 # repo/org admins by email. check-dependencies only scans local Liquid Test YAML files.
 #
 # silverfin-cli still requires SF_API_CLIENT_ID / SF_API_SECRET at process startup; callers
