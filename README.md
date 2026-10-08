@@ -334,7 +334,7 @@ _Authentication note:_
 
 _Prerequisites:_
 
-* `SF_API_CLIENT_ID`, `SF_API_SECRET`, `PARTNER_CONFIG_JSON` (per-partner secret resolved by the caller) and `REPO_ACCESS_TOKEN` (repo-scoped write PAT, for the token write-back) available to the caller.
+* `SF_API_CLIENT_ID`, `SF_API_SECRET`, `PARTNER_CONFIG_JSON` (per-partner secret resolved by the caller) and `REPO_ACCESS_TOKEN` available to the caller. The token needs Secrets: Read and write (token write-back) and Actions: Read and write (the automatic retry after a partner-login race starts a new run with it).
 * `SF_BASIC_AUTH` if the partner's host is a `*.staging.getsilverfin.com` gateway.
 * The partner must already be authorized with the Silverfin CLI (`silverfin authorize-partner`) and its `config.json` stored as the `PARTNER_CONFIG_JSON_<partner>` secret.
 

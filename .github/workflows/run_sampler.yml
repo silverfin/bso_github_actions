@@ -513,11 +513,11 @@ jobs:
           echo "::add-mask::${CONFIG_JSON}"
 
           # By this point the backend has ALREADY rotated away from BEFORE_TOKEN - unlike a
-          # firm's refresh token (self-heals via check_auth.yml's next */10 tick), the partner
-          # api_key has no other writer and no cron. A single failed write-back here doesn't
+          # firm's token pair (renewed by every liquid-test run), the partner api_key has no
+          # other writer. A single failed write-back here doesn't
           # just leave a stale secret, it strands a dead one: BEFORE_TOKEN no longer works
           # server-side, and AFTER_TOKEN never made it to disk. Retry transient failures
-          # (same shape as check_auth.yml's/repair_firm_auth.yml's write-back), and make the
+          # (same shape as repair_firm_auth.yml's write-back), and make the
           # final failure message say exactly that, naming the partner.
           MAX_ATTEMPTS=3
           ATTEMPT=1
@@ -528,7 +528,7 @@ jobs:
             # A newline ends an ::error:: command, so gh's multi-line output would push the
             # re-authorization instruction out of the annotation and into the raw log.
             ERR_LINE=$(tr '\n\r' '  ' <<< "${ERR}")
-            # 5xx is the check_auth.yml shape. Also retry explicit GitHub rate limits:
+            # Retry 5xx, and explicit GitHub rate limits:
             # 429, and 403 only when the body says rate-limit (a plain 403 is a permanent
             # auth/scope failure and must not burn retries). A network-layer failure carries no
             # HTTP status at all, and is the likeliest transient case of the three.
