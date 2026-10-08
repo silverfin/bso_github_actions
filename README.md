@@ -307,7 +307,7 @@ _Inputs:_
 * `partner` (required) — partner environment id (must be authorized — see `PARTNER_CONFIG_JSON` secret).
 * `handles` (optional) — reconciliation text handles to sample, **one per line** (directory names under `reconciliation_texts/`). Optional if `account_templates` is set.
 * `account_templates` (optional) — account template names to sample, **one per line** (directory names under `account_templates/`). Optional if `handles` is set.
-  * All three lists are newline-separated, **not** space-separated: account template directory names routinely contain spaces (e.g. `Investment- and depreciation details`), so a space-joined list is ambiguous and gets word-split into template names that don't exist (`Config file for account template "Investment-" not found`). Same convention as [`run_tests.yml`](#run-liquid-tests-run_testsyml). `firm_ids` is the exception — numeric, so it stays space-separated.
+  * All three lists are newline-separated, **not** space-separated: account template directory names routinely contain spaces (e.g. `Investment- and depreciation details`), so a space-joined list is ambiguous and gets word-split into template names that don't exist (`Config file for account template "Investment-" not found`). Same convention as [`run_tests_inline_auth.yml`](#run-liquid-tests-inline-auth-run_tests_inline_authyml). `firm_ids` is the exception — numeric, so it stays space-separated.
   * A name that **starts with `-`** is rejected before the CLI is called, and the job fails with the directory to rename. `silverfin-cli`'s `-h`/`-at`/`-s` are variadic options, so commander stops consuming values at the first `-`-prefixed token and would read such a name as a flag; a `--` separator does not protect variadic values. Only a leading `-` is affected — internal and trailing hyphens (`Cut-off`, `Investment- and depreciation details`) are fine.
 * `shared_parts` (optional) — shared part names to sample, **one per line** (directory names under `shared_parts/`). Optional if `handles` or `account_templates` is set. The sampler backend expands each shared part to every reconciliation text / account detail template that includes it, so one name here can fan out to many rendered templates — no `used_in` expansion is needed on the caller's side.
 * `firm_ids` (required) — firm id(s) to sample against, space-separated. The backend 422s if empty.
@@ -334,7 +334,7 @@ _Authentication note:_
 
 _Prerequisites:_
 
-* `SF_API_CLIENT_ID`, `SF_API_SECRET`, `PARTNER_CONFIG_JSON` (per-partner secret resolved by the caller) and `REPO_ACCESS_TOKEN` available to the caller. The token needs Secrets: Read and write (token write-back) and Actions: Read and write (the automatic retry after a partner-login race starts a new run with it).
+* `SF_API_CLIENT_ID`, `SF_API_SECRET`, `PARTNER_CONFIG_JSON` (per-partner secret resolved by the caller) and `REPO_ACCESS_TOKEN` available to the caller. The token needs Secrets: Read and write (token write-back), and for the automatic retry after a partner-login race, Actions: Read and write (it starts a new run) and Pull requests: Read and write (it lists, posts and removes a marker comment on the PR).
 * `SF_BASIC_AUTH` if the partner's host is a `*.staging.getsilverfin.com` gateway.
 * The partner must already be authorized with the Silverfin CLI (`silverfin authorize-partner`) and its `config.json` stored as the `PARTNER_CONFIG_JSON_<partner>` secret.
 

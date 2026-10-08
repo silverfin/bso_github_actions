@@ -215,7 +215,7 @@ jobs:
           # names do (e.g. "Investment- and depreciation details"), and word-splitting them
           # handed the CLI "Investment-" as a template name:
           #   [error] Config file for account template "Investment-" not found
-          # Same convention as run_tests.yml's TEMPLATE_BUCKETS.
+          # Same convention as run_tests_inline_auth.yml's TEMPLATE_BUCKETS.
           HANDLE_NAMES=()
           ACCOUNT_NAMES=()
           SHARED_NAMES=()
