@@ -1,6 +1,6 @@
 # Reader-only on CONFIG_JSON: it never refreshes tokens and never writes the secret back (avoids
-# becoming a concurrent writer of CONFIG_JSON, racing check_auth.yml's refresher). It relies on
-# the existing refresher to keep the secret fresh.
+# becoming a concurrent writer of CONFIG_JSON). Not updated for the current login handling: it
+# reads CONFIG_JSON without renewing it, so a token older than 2 hours fails.
 name: update-liquid-templates-review
 run-name: Update liquid templates for functional review
 # We run this action when a "functional review" label is added to the PR

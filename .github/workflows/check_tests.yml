@@ -33,7 +33,7 @@ jobs:
       # Step 3: Print list of changed files (internal maintenance)
       - name: Print list of changed yml/yaml files
         id: print-changed-yaml-files
-        # Passed via env (not inlined into the script), same convention as run_tests.yml: a
+        # Passed via env (not inlined into the script), same convention as run_tests_inline_auth.yml: a
         # changed filename is PR-author-controlled, and splicing it directly into `run:` would
         # let a crafted filename (backticks, $(...)) execute as shell code before bash even sees
         # the rest of this script.

@@ -1,14 +1,9 @@
 name: Refresh CONFIG_JSON
 description: >-
   Refreshes every firm's token pair in CONFIG_JSON and writes the result back to the caller's
-  secret. Same logic as check_auth.yml's refresh-tokens job, packaged as a composite action so a
-  job can run it as its own first step and use the local $HOME/.silverfin/config.json it writes
-  directly - a reusable *workflow* can only ever be its own separate job, and a value written to a
-  secret by one job is not visible to a later job in the same run (confirmed empirically
-  2026-09-07: a downstream job's `secrets.*` reflects the value at the moment the run was queued,
-  not a sibling job's write earlier in that same run). check_auth.yml itself is untouched by this
-  - it still exists for callers with no same-run consumer (the cron), and this action deliberately
-  duplicates rather than shares its steps so nothing here can regress that file's own callers.
+  secret. A composite action, so a job can run it as its own first step and use the local
+  $HOME/.silverfin/config.json it writes directly: a value written to a secret by one job is not
+  visible to a later job in the same run (`secrets.*` is snapshotted when the run is created).
 inputs:
   sf_api_client_id:
     description: "Silverfin API OAuth client id."

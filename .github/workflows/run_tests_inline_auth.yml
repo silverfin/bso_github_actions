@@ -3,7 +3,7 @@
 # The refresh seeds `autoRenew: false` per firm and the pinned CLI honours it, so a stale token
 # exits 2 instead of silently rotating the shared refresh token on the runner.
 #
-# Temporary name: replaces run_tests.yml once every market has switched.
+# Temporary name: to be renamed run_tests.yml, which needs each market's caller updated.
 #
 # Caller requirements:
 # - `workflow_dispatch` with a required string input `rerun_run_id` (used by retry-on-race).

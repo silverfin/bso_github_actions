@@ -1,6 +1,6 @@
 # Reader-only on CONFIG_JSON: it never refreshes tokens and never writes the secret back (avoids
-# becoming a concurrent writer of CONFIG_JSON, racing check_auth.yml's refresher). It relies on
-# the existing refresher to keep the secret fresh.
+# becoming a concurrent writer of CONFIG_JSON). Not updated for the current login handling: it
+# reads CONFIG_JSON without renewing it, so a token older than 2 hours fails.
 name: add-shared-parts-review
 run-name: Add shared parts to the functional review firm
 # We run this action when a "add-shared-parts-review-firm" label is added to the PR

@@ -40,11 +40,9 @@ The document will go over all the Github Actions that currently automate a coupl
     * [Add Code Review Label (add_code_review_label.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBfce44f57a01564acd95f8c0c98)
     * [Remove Code Review Label (remove_code_review_label.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf2828559422d84087b81255dc8)
   * [Authentication](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf4f743db4b6854130af8693671)
-    * [Check authentication (check_auth.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf73af65c6455e4bb6a62454b15)
     * [Repair a firm's CI auth token pair (repair_firm_auth.yml)](#repair-a-firms-ci-auth-token-pair-repair_firm_authyml)
   * [Testing](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf13d6dbd0df1e4450b3b22691c)
     * [Check YAML files (check_tests.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf931fa1547b4b419d940464f89)
-    * [Run liquid tests (run_tests.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBfa4878bb5baac49cbb0c39d927)
     * [Run liquid tests, inline auth (run_tests_inline_auth.yml)](#run-liquid-tests-inline-auth-run_tests_inline_authyml)
   * [Slack updates](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBfc9ca89d4b174494391ba075c5)
     * [Automated slack update (slack_changelog.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf862cf4257e68475d8b47891c6)
@@ -94,45 +92,6 @@ _Trigger_:
 
 
 ### Authentication
-
-#### Check authentication `(check_auth.yml)`
-
-_Description_:
-Refreshes Silverfin API tokens to ensure authentication remains valid for subsequent operations.
-
-_Inputs:_
-
-* `seed_no_auto_renew` (boolean, optional, default `false`) - when `true`, ensures every firm in the
-  calling repository's `CONFIG_JSON` carries an `autoRenew` flag, and fails the job if the CLI does
-  not preserve it through a refresh. Only top-level numeric firm IDs whose value is a JSON object
-  are seeded or asserted on; a firm record that is a scalar is left exactly as it is and is not
-  included in the round-trip check, since there is nothing on it to set a flag on. **The flag is written into the caller's own `CONFIG_JSON`
-  secret, so a single enabled run affects every workflow in that repository from then on, and this
-  workflow has no way to remove it again.** Nothing reads the flag yet, so enabling it changes no
-  renewal behaviour today - the only new effect is the round-trip check itself, which can fail the
-  job. It exists so the flag can be proven durable before anything depends on it.
-
-_Trigger_: 
-
-* The authentication workflow is run before the `run-tests` workflow to make sure that we always have the correct authentication before communicating with the platform. 
-
-
-_Steps:_
-
-* Installs the latest silverfin-cli version
-* Loads the CONFIG_JSON file from the secrets
-* Refreshes the tokens for all configured firms
-* Updates the CONFIG_JSON file secret with the refreshed tokens
-
-
-_Prerequisites_:
-
-* `SF_API_CLIENT_ID`: Silverfin API client ID
-* `SF_API_SECRET`: Silverfin API secret
-* `CONFIG_JSON`: Silverfin configuration file content
-* `REPO_ACCESS_TOKEN`: GitHub personal access token
-
-
 
 #### Repair a firm's CI auth token pair `(repair_firm_auth.yml)`
 
@@ -211,55 +170,16 @@ _Trigger:_
 * When labels are added (important for the `no-test-required` bypass logic)
 * When labels are removed (re-enables validation if `no-test-required` was removed)
 
-#### Run liquid tests `(run_tests.yml)`
-
-_Description:_
-Executes liquid tests for updated reconciliations and reconciliations that use updated shared parts.
-
-_Trigger_:
-
-* On every pull request to any branch (comprehensive testing)
-* When code is pushed directly to main (post-merge validation)
-* Runs on PR creation, updates (commits), and rebasing/merging actions
-
-
-_Steps:_
-
-* Calls `check_auth.yml` to refresh tokens
-* Identifies changed liquid/config files
-* Determines which templates need testing
-* Runs liquid tests using silverfin-cli `run-test` command
-* Supports multiple firm ID selection strategies ℹ️
-
-
-_Test firm options:_
-There is a certain priority when it comes to test firm id’s. Users do have some options to configure which test firm is used for the liquid tests. 
-
-
-1. **Template-specific test firm id**
-
-This is the most specific option that is available on a template by template basis. An additional attribute `test_firm_id` can be added to the `config.json` file. That firm will always get priority over the other two options.
-
-
-1. **Github test firm id**
-
-If the `test_firm_id` is not used for a specific handle, the Github action will look for a Github environment variable `SF_TEST_FIRM_ID`. This variable can be defined on [this page](https://github.com/silverfin/be_market/settings/variables/actions) (link to BE market) and will be used for every template within the market repo (so not template specific). 
-
-
-1. **Default test firm id**
-
-If none of the above options is used/defined, we will fall back to the default option: the first firm id that is present in the `config.json` file. This is again template specific, but the order cannot be changed (the smallest firm id number will always be on top). 
-
-
-
 #### Run liquid tests, inline auth `(run_tests_inline_auth.yml)`
 
 _Description:_
-Same tests as `run_tests.yml`, but `test-templates` refreshes `CONFIG_JSON` as its own first step
-instead of relying on a separate `check_auth.yml` job (whose write a later job in the same run never
-sees). Markets switch to it one at a time; once all have, it replaces `run_tests.yml`.
+Runs the liquid tests of the reconciliation texts and account templates a PR changes (a PR that only
+changes shared parts skips the tests), grouped per firm and run in parallel. `test-templates`
+refreshes `CONFIG_JSON` as its own first step: `secrets.*` is snapshotted when a run is created, so a
+refresh in a separate job would never reach the tests. Used by every market. Temporary name: it will
+be renamed to `run_tests.yml`, which needs each market's caller updated.
 
-_Differences from `run_tests.yml`:_
+_Behaviour:_
 
 * Refreshes tokens inline via the `refresh-config-json` action, seeding `autoRenew: false`, and blanks the refresh token on disk before tests run
 * If a concurrent run wins a refresh race, the losing PR run's failed jobs are re-run once (`retry-on-race` dispatches a small helper run that waits for the losing run to finish, then re-runs it; helpers take turns per repo, so two losers from one burst can't race each other again). A re-run counts for the PR's required check and reads the fresh token; Slack is alerted only if that fails
@@ -296,8 +216,8 @@ jobs:
     secrets: inherit
 ```
 
-Disable any scheduled `CONFIG_JSON` refresher (e.g. a `refresh_token.yml` cron) when switching: it
-races the inline refresh.
+Don't add a scheduled `CONFIG_JSON` refresher (e.g. a cron) to a caller repo: it races the inline
+refresh.
 
 ### Slack updates
 
