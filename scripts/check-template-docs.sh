@@ -21,6 +21,8 @@ extract_template_dirs() {
 }
 
 # Same shape, for shared_parts/<x>. Same `(grep ... || true)` reasoning.
+# This and resolve_fanout_consumers are only used by the disabled fan-out in
+# compute_expected_docs; kept for re-enabling it.
 extract_shared_part_dirs() {
   (grep -E '^shared_parts/[^/]+/' || true) \
     | sed -E 's#^(shared_parts/[^/]+)/.*#\1#' \
@@ -152,9 +154,10 @@ compute_expected_docs() {
   local changed
   changed=$(cat "$changed_files_path")
 
-  local template_dirs shared_part_dirs
+  local template_dirs
   template_dirs=$(extract_template_dirs <<< "$changed")
-  shared_part_dirs=$(extract_shared_part_dirs <<< "$changed")
+  # local shared_part_dirs
+  # shared_part_dirs=$(extract_shared_part_dirs <<< "$changed")
 
   local results=()
   while IFS= read -r dir; do
@@ -162,16 +165,18 @@ compute_expected_docs() {
     results+=("$(doc_path_for_dir "$dir" "$repo_root")")
   done <<< "$template_dirs"
 
-  local consumers
-  while IFS= read -r sp_dir; do
-    [[ -z "$sp_dir" ]] && continue
-    # Captured, not `< <(...)`: a process substitution hides the failure.
-    consumers=$(resolve_fanout_consumers "$sp_dir" "$repo_root") || return 1
-    while IFS= read -r consumer_dir; do
-      [[ -z "$consumer_dir" ]] && continue
-      results+=("$(doc_path_for_dir "$consumer_dir" "$repo_root")")
-    done <<< "$consumers"
-  done <<< "$shared_part_dirs"
+  # Shared-part fan-out disabled: a shared-part change does not require its
+  # consumers' docs to be updated. Uncomment to re-enable.
+  # local consumers
+  # while IFS= read -r sp_dir; do
+  #   [[ -z "$sp_dir" ]] && continue
+  #   # Captured, not `< <(...)`: a process substitution hides the failure.
+  #   consumers=$(resolve_fanout_consumers "$sp_dir" "$repo_root") || return 1
+  #   while IFS= read -r consumer_dir; do
+  #     [[ -z "$consumer_dir" ]] && continue
+  #     results+=("$(doc_path_for_dir "$consumer_dir" "$repo_root")")
+  #   done <<< "$consumers"
+  # done <<< "$shared_part_dirs"
 
   (( ${#results[@]} )) && printf '%s\n' "${results[@]}" | sort -u
   return 0
@@ -231,54 +236,40 @@ validate_doc_structure() {
   done
 
   # Unresolved skeleton placeholders: backtick-quoted {word} left as-is,
-  # e.g. `{handle}`, `{situation}`. A filled-in doc should have none.
-  # Character class includes digits/hyphen/comma/period, not just letters
-  # and spaces: the skill's own skeleton examples include placeholder text
-  # like `{plain-language answer}` and a hyphen-free class misses it
-  # silently (verified: `{plain-language answer}` does not match
-  # `[a-zA-Z_ /]+`, only the fixture's other, letters-only placeholders
-  # do - masking the gap behind an otherwise-passing test).
-  if grep -qE '`\{[a-zA-Z0-9_ /,.-]+\}`' "$readme_path"; then
+  # e.g. `{handle}`, `{situation}`. The class includes digits, hyphens, commas
+  # and periods because the skeleton has e.g. `{plain-language answer}`.
+  # `{to be confirmed}` (and variants like `{to be confirmed in a live file}`)
+  # is the skill's marker for an open question, not a placeholder.
+  local placeholder_lines rc=0 n
+  placeholder_lines=$(sed -E 's/`\{[Tt]o be confirmed[^}]*\}`//g' "$readme_path" \
+    | grep -nE '`\{[a-zA-Z0-9_ /,.-]+\}`' | cut -d: -f1) || rc=$?
+  if (( rc > 1 )); then
+    echo "ERROR: could not scan for placeholders (exit $rc)"
+    ok=1
+  elif [[ -n "$placeholder_lines" ]]; then
     echo "ERROR: unresolved placeholder(s) still present - the skeleton was not filled in:"
-    grep -nE '`\{[a-zA-Z0-9_ /,.-]+\}`' "$readme_path" | sed 's/^/  /'
+    while IFS= read -r n; do
+      printf '  %s:%s\n' "$n" "$(sed -n "${n}p" "$readme_path")"
+    done <<< "$placeholder_lines"
     ok=1
   fi
 
-  # PII backstop: BE-shaped VAT/company numbers and email addresses.
-  # This is a mechanical net under the skill's own PII rule, not a
-  # replacement for it - false positives are expected and acceptable.
-  local pii_matches
-  pii_matches=$(grep -nE '(BE[0-9]{10}|BE0[0-9]{3}\.[0-9]{3}\.[0-9]{3}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})' "$readme_path" || true)
-  if [[ -n "$pii_matches" ]]; then
-    echo "ERROR: possible PII (VAT/company number or email) found - generalize per the skill's PII rule:"
-    echo "$pii_matches" | sed 's/^/  /'
-    ok=1
-  fi
+  check_pii "$readme_path" || ok=1
 
   return $ok
 }
 
-# $1 = template dir, $2 = repo_root. Prints one line per .md file under
-# <dir>/template_info/ other than the expected one: a misnamed doc
-# (`{handle}_v2.md`, a `.MD` casing variant, a `README.md`), a second doc, or
-# one nested deeper. The skill allows exactly one doc per template.
-find_stray_docs() {
-  local dir="$1"
-  local repo_root="$2"
-  local info_dir="$repo_root/$dir/template_info"
-  [[ -d "$info_dir" ]] || return 0
-
-  local expected found
-  expected="$repo_root/$(doc_path_for_dir "$dir" "$repo_root")"
-  if ! found=$(find "$info_dir" -type f -iname '*.md' -print); then
-    echo "ERROR: could not list $dir/template_info" >&2
+# $1 = path to an md. PII backstop: BE-shaped VAT/company numbers and email
+# addresses. A mechanical net under the skill's own PII rule, not a
+# replacement for it - false positives are expected and acceptable.
+check_pii() {
+  local pii_matches
+  pii_matches=$(grep -nE '(BE[0-9]{10}|BE0[0-9]{3}\.[0-9]{3}\.[0-9]{3}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})' "$1" || true)
+  if [[ -n "$pii_matches" ]]; then
+    echo "ERROR: possible PII (VAT/company number or email) found - generalize per the skill's PII rule:"
+    echo "$pii_matches" | sed 's/^/  /'
     return 1
   fi
-  local path
-  while IFS= read -r path; do
-    [[ -z "$path" || "$path" == "$expected" ]] && continue
-    echo "${path#"$repo_root"/}"
-  done <<< "$found"
 }
 
 # CLI entrypoint - only runs when this file is executed directly, not when sourced.
@@ -341,30 +332,18 @@ main() {
   local invalid=()
   local changed dir errors
   while IFS= read -r changed; do
-    # Only the exact <dir>/template_info/<handle>.md is validated. Misnamed
-    # files are reported by find_stray_docs below; tests/README.md and a
+    # The exact <dir>/template_info/<handle>.md gets the full validation; other
+    # .md files next to it only the PII scan. tests/README.md and a
     # template-root README.md (developer notes) are not template docs at all.
-    [[ "$changed" =~ ^((reconciliation_texts|account_templates)/[^/]+)/template_info/ ]] || continue
+    [[ "$changed" =~ ^((reconciliation_texts|account_templates)/[^/]+)/template_info/.+\.[mM][dD]$ ]] || continue
     dir="${BASH_REMATCH[1]}"
-    [[ "$changed" == "$(doc_path_for_dir "$dir" "$repo_root")" ]] || continue
     [[ -f "$repo_root/$changed" ]] || continue
-    errors=$(validate_doc_structure "$repo_root/$changed") || invalid+=("$changed: $errors")
-  done < "$changed_files_path"
-
-  local stray=()
-  local template_dirs stray_out
-  template_dirs=$(extract_template_dirs < "$touched_path")
-  while IFS= read -r dir; do
-    [[ -z "$dir" ]] && continue
-    if ! stray_out=$(find_stray_docs "$dir" "$repo_root"); then
-      invalid+=("$dir/template_info: could not be listed")
-      continue
+    if [[ "$changed" == "$(doc_path_for_dir "$dir" "$repo_root")" ]]; then
+      errors=$(validate_doc_structure "$repo_root/$changed") || invalid+=("$changed: $errors")
+    else
+      errors=$(check_pii "$repo_root/$changed") || invalid+=("$changed: $errors")
     fi
-    [[ -z "$stray_out" ]] && continue
-    while IFS= read -r doc; do
-      stray+=("$doc (expected only $(doc_path_for_dir "$dir" "$repo_root"))")
-    done <<< "$stray_out"
-  done <<< "$template_dirs"
+  done < "$changed_files_path"
 
   local missing_report="" invalid_report=""
   if (( ${#not_created[@]} )); then
@@ -378,10 +357,6 @@ main() {
   if (( ${#invalid[@]} )); then
     invalid_report+="These template-specific mds have structural problems:"$'\n'
     invalid_report+=$(printf '%s\n' "${invalid[@]}" | sed 's/^/  - /')$'\n'
-  fi
-  if (( ${#stray[@]} )); then
-    invalid_report+="These files in template_info/ are misnamed or extra - one <handle>.md per template (an account template's handle is its folder name):"$'\n'
-    invalid_report+=$(printf '  - %s\n' "${stray[@]}")$'\n'
   fi
 
   [[ -n "$missing_report" ]] && printf '%s' "$missing_report"

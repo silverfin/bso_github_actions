@@ -240,11 +240,8 @@ test_compute_expected_docs() {
     "reconciliation_texts/vol_1_fixture/main.liquid")
   local actual
   actual=$(compute_expected_docs <(echo "$changed") "$root" 2>/dev/null)
-  local expected
-  expected=$(printf '%s\n' \
-    "account_templates/AT_fixture/template_info/AT_fixture.md" \
-    "reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md")
-  assert_eq "compute_expected_docs" "$expected" "$actual"
+  # Shared-part fan-out is disabled: only the directly changed template counts.
+  assert_eq "compute_expected_docs" "reconciliation_texts/vol_1_fixture/template_info/vol_1_fixture.md" "$actual"
 }
 
 test_compute_expected_docs_empty_input() {
@@ -450,6 +447,20 @@ MD
   fi
 }
 
+test_validate_doc_structure_to_be_confirmed_is_allowed() {
+  local doc out rc
+  doc=$(mktemp)
+  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$doc"
+  printf '%s\n' '- Legislation `{to be confirmed}`.' '- `{To be confirmed in a live file}`.' >> "$doc"
+  out=$(validate_doc_structure "$doc") && rc=0 || rc=$?
+  assert_eq "{to be confirmed} markers are not placeholders" "0" "$rc"
+  printf '%s\n' '- `{to be confirmed}` and `{handle}` on one line' >> "$doc"
+  out=$(validate_doc_structure "$doc") && rc=0 || rc=$?
+  assert_eq "a real placeholder next to {to be confirmed} still fails" "1" "$rc"
+  assert_contains "the original line is reported" '`{to be confirmed}` and `{handle}` on one line' "$out"
+  rm -f "$doc"
+}
+
 # Regression case: a wrong heading level (### instead of the required ##)
 # must not be accepted. Plain -F is a substring search, and "### Metadata"
 # contains "## Metadata" as a substring (starting at its second character),
@@ -584,30 +595,28 @@ test_cli_distinguishes_not_updated_from_not_created() {
   assert_contains "CLI: reports the absent doc as not created" "silverfin-uni-create-template-specific-md:"$'\n'"  - reconciliation_texts/no_doc/template_info/no_doc.md" "$cli_out"
 }
 
-test_cli_flags_misnamed_doc() {
+test_cli_misnamed_doc_does_not_satisfy_check() {
   local root
   root=$(new_fixture_root)
   mkdir -p "$root/reconciliation_texts/vol_1/template_info"
   cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/reconciliation_texts/vol_1/template_info/vol_1_v2.md"
   run_cli "$root" "reconciliation_texts/vol_1/main.liquid" "reconciliation_texts/vol_1/template_info/vol_1_v2.md"
-  assert_eq "CLI: misnamed doc: exit 1" "1" "$cli_rc"
-  assert_contains "CLI: misnamed doc is reported as stray" "reconciliation_texts/vol_1/template_info/vol_1_v2.md (expected only" "$cli_out"
+  assert_eq "CLI: misnamed doc does not replace the default one: exit 1" "1" "$cli_rc"
   assert_contains "CLI: misnamed doc leaves the real one missing" "  - reconciliation_texts/vol_1/template_info/vol_1.md" "$cli_out"
 }
 
-test_cli_flags_case_variant_doc() {
+test_cli_case_variant_doc_does_not_satisfy_check() {
   local root
   root=$(new_fixture_root)
   mkdir -p "$root/reconciliation_texts/vol_1/template_info"
   cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/reconciliation_texts/vol_1/template_info/vol_1.MD"
   run_cli "$root" "reconciliation_texts/vol_1/template_info/vol_1.MD"
-  assert_eq "CLI: .MD casing variant: exit 1" "1" "$cli_rc"
-  assert_contains "CLI: .MD casing variant is reported as stray" "template_info/vol_1.MD (expected only" "$cli_out"
+  assert_eq "CLI: .MD casing variant does not replace the default one: exit 1" "1" "$cli_rc"
+  assert_contains "CLI: .MD casing variant leaves the real one missing" "  - reconciliation_texts/vol_1/template_info/vol_1.md" "$cli_out"
 }
 
-# A pre-existing extra doc fails any PR touching the template, not just the
-# one that added it - one doc per template.
-test_cli_flags_extra_doc_already_on_disk() {
+# Extra docs next to the default one are allowed and not validated.
+test_cli_allows_extra_docs_next_to_default() {
   local root
   root=$(new_fixture_root)
   mkdir -p "$root/reconciliation_texts/vol_1/template_info/old"
@@ -615,9 +624,13 @@ test_cli_flags_extra_doc_already_on_disk() {
   echo '# legacy' > "$root/reconciliation_texts/vol_1/template_info/README.md"
   echo '# nested' > "$root/reconciliation_texts/vol_1/template_info/old/vol_1.md"
   run_cli "$root" "reconciliation_texts/vol_1/main.liquid" "reconciliation_texts/vol_1/template_info/vol_1.md"
-  assert_eq "CLI: extra docs on disk: exit 1" "1" "$cli_rc"
-  assert_contains "CLI: template_info/README.md is stray" "reconciliation_texts/vol_1/template_info/README.md (expected only" "$cli_out"
-  assert_contains "CLI: nested doc is stray" "reconciliation_texts/vol_1/template_info/old/vol_1.md (expected only" "$cli_out"
+  assert_eq "CLI: extra docs next to the default one pass" "0" "$cli_rc"
+
+  printf 'Contact: someone@example.com\n' > "$root/reconciliation_texts/vol_1/template_info/notes.md"
+  run_cli "$root" "reconciliation_texts/vol_1/main.liquid" "reconciliation_texts/vol_1/template_info/vol_1.md" \
+    "reconciliation_texts/vol_1/template_info/notes.md"
+  assert_eq "CLI: a changed extra doc is still PII-scanned: exit 1" "1" "$cli_rc"
+  assert_contains "CLI: names the extra doc" "template_info/notes.md: ERROR: possible PII" "$cli_out"
 }
 
 test_cli_non_md_files_in_template_info_are_ignored() {
@@ -694,8 +707,7 @@ test_cli_rt_doc_named_after_handle_not_folder() {
   cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/reconciliation_texts/model_condensed/template_info/model_condensed.md"
   run_cli "$root" "reconciliation_texts/model_condensed/main.liquid" \
     "reconciliation_texts/model_condensed/template_info/model_profit_loss_condensed.md"
-  assert_eq "CLI: an extra folder-named RT doc fails" "1" "$cli_rc"
-  assert_contains "CLI: folder-named RT doc is stray" "template_info/model_condensed.md (expected only" "$cli_out"
+  assert_eq "CLI: an extra folder-named RT doc is allowed" "0" "$cli_rc"
 }
 
 test_resolve_fanout_consumers_rt_handle_differs_from_folder() {
@@ -709,14 +721,14 @@ test_resolve_fanout_consumers_rt_handle_differs_from_folder() {
     "reconciliation_texts/model_condensed" "$(resolve_fanout_consumers "shared_parts/sp" "$root" 2>/dev/null)"
 }
 
-test_cli_malformed_shared_part_config_fails() {
+test_cli_shared_part_change_needs_no_consumer_docs() {
   local root
   root=$(new_fixture_root)
-  mkdir -p "$root/shared_parts/broken"
-  printf '{ not json' > "$root/shared_parts/broken/config.json"
-  run_cli "$root" "shared_parts/broken/broken.liquid"
-  assert_eq "CLI: unparseable shared-part config fails the gate" "1" "$cli_rc"
-  assert_contains "CLI: names the unparseable config" "shared_parts/broken has an unparseable config.json" "$cli_out"
+  mkdir -p "$root/shared_parts/sp" "$root/reconciliation_texts/vol_1/template_info"
+  echo '{"used_in":[{"type":"reconciliationText","handle":"vol_1"}]}' > "$root/shared_parts/sp/config.json"
+  cp "$SCRIPT_DIR/fixtures/readmes/valid.README.md" "$root/reconciliation_texts/vol_1/template_info/vol_1.md"
+  run_cli "$root" "shared_parts/sp/sp.liquid"
+  assert_eq "CLI: shared-part change needs no consumer docs" "0" "$cli_rc"
 }
 
 test_cli_deleting_only_the_doc_fails() {
@@ -758,6 +770,7 @@ test_validate_doc_structure_valid
 test_validate_doc_structure_missing_heading
 test_validate_doc_structure_unresolved_placeholder
 test_validate_doc_structure_unresolved_placeholder_with_hyphen_and_digit
+test_validate_doc_structure_to_be_confirmed_is_allowed
 test_validate_doc_structure_wrong_heading_level
 test_validate_doc_structure_pii_leak
 test_cli_passes_when_nothing_missing_and_all_valid
@@ -769,9 +782,9 @@ test_doc_path_for_dir
 test_resolve_fanout_consumers_ignores_root_readme
 test_cli_root_readme_does_not_satisfy_check
 test_cli_distinguishes_not_updated_from_not_created
-test_cli_flags_misnamed_doc
-test_cli_flags_case_variant_doc
-test_cli_flags_extra_doc_already_on_disk
+test_cli_misnamed_doc_does_not_satisfy_check
+test_cli_case_variant_doc_does_not_satisfy_check
+test_cli_allows_extra_docs_next_to_default
 test_cli_non_md_files_in_template_info_are_ignored
 test_cli_account_template_with_trailing_space_and_metacharacters
 test_cli_validates_changed_doc_structure
@@ -779,7 +792,7 @@ test_cli_unreadable_changed_files
 test_cli_github_output_carries_report
 test_cli_rt_doc_named_after_handle_not_folder
 test_resolve_fanout_consumers_rt_handle_differs_from_folder
-test_cli_malformed_shared_part_config_fails
+test_cli_shared_part_change_needs_no_consumer_docs
 test_cli_deleting_only_the_doc_fails
 test_cli_deleting_a_whole_template_passes
 

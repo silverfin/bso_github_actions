@@ -303,9 +303,9 @@ races the inline refresh.
 #### Check template docs `(check_template_docs.yml)`
 
 _Description:_
-Fails a PR that changes a reconciliation text or account template without also adding or updating its template-specific md: `<template folder>/template_info/<handle>.md`, the file `silverfin-uni-create-template-specific-md` (bso-cursor-rules) creates. A reconciliation text's handle comes from its `config.json`; an account template's is its folder name, verbatim. A change to a shared part also requires the docs of its consumers that already have one, and deleting a doc while its template stays counts as a missing doc. An unparseable shared-part `config.json` fails the check rather than skipping its consumers.
+Fails a PR that changes a reconciliation text or account template without also adding or updating its template-specific md: `<template folder>/template_info/<handle>.md`, the file `silverfin-uni-create-template-specific-md` (bso-cursor-rules) creates. A reconciliation text's handle comes from its `config.json`; an account template's is its folder name, verbatim. Deleting a doc while its template stays counts as a missing doc. A change to a shared part does not require its consumers' docs to be updated (that fan-out is commented out in the script).
 
-It also fails when a changed doc is missing a required section (`## Metadata`, `## Functional overview`, `## Scenarios & edge cases`, `## FAQ / support answers`), still contains skeleton placeholders or looks like it contains PII, and when a touched template's `template_info/` holds any other `.md` (a misnamed copy, a `README.md`, a casing variant). A `README.md` at the template root is developer notes and does not count.
+It also fails when a changed doc is missing a required section (`## Metadata`, `## Functional overview`, `## Scenarios & edge cases`, `## FAQ / support answers`), still contains skeleton placeholders (`{to be confirmed}` markers are allowed) or looks like it contains PII. Other `.md` files in `template_info/` are allowed next to the default one; a changed one only gets the PII scan. A `README.md` at the template root is developer notes and does not count.
 
 Bypass with the `no-readme-required` label.
 
