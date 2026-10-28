@@ -1,6 +1,6 @@
 # Reusable liquid-test workflow. test-templates refreshes CONFIG_JSON as its own first step:
 # secrets.* is snapshotted when a run is created, so a refresh in a separate job never reaches it.
-# The refresh seeds `autoRenew: false` per firm and the pinned CLI honours it, so a stale token
+# The refresh seeds `autoRenew: false` per firm and the CLI honours it, so a stale token
 # exits 2 instead of silently rotating the shared refresh token on the runner.
 #
 # Temporary name: to be renamed run_tests.yml, which needs each market's caller updated.
@@ -452,13 +452,12 @@ jobs:
           node-version: 22
       # Before checkout, outside the workspace: `npm install` would otherwise run a PR-added
       # package.json's install scripts with this job's secrets in env.
-      - name: "Add silverfin-cli package (pinned to the autoRenew branch)"
+      - name: "Add silverfin-cli package"
         if: ${{ env.HAS_CHANGED_TEMPLATES == 'true' }}
-        # Pinned SHA of the open silverfin-cli#273 branch (a mutable ref). Unpin once it merges.
         run: |
           INSTALL_DIR="${RUNNER_TEMP}/silverfin-cli-install"
           mkdir -p "${INSTALL_DIR}"
-          npm install --prefix "${INSTALL_DIR}" --ignore-scripts https://github.com/silverfin/silverfin-cli.git#b072a6027f447437993728645a39bed2a0f6f5c9
+          npm install --prefix "${INSTALL_DIR}" --ignore-scripts https://github.com/silverfin/silverfin-cli.git
           echo "SILVERFIN_CLI_BIN=${INSTALL_DIR}/node_modules/silverfin-cli/bin/cli.js" >> "$GITHUB_ENV"
       - name: Checkout Repository - Fetch all history for all tags and branches
         if: ${{ env.HAS_CHANGED_TEMPLATES == 'true' }}
@@ -469,7 +468,7 @@ jobs:
       - name: Blank the refresh token on disk
         if: ${{ env.HAS_CHANGED_TEMPLATES == 'true' }}
         run: |
-          # The pinned CLI's renew gate checks autoRenew, not the refreshToken, so the tests never need
+          # The CLI's renew gate checks autoRenew, not the refreshToken, so the tests never need
           # a working refresh token on disk, on a runner whose contents a PR controls.
           jq 'to_entries | map(if (.key|test("^[0-9]+$")) then .value.refreshToken = "" else . end) | from_entries' \
             "$HOME/.silverfin/config.json" > "$HOME/.silverfin/config.stripped.json"

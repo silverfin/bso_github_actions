@@ -227,10 +227,9 @@ jobs:
         with:
           node-version: 20
 
-      # Pinned SHA of the open silverfin-cli#273 branch (a mutable ref). Unpin once it merges.
       - name: Install silverfin-cli
         run: |
-          npm install https://github.com/silverfin/silverfin-cli.git#b072a6027f447437993728645a39bed2a0f6f5c9
+          npm install https://github.com/silverfin/silverfin-cli.git
           VERSION=$(node ./node_modules/silverfin-cli/bin/cli.js -V)
           echo "silverfin-cli version: ${VERSION}"
 
@@ -238,7 +237,7 @@ jobs:
         env:
           FIRM_ID: ${{ steps.firm.outputs.firm_id }}
         run: |
-          # The refresh step wrote the credentials file. The pinned CLI's renew gate checks autoRenew,
+          # The refresh step wrote the credentials file. The CLI's renew gate checks autoRenew,
           # not the refreshToken, so this job never needs a working refresh token on disk.
           jq 'to_entries | map(if (.key|test("^[0-9]+$")) then .value.refreshToken = "" else . end) | from_entries' \
             "$HOME/.silverfin/config.json" > "$HOME/.silverfin/config.stripped.json"
