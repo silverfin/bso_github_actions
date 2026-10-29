@@ -1,0 +1,93 @@
+# .github/workflows/check_template_docs.yml
+name: check-template-docs
+
+on:
+  workflow_call: {}
+
+jobs:
+  skip-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    if: contains(github.event.pull_request.labels.*.name, 'no-readme-required')
+    steps:
+      - run: echo "no-readme-required label present, skipping"
+
+  check-template-docs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'no-readme-required') }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@24d32ffd492484c1d75e0c0b894501ddb9d30d62 # v47
+        with:
+          base_sha: 'main'
+          dir_names: false
+          # Emit the file list as a JSON array so paths containing spaces (e.g. account
+          # template names) survive the hand-off intact. escape_json: false keeps it valid
+          # JSON for jq. safe_output: false stops backslash-escaping of shell metacharacters
+          # (& ( ) ...) inside the JSON values, which is invalid JSON and would silently
+          # empty the list - safe here, the list is passed via env and parsed with jq, never
+          # eval'd by the shell. quotepath: false emits non-ASCII paths as-is instead of
+          # octal-escaping them (which would break the downstream regex match).
+          json: true
+          escape_json: false
+          safe_output: false
+          quotepath: false
+          files: |
+            **/**.{liquid,yml,yaml,json,md,MD,Md,mD}
+
+      - name: Write changed and deleted files to plain lists
+        env:
+          # Passed via env (not inlined into the shell body), so a path with quotes/spaces/
+          # metacharacters cannot break the script or be interpreted as shell syntax.
+          ALL_CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
+          DELETED_FILES: ${{ steps.changed-files.outputs.deleted_files }}
+        run: |
+          # Fail loudly if either output is not valid JSON. A silent jq failure here would
+          # empty a list and let templates through unchecked.
+          for VAR in ALL_CHANGED_FILES DELETED_FILES; do
+            if ! printf '%s' "${!VAR:-[]}" | jq -e 'type == "array"' > /dev/null; then
+              echo "::error::changed-files ${VAR} output is not a JSON array, refusing to skip the check silently"
+              exit 1
+            fi
+          done
+          printf '%s' "${ALL_CHANGED_FILES:-[]}" | jq -r '.[]' > /tmp/changed_files.txt
+          printf '%s' "${DELETED_FILES:-[]}" | jq -r '.[]' > /tmp/deleted_files.txt
+
+      - name: Fetch check-template-docs.sh
+        run: |
+          curl -fsSL -o /tmp/check-template-docs.sh \
+            "https://raw.githubusercontent.com/silverfin/bso_github_actions/main/scripts/check-template-docs.sh"
+
+      - name: Check template docs
+        id: check-template-docs
+        env:
+          REPO_ROOT: ${{ github.workspace }}
+        run: bash /tmp/check-template-docs.sh /tmp/changed_files.txt "${REPO_ROOT}" /tmp/deleted_files.txt
+
+      - name: Summarize failures
+        if: failure()
+        env:
+          MISSING_DOCS: ${{ steps.check-template-docs.outputs.missing_docs }}
+          INVALID_DOCS: ${{ steps.check-template-docs.outputs.invalid_docs }}
+        run: |
+          # Both empty means the check never produced a report (fetch, input or script
+          # error), not that nothing is wrong.
+          if [[ -z "${MISSING_DOCS}${INVALID_DOCS}" ]]; then
+            echo "### Template docs check did not complete - see the step log" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "### Missing template-specific mds"
+            printf '%s\n' "${MISSING_DOCS:-none}"
+            echo "### Template-specific md problems"
+            printf '%s\n' "${INVALID_DOCS:-none}"
+          } >> "$GITHUB_STEP_SUMMARY"

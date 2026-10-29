@@ -44,6 +44,7 @@ The document will go over all the Github Actions that currently automate a coupl
   * [Testing](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf13d6dbd0df1e4450b3b22691c)
     * [Check YAML files (check_tests.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf931fa1547b4b419d940464f89)
     * [Run liquid tests, inline auth (run_tests_inline_auth.yml)](#run-liquid-tests-inline-auth-run_tests_inline_authyml)
+    * [Check template docs (check_template_docs.yml)](#check-template-docs-check_template_docsyml)
   * [Slack updates](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBfc9ca89d4b174494391ba075c5)
     * [Automated slack update (slack_changelog.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf862cf4257e68475d8b47891c6)
   * [Review firm deployment](#review-firm-deployment)
@@ -218,6 +219,17 @@ jobs:
 
 Don't add a scheduled `CONFIG_JSON` refresher (e.g. a cron) to a caller repo: it races the inline
 refresh.
+
+#### Check template docs `(check_template_docs.yml)`
+
+_Description:_
+Fails a PR that changes a reconciliation text or account template without also adding or updating its template-specific md: `<template folder>/template_info/<handle>.md`, the file `silverfin-uni-create-template-specific-md` (bso-cursor-rules) creates. A reconciliation text's handle comes from its `config.json`; an account template's is its folder name, verbatim. Deleting a doc while its template stays counts as a missing doc. A change to a shared part does not require its consumers' docs to be updated (that fan-out is commented out in the script).
+
+It also fails when a changed doc is missing a required section (`## Metadata`, `## Functional overview`, `## Scenarios & edge cases`, `## FAQ / support answers`), still contains skeleton placeholders (`{to be confirmed}` markers are allowed) or looks like it contains PII. Other `.md` files in `template_info/` are allowed next to the default one; a changed one only gets the PII scan. A `README.md` at the template root is developer notes and does not count.
+
+Bypass with the `no-readme-required` label.
+
+_Trigger:_ `workflow_call`, from a market repo's `pull_request` workflow (include the `labeled`/`unlabeled` types so the bypass label takes effect).
 
 ### Slack updates
 
