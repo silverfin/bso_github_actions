@@ -162,7 +162,8 @@ read it and the topic file for the workflow you're editing (see its `INDEX.md`).
      about what the workflow actually installs.
    - **A currently-open, unmerged CLI PR touches credential-handling code this workflow relies
      on**, so an ordinary `@main` merge elsewhere could change how secrets are handled here
-     with zero visible diff in *this* repo. Pin against a specific named risk, not against the general category of "handles credentials."
+     with zero visible diff in *this* repo. Pin against a specific named risk, not against
+     the general category of "handles credentials."
 
 8. **A new reusable workflow needs a README.md entry** (Individual Action Documentation
    section) - README drift on this file is treated as a real
