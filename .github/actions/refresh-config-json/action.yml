@@ -44,12 +44,10 @@ runs:
       uses: actions/setup-node@v6
       with:
         node-version: 22
-    # Same pinned CLI commit as the callers: this step holds real API credentials and a
-    # secret-writing PAT. Unpin once silverfin-cli#273 merges.
-    - name: Add silverfin-cli package (pinned)
+    - name: Add silverfin-cli package
       shell: bash
       run: |
-        npm install https://github.com/silverfin/silverfin-cli.git#b072a6027f447437993728645a39bed2a0f6f5c9
+        npm install https://github.com/silverfin/silverfin-cli.git
         VERSION=$(./node_modules/silverfin-cli/bin/cli.js -V)
         echo "[Action] CLI version: ${VERSION}"
     - name: Create Silverfin config file

@@ -135,10 +135,9 @@ jobs:
           fetch-depth: 0
 
       # Fully qualified: a reusable workflow runs in the caller's repo, so a `./` path never resolves.
-      # Pinned SHA; bump it whenever .github/actions/refresh-config-json/action.yml changes.
       - name: Refresh CONFIG_JSON
         id: refresh
-        uses: silverfin/bso_github_actions/.github/actions/refresh-config-json@7d9fcbb581b6dee3d78b7973af50a9b48da44db4
+        uses: silverfin/bso_github_actions/.github/actions/refresh-config-json@main
         with:
           sf_api_client_id: ${{ secrets.SF_API_CLIENT_ID }}
           sf_api_secret: ${{ secrets.SF_API_SECRET }}
@@ -227,10 +226,9 @@ jobs:
         with:
           node-version: 20
 
-      # Pinned SHA of the open silverfin-cli#273 branch (a mutable ref). Unpin once it merges.
       - name: Install silverfin-cli
         run: |
-          npm install https://github.com/silverfin/silverfin-cli.git#b072a6027f447437993728645a39bed2a0f6f5c9
+          npm install https://github.com/silverfin/silverfin-cli.git
           VERSION=$(node ./node_modules/silverfin-cli/bin/cli.js -V)
           echo "silverfin-cli version: ${VERSION}"
 
@@ -238,7 +236,7 @@ jobs:
         env:
           FIRM_ID: ${{ steps.firm.outputs.firm_id }}
         run: |
-          # The refresh step wrote the credentials file. The pinned CLI's renew gate checks autoRenew,
+          # The refresh step wrote the credentials file. The CLI's renew gate checks autoRenew,
           # not the refreshToken, so this job never needs a working refresh token on disk.
           jq 'to_entries | map(if (.key|test("^[0-9]+$")) then .value.refreshToken = "" else . end) | from_entries' \
             "$HOME/.silverfin/config.json" > "$HOME/.silverfin/config.stripped.json"
