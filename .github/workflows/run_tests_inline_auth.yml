@@ -91,8 +91,8 @@ jobs:
       group: rerun-losing-run
       queue: max
     runs-on: ubuntu-latest
-    # Up to 15 min waiting for the loser, then up to 10 for its re-run's refresh.
-    timeout-minutes: 30
+    # Up to 15 min waiting for the loser, ~2 retrying a refused re-run, then up to 10 for its refresh.
+    timeout-minutes: 35
     # actions: write only. Anything the caller's job doesn't grant fails the whole run at startup.
     permissions:
       actions: write
@@ -169,35 +169,47 @@ jobs:
               exit 1
               ;;
           esac
-          # Retried, not skipped: re-running on a stale read could duplicate a hand re-run.
-          ATTEMPT=""
-          for _ in 1 2 3; do
-            if RUN=$(gh api "repos/${REPO}/actions/runs/${RERUN_RUN_ID}"); then
-              ATTEMPT=$(jq -r '.run_attempt' <<< "${RUN}")
+          # Right after a run completes GitHub can briefly refuse a re-run ("cannot be retried");
+          # a later attempt works, so only that error is retried. Every try re-checks the run first.
+          for DELAY in 15 30 60 0; do
+            # Retried, not skipped: re-running on a stale read could duplicate a hand re-run.
+            ATTEMPT=""
+            for _ in 1 2 3; do
+              if RUN=$(gh api "repos/${REPO}/actions/runs/${RERUN_RUN_ID}"); then
+                ATTEMPT=$(jq -r '.run_attempt' <<< "${RUN}")
+                break
+              fi
+              sleep 5
+            done
+            if [[ -z "${ATTEMPT}" ]]; then
+              echo "::error::could not re-read run ${RERUN_RUN_ID} before re-running it - not re-running it"
+              exit 1
+            fi
+            if [[ "${ATTEMPT}" != "1" ]]; then
+              echo "::notice::run ${RERUN_RUN_ID} was already re-run in the meantime - leaving it alone"
+              exit 0
+            fi
+            # The run's pull_requests lists only open PRs, with their current head: none means
+            # closed or merged, a different head means a newer commit has its own run.
+            PR_HEAD=$(jq -r '.pull_requests[0].head.sha // empty' <<< "${RUN}")
+            if [[ -z "${PR_HEAD}" ]]; then
+              echo "::notice::run ${RERUN_RUN_ID} no longer has an open PR - leaving it alone"
+              exit 0
+            fi
+            if [[ "${PR_HEAD}" != "$(jq -r '.head_sha' <<< "${RUN}")" ]]; then
+              echo "::notice::run ${RERUN_RUN_ID}'s PR moved on - its newer run covers it, leaving this one alone"
+              exit 0
+            fi
+            if RERUN_OUT=$(gh run rerun "${RERUN_RUN_ID}" --failed --repo "${REPO}" 2>&1); then
               break
             fi
-            sleep 5
+            if [[ "${RERUN_OUT}" != *"cannot be retried"* || "${DELAY}" == "0" ]]; then
+              echo "::error::could not re-run run ${RERUN_RUN_ID}: ${RERUN_OUT//[$'\n'$'\r']/ }"
+              exit 1
+            fi
+            echo "GitHub refused the re-run for now - retrying in ${DELAY}s"
+            sleep "${DELAY}"
           done
-          if [[ -z "${ATTEMPT}" ]]; then
-            echo "::error::could not re-read run ${RERUN_RUN_ID} before re-running it - not re-running it"
-            exit 1
-          fi
-          if [[ "${ATTEMPT}" != "1" ]]; then
-            echo "::notice::run ${RERUN_RUN_ID} was already re-run in the meantime - leaving it alone"
-            exit 0
-          fi
-          # The run's pull_requests lists only open PRs, with their current head: none means
-          # closed or merged, a different head means a newer commit has its own run.
-          PR_HEAD=$(jq -r '.pull_requests[0].head.sha // empty' <<< "${RUN}")
-          if [[ -z "${PR_HEAD}" ]]; then
-            echo "::notice::run ${RERUN_RUN_ID} no longer has an open PR - leaving it alone"
-            exit 0
-          fi
-          if [[ "${PR_HEAD}" != "$(jq -r '.head_sha' <<< "${RUN}")" ]]; then
-            echo "::notice::run ${RERUN_RUN_ID}'s PR moved on - its newer run covers it, leaving this one alone"
-            exit 0
-          fi
-          gh run rerun "${RERUN_RUN_ID}" --failed --repo "${REPO}"
           # From here the re-run alerts on its own failure; this helper must not claim it never started.
           echo "RERUN_STARTED=true" >> "$GITHUB_ENV"
           echo "::notice::Re-running the failed jobs of https://github.com/${REPO}/actions/runs/${RERUN_RUN_ID}"
