@@ -3,7 +3,7 @@
 # The refresh seeds `autoRenew: false` per firm and the CLI honours it, so a stale token
 # exits 2 instead of silently rotating the shared refresh token on the runner.
 #
-# Temporary name: to be renamed run_tests.yml, which needs each market's caller updated.
+# Deprecated: replaced by run_tests.yml. Kept until every market caller has switched; apply any fix to both files until then.
 #
 # Caller requirements:
 # - `workflow_dispatch` with a required string input `rerun_run_id` (used by retry-on-race).

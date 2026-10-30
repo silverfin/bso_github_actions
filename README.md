@@ -43,7 +43,7 @@ The document will go over all the Github Actions that currently automate a coupl
     * [Repair a firm's CI auth token pair (repair_firm_auth.yml)](#repair-a-firms-ci-auth-token-pair-repair_firm_authyml)
   * [Testing](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf13d6dbd0df1e4450b3b22691c)
     * [Check YAML files (check_tests.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf931fa1547b4b419d940464f89)
-    * [Run liquid tests, inline auth (run_tests_inline_auth.yml)](#run-liquid-tests-inline-auth-run_tests_inline_authyml)
+    * [Run liquid tests (run_tests.yml)](#run-liquid-tests-run_testsyml)
   * [Slack updates](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBfc9ca89d4b174494391ba075c5)
     * [Automated slack update (slack_changelog.yml)](https://silverfin.quip.com/avPDA9TrpJ9Y#temp:C:EBf862cf4257e68475d8b47891c6)
   * [Review firm deployment](#review-firm-deployment)
@@ -170,21 +170,21 @@ _Trigger:_
 * When labels are added (important for the `no-test-required` bypass logic)
 * When labels are removed (re-enables validation if `no-test-required` was removed)
 
-#### Run liquid tests, inline auth `(run_tests_inline_auth.yml)`
+#### Run liquid tests `(run_tests.yml)`
 
 _Description:_
 Runs the liquid tests of the reconciliation texts and account templates a PR changes (a PR that only
 changes shared parts skips the tests), grouped per firm and run in parallel. `test-templates`
 refreshes `CONFIG_JSON` as its own first step: `secrets.*` is snapshotted when a run is created, so a
-refresh in a separate job would never reach the tests. Used by every market. Temporary name: it will
-be renamed to `run_tests.yml`, which needs each market's caller updated.
+refresh in a separate job would never reach the tests. Used by every market. `run_tests_inline_auth.yml`
+is an identical copy under the old name, kept only until every market caller has switched.
 
 _Behaviour:_
 
 * Refreshes tokens inline via the `refresh-config-json` action, seeding `autoRenew: false`, and blanks the refresh token on disk before tests run
 * If a concurrent run wins a refresh race, the losing PR run's failed jobs are re-run once (`retry-on-race` dispatches a small helper run that waits for the losing run to finish, then re-runs it; helpers take turns per repo, so two losers from one burst can't race each other again). A re-run counts for the PR's required check and reads the fresh token; Slack is alerted only if that fails
 * `test-templates` always runs, so the required check fails rather than passing as skipped when change detection fails or the run is cancelled
-* A push to main diffs against the previous main commit (not `main` itself), so post-merge runs actually test something
+* No `push` trigger needed: with a strict required check, the PR run already tested what lands on main. A caller that does trigger on push diffs against the previous main commit
 * The silverfin-cli install happens outside the PR checkout
 
 _Caller requirements:_
@@ -193,8 +193,6 @@ _Caller requirements:_
 on:
   pull_request:
     branches: ["*"]
-  push:
-    branches: ["main"]
   # retry-on-race dispatches this file on the default branch to re-run a losing PR run
   workflow_dispatch:
     inputs:
@@ -212,7 +210,7 @@ jobs:
     permissions:
       contents: read
       actions: write
-    uses: silverfin/bso_github_actions/.github/workflows/run_tests_inline_auth.yml@main
+    uses: silverfin/bso_github_actions/.github/workflows/run_tests.yml@main
     secrets: inherit
 ```
 
@@ -307,7 +305,7 @@ _Inputs:_
 * `partner` (required) — partner environment id (must be authorized — see `PARTNER_CONFIG_JSON` secret).
 * `handles` (optional) — reconciliation text handles to sample, **one per line** (directory names under `reconciliation_texts/`). Optional if `account_templates` is set.
 * `account_templates` (optional) — account template names to sample, **one per line** (directory names under `account_templates/`). Optional if `handles` is set.
-  * All three lists are newline-separated, **not** space-separated: account template directory names routinely contain spaces (e.g. `Investment- and depreciation details`), so a space-joined list is ambiguous and gets word-split into template names that don't exist (`Config file for account template "Investment-" not found`). Same convention as [`run_tests_inline_auth.yml`](#run-liquid-tests-inline-auth-run_tests_inline_authyml). `firm_ids` is the exception — numeric, so it stays space-separated.
+  * All three lists are newline-separated, **not** space-separated: account template directory names routinely contain spaces (e.g. `Investment- and depreciation details`), so a space-joined list is ambiguous and gets word-split into template names that don't exist (`Config file for account template "Investment-" not found`). Same convention as [`run_tests.yml`](#run-liquid-tests-run_testsyml). `firm_ids` is the exception — numeric, so it stays space-separated.
   * A name that **starts with `-`** is rejected before the CLI is called, and the job fails with the directory to rename. `silverfin-cli`'s `-h`/`-at`/`-s` are variadic options, so commander stops consuming values at the first `-`-prefixed token and would read such a name as a flag; a `--` separator does not protect variadic values. Only a leading `-` is affected — internal and trailing hyphens (`Cut-off`, `Investment- and depreciation details`) are fine.
 * `shared_parts` (optional) — shared part names to sample, **one per line** (directory names under `shared_parts/`). Optional if `handles` or `account_templates` is set. The sampler backend expands each shared part to every reconciliation text / account detail template that includes it, so one name here can fan out to many rendered templates — no `used_in` expansion is needed on the caller's side.
 * `firm_ids` (required) — firm id(s) to sample against, space-separated. The backend 422s if empty.
