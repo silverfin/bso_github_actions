@@ -197,7 +197,24 @@ jobs:
             echo "::notice::run ${RERUN_RUN_ID}'s PR moved on - its newer run covers it, leaving this one alone"
             exit 0
           fi
-          gh run rerun "${RERUN_RUN_ID}" --failed --repo "${REPO}"
+          # Right after a run completes GitHub can briefly refuse a re-run ("cannot be retried");
+          # a later attempt works, so only that error is retried.
+          for DELAY in 15 30 60 0; do
+            if RERUN_OUT=$(gh run rerun "${RERUN_RUN_ID}" --failed --repo "${REPO}" 2>&1); then
+              break
+            fi
+            if [[ "${RERUN_OUT}" != *"cannot be retried"* || "${DELAY}" == "0" ]]; then
+              echo "::error::could not re-run run ${RERUN_RUN_ID}: ${RERUN_OUT//[$'\n'$'\r']/ }"
+              exit 1
+            fi
+            echo "GitHub refused the re-run for now - retrying in ${DELAY}s"
+            sleep "${DELAY}"
+            ATTEMPT=$(gh api "repos/${REPO}/actions/runs/${RERUN_RUN_ID}" --jq '.run_attempt') || ATTEMPT=1
+            if [[ "${ATTEMPT}" != "1" ]]; then
+              echo "::notice::run ${RERUN_RUN_ID} was re-run by someone else in the meantime - leaving it alone"
+              exit 0
+            fi
+          done
           # From here the re-run alerts on its own failure; this helper must not claim it never started.
           echo "RERUN_STARTED=true" >> "$GITHUB_ENV"
           echo "::notice::Re-running the failed jobs of https://github.com/${REPO}/actions/runs/${RERUN_RUN_ID}"
