@@ -155,7 +155,9 @@ jobs:
           # `runner` context) so every later step in this job gets the resolved absolute path.
           echo "SILVERFIN_CLI_BIN=${INSTALL_DIR}/node_modules/silverfin-cli/bin/cli.js" >> "$GITHUB_ENV"
           VERSION=$(node "${INSTALL_DIR}/node_modules/silverfin-cli/bin/cli.js" -V)
-          echo "CLI version: ${VERSION}"
+          # Unpinned, so log the commit too: matrix legs install separately and can differ.
+          COMMIT=$(jq -r '.packages["node_modules/silverfin-cli"].resolved // "unknown"' "${INSTALL_DIR}/package-lock.json" 2>/dev/null || echo unknown)
+          echo "CLI version: ${VERSION} (${COMMIT})"
 
       - name: Checkout repository at PR head
         uses: actions/checkout@v6
@@ -273,10 +275,10 @@ jobs:
           STEP_DEADLINE=$(( ${JOB_STARTED_AT:-$(date +%s)} + 255*60 ))
           # Floored at 1: `timeout 0` means no timeout at all.
           remaining() { local r=$(( STEP_DEADLINE - $(date +%s) )); echo $(( r > 1 ? r : 1 )); }
-          # Last moment a 422 retry may start: a run takes up to ~60 min, and an attempt that
-          # can't finish is killed at STEP_DEADLINE and orphans a backend run that 422s every
-          # repo using this partner.
-          DEADLINE=$(( STEP_DEADLINE - 60*60 ))
+          # Last moment a 422 retry may start: a large shared-part run can take the CLI's full 2 h
+          # poll, and an attempt that can't finish is killed at STEP_DEADLINE and orphans a
+          # backend run that 422s every repo using this partner.
+          DEADLINE=$(( STEP_DEADLINE - 125*60 ))
           ATTEMPT=1
           while true; do
             # %q-quoted so a name containing spaces is visibly one argument in the log.
@@ -581,10 +583,10 @@ jobs:
         if: always() && steps.download.outputs.downloaded == 'true'
         continue-on-error: true
         run: |
-          # The flag ships in silverfin-cli 1.59.3. Detect rather than fail, in case a caller's
-          # install ever predates it.
+          # The flag ships in silverfin-cli 1.63.0 (#265). Detect rather than fail, so a run on an
+          # older CLI still uploads results.zip.
           if ! node "${SILVERFIN_CLI_BIN}" run-sampler --help 2>&1 | grep -q -- '--extract-flagged-only'; then
-            echo "::notice::The installed silverfin-cli has no --extract-flagged-only yet; skipping the flagged-entries artifact."
+            echo "::warning::The installed silverfin-cli has no --extract-flagged-only; skipping the flagged-entries artifact."
             echo "flagged_extracted=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
