@@ -838,8 +838,10 @@ jobs:
             try {
               await github.rest.actions.createWorkflowDispatch({
                 owner, repo, workflow_id: workflowFile, ref,
+                // Only this partner: the caller's matrix may hold others that did not go stale.
                 inputs: {
                   pull_request_number: String(prNumber),
+                  partner,
                   ...(process.env.FIRM_IDS_OVERRIDE ? { firm_ids_override: process.env.FIRM_IDS_OVERRIDE } : {}),
                 },
               });
@@ -857,7 +859,7 @@ jobs:
               } catch (delErr) {
                 core.warning(`Could not roll back the auto-retry marker (${delErr.status || delErr.message}); this PR will not auto-retry for partner ${partner} again.`);
               }
-              core.error(`Could not re-dispatch ${workflowFile} on ${ref} for PR #${prNumber}: ${e.status || ""} ${e.message}. If this is a 403, REPO_ACCESS_TOKEN needs Actions: write (a repo-scoped token that can set secrets still cannot dispatch a workflow). Re-run the sampler manually.`);
+              core.error(`Could not re-dispatch ${workflowFile} on ${ref} for PR #${prNumber}: ${e.status || ""} ${e.message}. If this is a 403, REPO_ACCESS_TOKEN needs Actions: write (a repo-scoped token that can set secrets still cannot dispatch a workflow); a 422 'Unexpected inputs' means the caller's workflow_dispatch lacks a partner or firm_ids_override input. Re-run the sampler manually.`);
               core.setOutput("retried", "false");
               return;
             }

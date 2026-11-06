@@ -334,6 +334,7 @@ _Authentication note:_
 _Prerequisites:_
 
 * `SF_API_CLIENT_ID`, `SF_API_SECRET`, `PARTNER_CONFIG_JSON` (per-partner secret resolved by the caller) and `REPO_ACCESS_TOKEN` available to the caller. The token needs Secrets: Read and write (token write-back), and for the automatic retry after a partner-login race, Actions: Read and write (it starts a new run) and Pull requests: Read and write (it lists, posts and removes a marker comment on the PR).
+* For the automatic retry, the caller's `workflow_dispatch` must accept `pull_request_number`, `partner` (sample only that partner) and `firm_ids_override` inputs: the retry re-dispatches the caller with them.
 * `SF_BASIC_AUTH` if the partner's host is a `*.staging.getsilverfin.com` gateway.
 * The partner must already be authorized with the Silverfin CLI (`silverfin authorize-partner`) and its `config.json` stored as the `PARTNER_CONFIG_JSON_<partner>` secret.
 
