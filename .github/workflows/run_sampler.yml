@@ -62,6 +62,11 @@ on:
         required: false
         type: string
         default: ""
+      firm_ids_override:
+        description: "The caller's own firm_ids_override dispatch input, if it has one. Not used for sampling (firm_ids is); only passed on to the stale-credential re-dispatch so the retry samples the same firms."
+        required: false
+        type: string
+        default: ""
     secrets:
       SF_API_CLIENT_ID:
         description: "Silverfin API OAuth client id (silverfin-cli needs it at startup)."
@@ -100,7 +105,7 @@ jobs:
     runs-on: ubuntu-latest
     # Generous ceiling: a single run is ~30-60 min, plus poll-and-retry on a cross-repo 422
     # collision; STEP_DEADLINE in the sampler step keeps ~45 min of it for the tail.
-    timeout-minutes: 180
+    timeout-minutes: 300
     # Job-level (not just on the sampler step): the CLI checks for these at process startup for
     # every command, including a bare `-V` version probe - confirmed live (the "Install
     # silverfin-cli" step failed with "Missing API credentials" before these were job-scoped).
@@ -143,32 +148,16 @@ jobs:
       # in the tree redirecting the registry.
       - name: Install silverfin-cli
         run: |
-          # Pinned to silverfin-cli's `sampler-cli-integration` branch: the tested merge of the
-          # two open sampler PRs (#276 visual tier + budget-driven caps, #275 payload attrs +
-          # flagged-entry extraction). Neither is on main, and no single PR branch carries both,
-          # which is why this points at an integration branch rather than at a PR head. That
-          # branch exists to keep this SHA reachable - do NOT delete it while anything pins to
-          # it. Switch to unpinned main, matching every other production workflow, once both
-          # PRs merge.
-          #
-          # Same SHA as be_market's inlined copy pins, deliberately: the two must not drift, or
-          # a run's output depends on which repo triggered it.
-          #
-          # Re-pin to the branch tip whenever that branch gains fixes — a commit pin silently goes
-          # stale, and a rebase can orphan it entirely. The previous pin (5accd6b) was exactly
-          # that: a pre-rebase copy of "Make --add-diffs-folder's zip write atomic", no longer an
-          # ancestor of the branch, and missing five later fixes to the compact diff (flag-array
-          # flip direction, radio-checked attribute boundary, flag-flip suffix side, the
-          # no-view.html rewrite skip, and the identical-render diffs/ skip).
           INSTALL_DIR="${RUNNER_TEMP}/silverfin-cli-install"
           mkdir -p "${INSTALL_DIR}"
-          npm install --prefix "${INSTALL_DIR}" --ignore-scripts \
-            https://github.com/silverfin/silverfin-cli.git#ec85206167741663370b28250f67ef53ff96db98
+          npm install --prefix "${INSTALL_DIR}" --ignore-scripts https://github.com/silverfin/silverfin-cli.git
           # Exported via $GITHUB_ENV (not job-level `env:`, which can't use $RUNNER_TEMP or the
           # `runner` context) so every later step in this job gets the resolved absolute path.
           echo "SILVERFIN_CLI_BIN=${INSTALL_DIR}/node_modules/silverfin-cli/bin/cli.js" >> "$GITHUB_ENV"
           VERSION=$(node "${INSTALL_DIR}/node_modules/silverfin-cli/bin/cli.js" -V)
-          echo "CLI version: ${VERSION}"
+          # Unpinned, so log the commit too: matrix legs install separately and can differ.
+          COMMIT=$(jq -r '.packages["node_modules/silverfin-cli"].resolved // "unknown"' "${INSTALL_DIR}/package-lock.json" 2>/dev/null || echo unknown)
+          echo "CLI version: ${VERSION} (${COMMIT})"
 
       - name: Checkout repository at PR head
         uses: actions/checkout@v6
@@ -276,20 +265,20 @@ jobs:
           # Sized against the tail, not against `timeout-minutes`: after this step come a
           # ~150 MB download (up to 5 min on its own `--max-time`), a full re-zip for the diffs/
           # folder, the flagged-entry extraction, an artifact upload of that same ~150 MB, and
-          # the PR comment. Measured from job start, so 135 leaves ~45 min for that tail
+          # the PR comment. Measured from job start, so 255 leaves ~45 min for that tail
           # whatever the setup steps cost. Raising `timeout-minutes` instead would not help: the
           # point is the margin between the two, not the absolute cap.
           #
           # Every CLI call runs under `timeout` to what is left of it: the CLI polls for up to
           # 2 h on its own, so an attempt started late (a 422 retry) would otherwise run past
           # the job cap regardless of any check between attempts.
-          STEP_DEADLINE=$(( ${JOB_STARTED_AT:-$(date +%s)} + 135*60 ))
+          STEP_DEADLINE=$(( ${JOB_STARTED_AT:-$(date +%s)} + 255*60 ))
           # Floored at 1: `timeout 0` means no timeout at all.
           remaining() { local r=$(( STEP_DEADLINE - $(date +%s) )); echo $(( r > 1 ? r : 1 )); }
-          # Last moment a 422 retry may start: a run takes up to ~60 min, and an attempt that
-          # can't finish is killed at STEP_DEADLINE and orphans a backend run that 422s every
-          # repo using this partner.
-          DEADLINE=$(( STEP_DEADLINE - 60*60 ))
+          # Last moment a 422 retry may start: a large shared-part run can take the CLI's full 2 h
+          # poll, and an attempt that can't finish is killed at STEP_DEADLINE and orphans a
+          # backend run that 422s every repo using this partner.
+          DEADLINE=$(( STEP_DEADLINE - 125*60 ))
           ATTEMPT=1
           while true; do
             # %q-quoted so a name containing spaces is visibly one argument in the log.
@@ -594,11 +583,10 @@ jobs:
         if: always() && steps.download.outputs.downloaded == 'true'
         continue-on-error: true
         run: |
-          # The flag ships in silverfin-cli 1.59.3; the install above is pinned to a commit that
-          # may predate it. Detect rather than fail - this step then starts working on its own
-          # once the pin moves, instead of warning on every run until someone notices.
+          # The flag ships in silverfin-cli 1.63.0 (#265). Detect rather than fail, so a run on an
+          # older CLI still uploads results.zip.
           if ! node "${SILVERFIN_CLI_BIN}" run-sampler --help 2>&1 | grep -q -- '--extract-flagged-only'; then
-            echo "::notice::The pinned silverfin-cli has no --extract-flagged-only yet; skipping the flagged-entries artifact."
+            echo "::warning::The installed silverfin-cli has no --extract-flagged-only; skipping the flagged-entries artifact."
             echo "flagged_extracted=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -782,6 +770,7 @@ jobs:
         env:
           PARTNER: ${{ inputs.partner }}
           PR_NUMBER: ${{ inputs.pull_request_number }}
+          FIRM_IDS_OVERRIDE: ${{ inputs.firm_ids_override }}
           # Resolves to the CALLER's top-level workflow, e.g.
           # silverfin/be_market/.github/workflows/run_sampler.yml@refs/heads/main
           WORKFLOW_REF: ${{ github.workflow_ref }}
@@ -849,7 +838,12 @@ jobs:
             try {
               await github.rest.actions.createWorkflowDispatch({
                 owner, repo, workflow_id: workflowFile, ref,
-                inputs: { pull_request_number: String(prNumber) },
+                // Only this partner: the caller's matrix may hold others that did not go stale.
+                inputs: {
+                  pull_request_number: String(prNumber),
+                  partner,
+                  ...(process.env.FIRM_IDS_OVERRIDE ? { firm_ids_override: process.env.FIRM_IDS_OVERRIDE } : {}),
+                },
               });
             } catch (e) {
               // The marker is already posted, so without this rollback a failed dispatch would
@@ -865,7 +859,7 @@ jobs:
               } catch (delErr) {
                 core.warning(`Could not roll back the auto-retry marker (${delErr.status || delErr.message}); this PR will not auto-retry for partner ${partner} again.`);
               }
-              core.error(`Could not re-dispatch ${workflowFile} on ${ref} for PR #${prNumber}: ${e.status || ""} ${e.message}. If this is a 403, REPO_ACCESS_TOKEN needs Actions: write (a repo-scoped token that can set secrets still cannot dispatch a workflow). Re-run the sampler manually.`);
+              core.error(`Could not re-dispatch ${workflowFile} on ${ref} for PR #${prNumber}: ${e.status || ""} ${e.message}. If this is a 403, REPO_ACCESS_TOKEN needs Actions: write (a repo-scoped token that can set secrets still cannot dispatch a workflow); a 422 'Unexpected inputs' means the caller's workflow_dispatch lacks a partner or firm_ids_override input. Re-run the sampler manually.`);
               core.setOutput("retried", "false");
               return;
             }
