@@ -182,7 +182,7 @@ is an identical copy under the old name, kept only until every market caller has
 _Behaviour:_
 
 * Refreshes tokens inline via the `refresh-config-json` action, seeding `autoRenew: false`, and blanks the refresh token on disk before tests run
-* If a concurrent run wins a refresh race, the losing PR run's failed jobs are re-run once (`retry-on-race` dispatches a small helper run that waits for the losing run to finish, then re-runs it; helpers take turns per repo, so two losers from one burst can't race each other again). A re-run counts for the PR's required check and reads the fresh token; Slack is alerted only if that fails
+* If a concurrent run wins a refresh race, or revokes a firm's token mid-test by refreshing it, the losing PR run's failed jobs are re-run once (`retry-on-race` dispatches a small helper run that waits for the losing run to finish, then re-runs it; helpers take turns per repo, so two losers from one burst can't race each other again). A re-run counts for the PR's required check and reads the fresh token; Slack is alerted only if that fails
 * `test-templates` always runs, so the required check fails rather than passing as skipped when change detection fails or the run is cancelled
 * No `push` trigger needed: with a strict required check, the PR run already tested what lands on main. A caller that does trigger on push diffs against the previous main commit
 * The silverfin-cli install happens outside the PR checkout

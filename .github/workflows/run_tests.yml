@@ -16,9 +16,9 @@ permissions:
   contents: read
 
 jobs:
-  # A PR run whose refresh lost a race to a concurrent job (single-use refresh token) gets one
-  # retry: a re-run of this same run, because only a pull_request run counts toward the PR's
-  # required check. A run can't re-run itself, so this dispatches the caller's workflow, whose
+  # A PR run whose refresh lost a race to a concurrent job (single-use refresh token), or whose
+  # token a concurrent refresh revoked mid-test, gets one retry: a re-run of this same run,
+  # because only a pull_request run counts toward the PR's required check. A run can't re-run itself, so this dispatches the caller's workflow, whose
   # rerun-losing-run job waits for this run to finish and re-runs its failed jobs.
   # A dead credential also lands here and costs one wasted re-run before the alert fires.
   # Separate from the alert job so `actions: write` never reaches the Slack step.
@@ -28,7 +28,7 @@ jobs:
     if: |
       !cancelled() &&
       needs.test-templates.outputs.refresh_completed == 'true' &&
-      needs.test-templates.outputs.failed_firms != '' &&
+      (needs.test-templates.outputs.failed_firms != '' || needs.test-templates.outputs.revoked_firms != '') &&
       github.event_name == 'pull_request' &&
       github.run_attempt == '1'
     runs-on: ubuntu-latest
@@ -48,6 +48,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FAILED_FIRMS: ${{ needs.test-templates.outputs.failed_firms }}
+          REVOKED_FIRMS: ${{ needs.test-templates.outputs.revoked_firms }}
           # Via env: a branch name is untrusted text.
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -71,7 +72,12 @@ jobs:
             exit 1
           fi
           # On the default branch: a PR branch may predate the caller's dispatch trigger.
-          echo "Dispatching a re-run - firm(s) ${FAILED_FIRMS} lost a refresh race against a concurrent job, not a genuine credential problem"
+          if [[ -n "${FAILED_FIRMS}" ]]; then
+            echo "Dispatching a re-run - firm(s) ${FAILED_FIRMS} lost a refresh race against a concurrent job, not a genuine credential problem"
+          fi
+          if [[ -n "${REVOKED_FIRMS}" ]]; then
+            echo "Dispatching a re-run - a concurrent refresh revoked the token for firm(s) ${REVOKED_FIRMS} mid-test"
+          fi
           gh workflow run "${CALLER_WORKFLOW}" \
             --repo "${REPO}" \
             --ref "refs/heads/${DEFAULT_BRANCH}" \
@@ -270,7 +276,8 @@ jobs:
       (needs.test-templates.outputs.refresh_completed != 'true' ||
        needs.test-templates.outputs.failed_firms != '' ||
        needs.test-templates.outputs.auto_renew_lost != '' ||
-       needs.test-templates.outputs.write_back_failed == 'true')
+       needs.test-templates.outputs.write_back_failed == 'true' ||
+       needs.test-templates.outputs.revoked_firms != '')
     runs-on: ubuntu-latest
     # Only secrets and a webhook, no GitHub API.
     permissions: {}
@@ -310,6 +317,12 @@ jobs:
             if [[ -n "${AUTO_RENEW_LOST}" ]]; then
               DETAIL="${DETAIL} | also: the CLI did not preserve the autoRenew flag for firm(s): ${AUTO_RENEW_LOST}"
             fi
+          elif [[ -n "${REVOKED_FIRMS}" ]]; then
+            FIRMS="${REVOKED_FIRMS}"
+            DETAIL="the refresh succeeded, but a concurrent refresh revoked the token mid-test and this run was not re-run automatically - re-run its failed jobs"
+            if [[ -n "${AUTO_RENEW_LOST}" ]]; then
+              DETAIL="${DETAIL} | also: the CLI did not preserve the autoRenew flag for firm(s): ${AUTO_RENEW_LOST}"
+            fi
           else
             FIRMS="${AUTO_RENEW_LOST}"
             DETAIL="every token refreshed and CONFIG_JSON was written, but the CLI did not preserve the autoRenew flag for these firms - the no-renew protection is not in effect for them"
@@ -328,6 +341,7 @@ jobs:
           REFRESH_COMPLETED: ${{ needs.test-templates.outputs.refresh_completed }}
           AUTO_RENEW_LOST: ${{ needs.test-templates.outputs.auto_renew_lost }}
           WRITE_BACK_FAILED: ${{ needs.test-templates.outputs.write_back_failed }}
+          REVOKED_FIRMS: ${{ needs.test-templates.outputs.revoked_firms }}
           CHANGED_TEMPLATES_RESULT: ${{ needs.check-changed-templates.result }}
 
   check-changed-templates:
@@ -412,6 +426,7 @@ jobs:
       auto_renew_lost: ${{ steps.refresh.outputs.auto_renew_lost }}
       refresh_completed: ${{ steps.refresh.outputs.refresh_completed }}
       write_back_failed: ${{ steps.refresh.outputs.write_back_failed }}
+      revoked_firms: ${{ steps.tests.outputs.revoked_firms }}
     env:
       SF_API_CLIENT_ID: "${{ secrets.SF_API_CLIENT_ID }}"
       SF_API_SECRET: "${{ secrets.SF_API_SECRET }}"
@@ -484,6 +499,7 @@ jobs:
             "$HOME/.silverfin/config.json" > "$HOME/.silverfin/config.stripped.json"
           mv "$HOME/.silverfin/config.stripped.json" "$HOME/.silverfin/config.json"
       - name: Run liquid tests for updated templates (grouped per firm, run in parallel)
+        id: tests
         if: ${{ env.HAS_CHANGED_TEMPLATES == 'true' }}
         run: |
           echo ""
@@ -750,7 +766,7 @@ jobs:
             [[ "${TYPE}" == "accountTemplate" ]] && CLI_FLAG="--account-template"
             # Verdicts go to disk as soon as decided, so a later crash can't lose earlier ones.
             local -a REMAINING=() NEXT=() BATCH=() VALID=()
-            local ATTEMPT=1 TOTAL START RAW PARSED BATCH_EXIT NAME STATUS TRANSIENT
+            local ATTEMPT=1 TOTAL START RAW PARSED BATCH_EXIT NAME STATUS TRANSIENT REVOKED=0
             mapfile -t REMAINING < "${LIST}"
             # A name starting with "-" would be parsed as a CLI option: fail it up front.
             for NAME in "${REMAINING[@]}"; do
@@ -802,7 +818,17 @@ jobs:
                   RESULTS["${NAME}"]="${STATUS}"
                   RETRYABLE["${NAME}"]="${TRANSIENT}"
                 done < "${PARSED}"
+                # A concurrent run refreshed this firm mid-test, revoking the token. Retrying can't
+                # help, so fail what's left; retry-on-race re-runs the job with the fresh token.
+                if grep -qF "Authentication failed for firm ${FIRM}:" "${RAW}"; then
+                  REVOKED=1
+                  echo "${FIRM}" >> "${WORKDIR}/revoked_firms"
+                fi
                 for NAME in "${BATCH[@]}"; do
+                  if (( REVOKED )) && [[ "${RESULTS[${NAME}]:-}" != "PASSED" ]]; then
+                    printf '%s\t%s\t%s\n' "FAIL - token revoked mid-run by a concurrent refresh" "${ATTEMPT}" "${NAME}" >> "${VERDICTS}"
+                    continue
+                  fi
                   case "${RESULTS[${NAME}]:-}" in
                     PASSED)
                       printf '%s\t%s\t%s\n' "PASS" "${ATTEMPT}" "${NAME}" >> "${VERDICTS}"
@@ -826,6 +852,13 @@ jobs:
                       ;;
                   esac
                 done
+                if (( REVOKED )); then
+                  for NAME in "${NEXT[@]}" "${REMAINING[@]:START+MAX_PARALLEL}"; do
+                    printf '%s\t%s\t%s\n' "FAIL - token revoked mid-run by a concurrent refresh" "${ATTEMPT}" "${NAME}" >> "${VERDICTS}"
+                  done
+                  NEXT=()
+                  break
+                fi
               done
               REMAINING=("${NEXT[@]}")
               ATTEMPT=$((ATTEMPT+1))
@@ -1046,6 +1079,11 @@ jobs:
                 fi
               fi
             } >> "${SUMMARY_FILE}"
+          fi
+          if [[ -s "${WORKDIR}/revoked_firms" ]]; then
+            REVOKED_FIRMS=$(sort -u "${WORKDIR}/revoked_firms" | paste -sd' ' -)
+            echo "revoked_firms=${REVOKED_FIRMS}" >> "$GITHUB_OUTPUT"
+            echo "::warning::Token for firm(s) ${REVOKED_FIRMS} was revoked mid-run, most likely by a concurrent run refreshing the same firm - not a test failure."
           fi
           # CHECK ERRORS PRESENT
           if [ ${#ERRORS[@]} -eq 0 ]; then
