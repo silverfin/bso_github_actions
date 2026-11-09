@@ -18,8 +18,9 @@ permissions:
 jobs:
   # A PR run whose refresh lost a race to a concurrent job (single-use refresh token), or whose
   # token a concurrent refresh revoked mid-test, gets one retry: a re-run of this same run,
-  # because only a pull_request run counts toward the PR's required check. A run can't re-run itself, so this dispatches the caller's workflow, whose
-  # rerun-losing-run job waits for this run to finish and re-runs its failed jobs.
+  # because only a pull_request run counts toward the PR's required check. A run can't re-run
+  # itself, so this dispatches the caller's workflow, whose rerun-losing-run job waits for this
+  # run to finish and re-runs its failed jobs.
   # A dead credential also lands here and costs one wasted re-run before the alert fires.
   # Separate from the alert job so `actions: write` never reaches the Slack step.
   retry-on-race:
@@ -258,7 +259,7 @@ jobs:
           else
             LOSER="(invalid rerun_run_id, ${#RERUN_RUN_ID} characters)"
           fi
-          TEXT=$(printf '⚠️ check-auth in %s: a PR run lost a token refresh race, but re-running it failed - that PR'"'"'s required check stays red until someone re-runs its failed jobs.\nLosing run: %s\nHelper run: %s' \
+          TEXT=$(printf '⚠️ check-auth in %s: a PR run lost a token refresh race or had its token revoked mid-test, but re-running it failed - that PR'"'"'s required check stays red until someone re-runs its failed jobs.\nLosing run: %s\nHelper run: %s' \
             "${REPO}" "${LOSER}" "${HELPER_URL}")
           curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
             -X POST "$SLACK" -H 'Content-Type: application/json' \
@@ -314,12 +315,15 @@ jobs:
           elif [[ -n "${FAILED_FIRMS}" ]]; then
             FIRMS="${FAILED_FIRMS}"
             DETAIL="${FAILED_SUMMARY}"
+            if [[ -n "${REVOKED_FIRMS}" ]]; then
+              DETAIL="${DETAIL} | also: a concurrent refresh revoked the token mid-test for firm(s): ${REVOKED_FIRMS}"
+            fi
             if [[ -n "${AUTO_RENEW_LOST}" ]]; then
               DETAIL="${DETAIL} | also: the CLI did not preserve the autoRenew flag for firm(s): ${AUTO_RENEW_LOST}"
             fi
           elif [[ -n "${REVOKED_FIRMS}" ]]; then
             FIRMS="${REVOKED_FIRMS}"
-            DETAIL="the refresh succeeded, but a concurrent refresh revoked the token mid-test and this run was not re-run automatically - re-run its failed jobs"
+            DETAIL="the refresh succeeded, but a concurrent refresh revoked the token mid-test (run attempt ${RUN_ATTEMPT}) and no automatic re-run was dispatched - re-run its failed jobs if this commit is still the PR head"
             if [[ -n "${AUTO_RENEW_LOST}" ]]; then
               DETAIL="${DETAIL} | also: the CLI did not preserve the autoRenew flag for firm(s): ${AUTO_RENEW_LOST}"
             fi
@@ -342,6 +346,7 @@ jobs:
           AUTO_RENEW_LOST: ${{ needs.test-templates.outputs.auto_renew_lost }}
           WRITE_BACK_FAILED: ${{ needs.test-templates.outputs.write_back_failed }}
           REVOKED_FIRMS: ${{ needs.test-templates.outputs.revoked_firms }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           CHANGED_TEMPLATES_RESULT: ${{ needs.check-changed-templates.result }}
 
   check-changed-templates:
@@ -766,7 +771,7 @@ jobs:
             [[ "${TYPE}" == "accountTemplate" ]] && CLI_FLAG="--account-template"
             # Verdicts go to disk as soon as decided, so a later crash can't lose earlier ones.
             local -a REMAINING=() NEXT=() BATCH=() VALID=()
-            local ATTEMPT=1 TOTAL START RAW PARSED BATCH_EXIT NAME STATUS TRANSIENT REVOKED=0
+            local ATTEMPT=1 TOTAL START RAW PARSED BATCH_EXIT NAME STATUS TRANSIENT REVOKED=0 REVOKED_HIT=0
             mapfile -t REMAINING < "${LIST}"
             # A name starting with "-" would be parsed as a CLI option: fail it up front.
             for NAME in "${REMAINING[@]}"; do
@@ -818,15 +823,17 @@ jobs:
                   RESULTS["${NAME}"]="${STATUS}"
                   RETRYABLE["${NAME}"]="${TRANSIENT}"
                 done < "${PARSED}"
-                # A concurrent run refreshed this firm mid-test, revoking the token. Retrying can't
-                # help, so fail what's left; retry-on-race re-runs the job with the fresh token.
-                if grep -qF "Authentication failed for firm ${FIRM}:" "${RAW}"; then
+                # Exit 2 is the CLI's auth-failure code: a concurrent run refreshed this firm mid-test,
+                # revoking the token. Retrying can't help, so fail what's left without a verdict;
+                # retry-on-race re-runs the job with the fresh token. Exit code, not the message: test
+                # names and platform errors in the output are PR-controlled.
+                if (( BATCH_EXIT == 2 )); then
                   REVOKED=1
-                  echo "${FIRM}" >> "${WORKDIR}/revoked_firms"
                 fi
                 for NAME in "${BATCH[@]}"; do
-                  if (( REVOKED )) && [[ "${RESULTS[${NAME}]:-}" != "PASSED" ]]; then
+                  if (( REVOKED )) && [[ -z "${RESULTS[${NAME}]:-}" || "${RETRYABLE[${NAME}]:-0}" == "1" ]]; then
                     printf '%s\t%s\t%s\n' "FAIL - token revoked mid-run by a concurrent refresh" "${ATTEMPT}" "${NAME}" >> "${VERDICTS}"
+                    REVOKED_HIT=1
                     continue
                   fi
                   case "${RESULTS[${NAME}]:-}" in
@@ -855,7 +862,12 @@ jobs:
                 if (( REVOKED )); then
                   for NAME in "${NEXT[@]}" "${REMAINING[@]:START+MAX_PARALLEL}"; do
                     printf '%s\t%s\t%s\n' "FAIL - token revoked mid-run by a concurrent refresh" "${ATTEMPT}" "${NAME}" >> "${VERDICTS}"
+                    REVOKED_HIT=1
                   done
+                  # Only when something failed because of it: a re-run for an all-green bucket is waste.
+                  if (( REVOKED_HIT )); then
+                    echo "${FIRM}" >> "${WORKDIR}/revoked_firms"
+                  fi
                   NEXT=()
                   break
                 fi
@@ -1009,6 +1021,12 @@ jobs:
           echo ""
           echo "All ${#KEYS[@]} bucket(s) finished - printing results."
           echo ""
+          # Written before the result printing, so an abort there can't lose the re-run trigger.
+          if [[ -s "${WORKDIR}/revoked_firms" ]]; then
+            REVOKED_FIRMS=$(sort -u "${WORKDIR}/revoked_firms" | paste -sd' ' -)
+            echo "revoked_firms=${REVOKED_FIRMS}" >> "$GITHUB_OUTPUT"
+            echo "::warning::Token for firm(s) ${REVOKED_FIRMS} was revoked mid-run, most likely by a concurrent run refreshing the same firm. Templates marked 'token revoked' were not tested, not failed."
+          fi
           for (( i=0; i<${#KEYS[@]}; i++ )); do
             print_bucket_results "${i}"
           done
@@ -1079,11 +1097,6 @@ jobs:
                 fi
               fi
             } >> "${SUMMARY_FILE}"
-          fi
-          if [[ -s "${WORKDIR}/revoked_firms" ]]; then
-            REVOKED_FIRMS=$(sort -u "${WORKDIR}/revoked_firms" | paste -sd' ' -)
-            echo "revoked_firms=${REVOKED_FIRMS}" >> "$GITHUB_OUTPUT"
-            echo "::warning::Token for firm(s) ${REVOKED_FIRMS} was revoked mid-run, most likely by a concurrent run refreshing the same firm - not a test failure."
           fi
           # CHECK ERRORS PRESENT
           if [ ${#ERRORS[@]} -eq 0 ]; then
